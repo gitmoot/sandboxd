@@ -553,7 +553,9 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 	}
 	failed := make(chan error, 1)
 	done := make(chan struct{})
+	monitorDone := make(chan struct{})
 	go func() {
+		defer close(monitorDone)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
@@ -561,8 +563,11 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 			case <-done:
 				return
 			case <-ticker.C:
-				if err := d.Ready(runCtx); err != nil {
-					failed <- err
+				checkCtx, stop := context.WithTimeout(runCtx, 5*time.Second)
+				checkErr := d.Ready(checkCtx)
+				stop()
+				if checkErr != nil {
+					failed <- checkErr
 					cancel()
 					return
 				}
@@ -574,6 +579,9 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 	}
 	err = c.Wait()
 	close(done)
+	// A check already in progress must finish before reporting success; closing
+	// done only prevents the next check, not one blocked on the helper.
+	<-monitorDone
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
