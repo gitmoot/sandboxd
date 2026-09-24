@@ -89,3 +89,69 @@ func TestModelRelayRefusesBroadGuestCIDRAndNonLoopbackTarget(t *testing.T) {
 		}
 	}
 }
+
+func TestModelRelayLimitsConnectionsPerSource(t *testing.T) {
+	broker, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer broker.Close()
+	forwarded := make(chan net.Conn, maxModelRelayConnectionsPerGuest+1)
+	go func() {
+		for {
+			conn, err := broker.Accept()
+			if err != nil {
+				return
+			}
+			forwarded <- conn
+		}
+	}()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- serveModelRelay(ctx, listener, broker.Addr().String(), netip.MustParsePrefix("127.0.0.0/8"))
+	}()
+	for range maxModelRelayConnectionsPerGuest {
+		conn, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		select {
+		case target := <-forwarded:
+			defer target.Close()
+		case <-time.After(2 * time.Second):
+			t.Fatal("permitted connection did not reach broker")
+		}
+	}
+	extra, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	_ = extra.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var b [1]byte
+	if n, err := extra.Read(b[:]); n != 0 || err == nil {
+		t.Fatalf("fifth connection stayed open: %d bytes, %v", n, err)
+	}
+	select {
+	case target := <-forwarded:
+		_ = target.Close()
+		t.Fatal("fifth connection reached broker")
+	default:
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not shut down with held guest connections")
+	}
+}

@@ -7,10 +7,14 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 )
 
-const maxModelRelayConnections = 16
+const (
+	maxModelRelayConnections         = 16
+	maxModelRelayConnectionsPerGuest = 4
+)
 
 func openModelRelay(listenAddress, target, guestCIDR string) (net.Listener, netip.Prefix, error) {
 	if listenAddress == "" && target == "" && guestCIDR == "" {
@@ -58,6 +62,8 @@ func serveModelRelay(ctx context.Context, listener net.Listener, target string, 
 	}()
 
 	slots := make(chan struct{}, maxModelRelayConnections)
+	var activeMu sync.Mutex
+	activeBySource := make(map[netip.Addr]int)
 	for {
 		inbound, err := listener.Accept()
 		if err != nil {
@@ -76,13 +82,31 @@ func serveModelRelay(ctx context.Context, listener net.Listener, target string, 
 			_ = inbound.Close()
 			continue
 		}
+		address = address.Unmap()
+		activeMu.Lock()
+		if activeBySource[address] >= maxModelRelayConnectionsPerGuest {
+			activeMu.Unlock()
+			_ = inbound.Close()
+			continue
+		}
 		select {
 		case slots <- struct{}{}:
+			activeBySource[address]++
+			activeMu.Unlock()
 			go func() {
-				defer func() { <-slots }()
+				defer func() {
+					activeMu.Lock()
+					activeBySource[address]--
+					if activeBySource[address] == 0 {
+						delete(activeBySource, address)
+					}
+					<-slots
+					activeMu.Unlock()
+				}()
 				proxyModelConnection(inbound, target)
 			}()
 		default:
+			activeMu.Unlock()
 			_ = inbound.Close()
 		}
 	}
