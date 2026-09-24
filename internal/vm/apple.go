@@ -20,6 +20,7 @@ const (
 	appleNamePrefix       = "sandboxd-"
 	appleOwnerLabel       = "gitmoot.sandboxd.owner=apple-v1"
 	appleVolumeOwnerLabel = "gitmoot.sandboxd.volume=apple-v1"
+	appleWorkerLabel      = "gitmoot.sandboxd.worker"
 	appleVolumeSize       = "10g"
 	maxCopyBytes          = 512 << 20
 )
@@ -33,16 +34,18 @@ var appleNetworkName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 // bounded tmpfs mounts, and a dedicated host-only network. No writable host
 // paths are exposed to the guest.
 type AppleDriver struct {
-	cli     string
-	images  map[string]struct{}
-	network string
+	cli      string
+	images   map[string]struct{}
+	network  string
+	workerID string
 }
 
 var _ Driver = (*AppleDriver)(nil)
 
-// NewAppleDriver requires an absolute CLI path, an exact image allowlist, and
-// a dedicated host-only network. It never falls back to the default NAT.
-func NewAppleDriver(cliPath string, images []string, network string) (*AppleDriver, error) {
+// NewAppleDriver requires an absolute CLI path, an exact image allowlist, a
+// dedicated host-only network, and a stable worker identity. It never falls
+// back to the default NAT or claims another worker's VMs.
+func NewAppleDriver(cliPath string, images []string, network, workerID string) (*AppleDriver, error) {
 	if !filepath.IsAbs(cliPath) || filepath.Clean(cliPath) != cliPath || strings.ContainsRune(cliPath, 0) {
 		return nil, fmt.Errorf("Apple container CLI path must be absolute and clean")
 	}
@@ -59,7 +62,10 @@ func NewAppleDriver(cliPath string, images []string, network string) (*AppleDriv
 	if !appleNetworkName.MatchString(network) || network == "default" {
 		return nil, fmt.Errorf("invalid private Apple container network %q", network)
 	}
-	return &AppleDriver{cli: cliPath, images: allowed, network: network}, nil
+	if !appleNetworkName.MatchString(workerID) {
+		return nil, fmt.Errorf("invalid Apple container worker ID %q", workerID)
+	}
+	return &AppleDriver{cli: cliPath, images: allowed, network: network, workerID: workerID}, nil
 }
 
 func validAppleID(id string) error {
@@ -125,9 +131,10 @@ func (d *AppleDriver) inventory(ctx context.Context) ([]appleContainer, error) {
 	return items, nil
 }
 
-func ownedApple(item appleContainer) bool {
+func (d *AppleDriver) owned(item appleContainer) bool {
 	return strings.HasPrefix(item.Configuration.ID, appleNamePrefix) &&
-		item.Configuration.Labels["gitmoot.sandboxd.owner"] == "apple-v1"
+		item.Configuration.Labels["gitmoot.sandboxd.owner"] == "apple-v1" &&
+		item.Configuration.Labels[appleWorkerLabel] == d.workerID
 }
 
 // lookup rejects a prefix collision without the ownership label; it must not
@@ -142,7 +149,7 @@ func (d *AppleDriver) lookup(ctx context.Context, id string) (appleContainer, bo
 	}
 	for _, item := range items {
 		if item.Configuration.ID == id {
-			if !ownedApple(item) {
+			if !d.owned(item) {
 				return appleContainer{}, false, fmt.Errorf("container %q is not owned by sandboxd", id)
 			}
 			return item, true, nil
@@ -177,7 +184,8 @@ func (d *AppleDriver) lookupVolume(ctx context.Context, id string) (bool, error)
 			return false, errors.New("incomplete Apple volume inventory entry")
 		}
 		if volume.ID == id {
-			if volume.Configuration.Labels["gitmoot.sandboxd.volume"] != "apple-v1" {
+			if volume.Configuration.Labels["gitmoot.sandboxd.volume"] != "apple-v1" ||
+				volume.Configuration.Labels[appleWorkerLabel] != d.workerID {
 				return false, fmt.Errorf("volume %q is not owned by sandboxd", id)
 			}
 			return true, nil
@@ -243,7 +251,7 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 		return Instance{}, fmt.Errorf("volume %q already exists", spec.ID)
 	}
 	out, err := d.output(ctx, "volume", "create", "--label", appleVolumeOwnerLabel,
-		"--opt", "size="+appleVolumeSize, spec.ID)
+		"--label", appleWorkerLabel+"="+d.workerID, "--opt", "size="+appleVolumeSize, spec.ID)
 	if err != nil {
 		return Instance{}, errors.Join(err, d.cleanupCreated(spec.ID))
 	}
@@ -251,7 +259,8 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 		return Instance{}, errors.Join(fmt.Errorf("volume create returned unexpected ID %q", strings.TrimSpace(string(out))), d.cleanupCreated(spec.ID))
 	}
 	out, err = d.output(ctx, "create", "--name", spec.ID,
-		"--label", appleOwnerLabel, "--network", d.network, "--platform", "linux/arm64",
+		"--label", appleOwnerLabel, "--label", appleWorkerLabel+"="+d.workerID,
+		"--network", d.network, "--platform", "linux/arm64",
 		"--cpus", strconv.Itoa(spec.CPUs), "--memory", strconv.Itoa(spec.MemoryMiB)+"M",
 		"--read-only", "--mount", "type=volume,source="+spec.ID+",target=/home/user",
 		"--tmpfs", "/tmp:size=512M,mode=1777", "--tmpfs", "/var/tmp:size=256M,mode=1777",
@@ -299,7 +308,7 @@ func (d *AppleDriver) List(ctx context.Context) ([]Instance, error) {
 	}
 	instances := make([]Instance, 0, len(items))
 	for _, item := range items {
-		if !ownedApple(item) {
+		if !d.owned(item) {
 			continue
 		}
 		if err := validAppleID(item.Configuration.ID); err != nil {

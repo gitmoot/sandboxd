@@ -31,13 +31,13 @@ case "$1" in
   volume)
     case "$2" in
       list) cat %q ;;
-      create) printf 'sandboxd-new\n'; printf '%%s\n' '[{"id":"sandboxd-new","configuration":{"labels":{"gitmoot.sandboxd.volume":"apple-v1"}}}]' > %q ;;
+      create) printf 'sandboxd-new\n'; printf '%%s\n' '[{"id":"sandboxd-new","configuration":{"labels":{"gitmoot.sandboxd.volume":"apple-v1","gitmoot.sandboxd.worker":"mac-local"}}}]' > %q ;;
       delete) printf '[]\n' > %q ;;
       *) exit 88 ;;
     esac ;;
   list) cat %q ;;
-  create) printf 'sandboxd-new\n'; printf '%%s\n' '[{"configuration":{"id":"sandboxd-new","labels":{"gitmoot.sandboxd.owner":"apple-v1"}},"status":{"state":"stopped"}}]' > %q ;;
-  start) printf 'sandboxd-new\n'; printf '%%s\n' '[{"configuration":{"id":"sandboxd-new","labels":{"gitmoot.sandboxd.owner":"apple-v1"}},"status":{"state":"running"}}]' > %q ;;
+  create) printf 'sandboxd-new\n'; printf '%%s\n' '[{"configuration":{"id":"sandboxd-new","labels":{"gitmoot.sandboxd.owner":"apple-v1","gitmoot.sandboxd.worker":"mac-local"}},"status":{"state":"stopped"}}]' > %q ;;
+  start) printf 'sandboxd-new\n'; printf '%%s\n' '[{"configuration":{"id":"sandboxd-new","labels":{"gitmoot.sandboxd.owner":"apple-v1","gitmoot.sandboxd.worker":"mac-local"}},"status":{"state":"running"}}]' > %q ;;
   delete) printf '[]\n' > %q ;;
   stats) printf '%%s\n' '[{"id":"sandboxd-new","cpuUsageUsec":7,"memoryUsageBytes":41943040,"memoryLimitBytes":536870912}]' ;;
   exec)
@@ -55,11 +55,12 @@ esac
 
 func TestAppleInventoryOwnershipAndDestroy(t *testing.T) {
 	cli, log := fakeAppleCLI(t, `[
- {"configuration":{"id":"sandboxd-a1","labels":{"gitmoot.sandboxd.owner":"apple-v1"}},"status":{"state":"stopped"}},
+ {"configuration":{"id":"sandboxd-a1","labels":{"gitmoot.sandboxd.owner":"apple-v1","gitmoot.sandboxd.worker":"mac-local"}},"status":{"state":"stopped"}},
  {"configuration":{"id":"sandboxd-b1","labels":{}},"status":{"state":"running"}},
+ {"configuration":{"id":"sandboxd-c1","labels":{"gitmoot.sandboxd.owner":"apple-v1","gitmoot.sandboxd.worker":"another-worker"}},"status":{"state":"running"}},
  {"configuration":{"id":"other","labels":{}},"status":{"state":"running"}}
 ]`, `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal")
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +71,9 @@ func TestAppleInventoryOwnershipAndDestroy(t *testing.T) {
 	}
 	if err := d.Destroy(ctx, "sandboxd-b1"); err == nil {
 		t.Fatal("destroy accepted a foreign container with the same name prefix")
+	}
+	if err := d.Destroy(ctx, "sandboxd-c1"); err == nil {
+		t.Fatal("destroy accepted a container belonging to another worker")
 	}
 	if err := d.Destroy(ctx, "../sandboxd-a1"); err == nil {
 		t.Fatal("destroy accepted a path instead of a service-owned ID")
@@ -91,7 +95,7 @@ func TestAppleInventoryOwnershipAndDestroy(t *testing.T) {
 
 func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 	cli, log := fakeAppleCLI(t, "[]\n", `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal")
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +151,8 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, expected := range []string{
-		"volume create --label gitmoot.sandboxd.volume=apple-v1 --opt size=10g sandboxd-new",
+		"volume create --label gitmoot.sandboxd.volume=apple-v1 --label gitmoot.sandboxd.worker=mac-local --opt size=10g sandboxd-new",
+		"--label gitmoot.sandboxd.owner=apple-v1 --label gitmoot.sandboxd.worker=mac-local",
 		"network list --format json", "--network sandboxd-internal",
 		"--platform linux/arm64", "--cpus 2 --memory 512M",
 		"--read-only --mount type=volume,source=sandboxd-new,target=/home/user",
@@ -171,7 +176,7 @@ func TestAppleCreateRejectsUntrustedGuestNetwork(t *testing.T) {
 		`[]`,
 	} {
 		cli, calls := fakeAppleCLI(t, "[]", network)
-		d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal")
+		d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local")
 		if err != nil {
 			t.Fatal(err)
 		}

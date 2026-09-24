@@ -26,6 +26,16 @@ have no live ledger row; a failed inventory or destroy blocks admission.
 If the ledger itself is lost, separately inspect labeled private volumes
 without a VM: VM inventory alone cannot prove those volumes were removed.
 
+VMs and volumes carry a `gitmoot.sandboxd.worker` ownership label. Assign
+a unique, stable `--worker-id` of at most 63 lowercase letters, digits, and
+hyphens (starting with a letter), and keep it with the same durable ledger
+across restarts. Stop the old daemon before restarting that identity; never
+use one worker ID with a different ledger. The worker ignores another
+worker's labeled VMs.
+
+Before upgrading from an owner-only-label build, drain its VMs and verify
+its volumes are gone; they cannot be claimed by the worker-scoped driver.
+
 Run conformance against an already running, private sandboxd instance with a real guest image:
 
 ```sh

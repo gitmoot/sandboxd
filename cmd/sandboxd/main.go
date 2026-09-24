@@ -68,7 +68,7 @@ func run(ctx context.Context, args []string) error {
 	if len(apiKey) < 8 || strings.ContainsAny(apiKey, "\r\n") {
 		return fmt.Errorf("API key must be a single nonempty value of at least eight bytes")
 	}
-	driver, err := vm.NewAppleDriver(*cli, []string{*image}, *network)
+	driver, err := vm.NewAppleDriver(*cli, []string{*image}, *network, *workerID)
 	if err != nil {
 		return err
 	}
