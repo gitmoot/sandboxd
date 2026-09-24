@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,30 +29,35 @@ var imageDigest = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 // Config is supplied by root-owned launchd configuration, never by the worker.
 // The bridge address and ULA prefix are pinned to the dedicated host-only network.
 type Config struct {
-	SocketPath      string
-	WorkerUID       int
-	WorkerGID       int
-	WorkerHome      string
-	WorkerID        string
-	ContainerCLI    string
-	Network         string
-	PinImage        string
-	GatewayIPv4     string
-	IPv4Subnet      string
-	IPv6Prefix      string
+	SocketPath   string
+	WorkerUID    int
+	WorkerGID    int
+	WorkerHome   string
+	WorkerID     string
+	ContainerCLI string
+	Network      string
+	PinImage     string
+	GatewayIPv4  string
+	IPv4Subnet   string
+	IPv6Prefix   string
+	// ModelRelayPort enables only a fixed IPv4 guest-to-gateway TCP exception.
+	// Zero keeps the anchor deny-only until the mTLS broker and lease are ready.
+	ModelRelayPort  int
 	MainRulesSHA256 string
 }
 
 type Server struct {
-	config     Config
-	gateway    netip.Addr
-	ipv4       netip.Prefix
-	ipv6       netip.Prefix
-	mainHash   [sha256.Size]byte
-	interfaces func() ([]net.Interface, error)
-	addrs      func(net.Interface) ([]net.Addr, error)
-	pf         func(context.Context, ...string) ([]byte, error)
-	container  func(context.Context, ...string) ([]byte, error)
+	config        Config
+	gateway       netip.Addr
+	ipv4          netip.Prefix
+	ipv6          netip.Prefix
+	mainHash      [sha256.Size]byte
+	modelPass     string
+	modelReadback string
+	interfaces    func() ([]net.Interface, error)
+	addrs         func(net.Interface) ([]net.Addr, error)
+	pf            func(context.Context, ...string) ([]byte, error)
+	container     func(context.Context, ...string) ([]byte, error)
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -79,12 +85,21 @@ func NewServer(cfg Config) (*Server, error) {
 		prefix.Masked() != prefix || !prefix.Addr().IsPrivate() {
 		return nil, fmt.Errorf("firewall IPv6 network must be a canonical private /48 to /64 prefix")
 	}
+	if cfg.ModelRelayPort != 0 && (cfg.ModelRelayPort < 1024 || cfg.ModelRelayPort > 65535) {
+		return nil, fmt.Errorf("model relay port must be 1024-65535 or zero to deny all")
+	}
 	rawHash, err := hex.DecodeString(cfg.MainRulesSHA256)
 	if err != nil || len(rawHash) != sha256.Size {
 		return nil, fmt.Errorf("root-configured PF main rules SHA-256 is required")
 	}
 	s := &Server{config: cfg, gateway: gateway, ipv4: ipv4, ipv6: prefix, interfaces: net.Interfaces,
 		addrs: func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }}
+	if cfg.ModelRelayPort != 0 {
+		endpoint := " inet proto tcp from " + ipv4.String() + " to " + gateway.String() + " port "
+		port := strconv.Itoa(cfg.ModelRelayPort)
+		s.modelPass = endpoint + port + "\n"
+		s.modelReadback = endpoint + "= " + port + " flags S/SA keep state\n"
+	}
 	copy(s.mainHash[:], rawHash)
 	s.pf = s.runPF
 	s.container = s.runContainer
@@ -145,14 +160,22 @@ func (s *Server) discover() (string, error) {
 	return found, nil
 }
 
-func policy(bridge string) string {
-	return "block in quick on " + bridge + " inet from any to any\n" +
+func (s *Server) policy(bridge string) string {
+	rules := "block in quick on " + bridge + " inet from any to any\n" +
 		"block in quick on " + bridge + " inet6 from any to any\n"
+	if s.modelPass != "" {
+		return "pass in quick on " + bridge + s.modelPass + rules
+	}
+	return rules
 }
 
-func canonicalPolicy(bridge string) string {
-	return "block drop in quick on " + bridge + " inet all\n" +
+func (s *Server) canonicalPolicy(bridge string) string {
+	rules := "block drop in quick on " + bridge + " inet all\n" +
 		"block drop in quick on " + bridge + " inet6 all"
+	if s.modelReadback != "" {
+		return "pass in quick on " + bridge + s.modelReadback + rules
+	}
+	return rules
 }
 
 func (s *Server) pfReady(ctx context.Context, bridge string) error {
@@ -218,8 +241,8 @@ func (s *Server) check(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if rules != canonicalPolicy(bridge) {
-		return "", fmt.Errorf("firewall anchor does not contain the exact deny policy for %s", bridge)
+	if rules != s.canonicalPolicy(bridge) {
+		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s", bridge)
 	}
 	return bridge, nil
 }
@@ -242,7 +265,7 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if rules == canonicalPolicy(bridge) {
+	if rules == s.canonicalPolicy(bridge) {
 		return s.clearBridgeStates(ctx, bridge)
 	}
 	if rules != "" {
@@ -257,7 +280,7 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 		file.Close()
 		return "", err
 	}
-	if _, err := io.WriteString(file, policy(bridge)); err != nil {
+	if _, err := io.WriteString(file, s.policy(bridge)); err != nil {
 		file.Close()
 		return "", err
 	}
@@ -303,11 +326,11 @@ func (s *Server) disarm(ctx context.Context) error {
 		return nil
 	}
 	parts := strings.Split(rules, "\n")
-	if len(parts) != 2 || !strings.HasPrefix(parts[0], "block drop in quick on ") {
+	if len(parts) < 2 || !strings.HasPrefix(parts[len(parts)-2], "block drop in quick on ") {
 		return fmt.Errorf("refusing to clear an unexpected PF anchor")
 	}
-	bridge := strings.TrimSuffix(strings.TrimPrefix(parts[0], "block drop in quick on "), " inet all")
-	if !bridgeName.MatchString(bridge) || rules != canonicalPolicy(bridge) {
+	bridge := strings.TrimSuffix(strings.TrimPrefix(parts[len(parts)-2], "block drop in quick on "), " inet all")
+	if !bridgeName.MatchString(bridge) || rules != s.canonicalPolicy(bridge) {
 		return fmt.Errorf("refusing to clear an unexpected PF anchor")
 	}
 	if _, err := s.pf(ctx, "-a", anchor, "-F", "rules"); err != nil {

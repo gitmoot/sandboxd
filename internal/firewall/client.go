@@ -23,7 +23,7 @@ type response struct {
 }
 
 // Gate is the root helper's attestation contract. A successful Check means
-// PF is enabled and the exact deny policy is active on the pinned bridge.
+// PF is enabled and the exact root-configured scoped policy is active on the pinned bridge.
 type Gate interface {
 	Arm(context.Context) (string, error)
 	Check(context.Context) error

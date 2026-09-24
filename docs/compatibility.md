@@ -60,24 +60,31 @@ ephemeral Mac bridge (`bridge102`), but the broad deny-all canary expired withou
 a valid counter read. No production PF policy or private HTTPS endpoint was
 deployed. Do not run untrusted PR code or production routing on that evidence.
 
-The selected root-owned PF helper (`cmd/sandboxd-pf-helper`) is a **local
-implementation, not yet installed or validated on the Mac**. Its launchd
+The selected root-owned PF helper (`cmd/sandboxd-pf-helper`) has passed a
+bounded deny-only Mac canary, but is **not installed as a launchd service or
+approved for production traffic**. Its root-owned launchd
 configuration must fix the dedicated worker UID/GID and HOME, worker ID,
 root-owned `container` CLI, `sandboxd-internal` network, trusted pin image at
 an OCI digest, IPv4 gateway and subnet, IPv6 ULA prefix, SHA-256 of reviewed
 `pfctl -sr` output, and a socket under a root-owned non-writable directory.
 It checks the network label/mode, a read-only capability-dropped pin VM,
 unique live bridge, PF enabled and not skipping that interface, unchanged
-main rules, and the exact IPv4/IPv6 deny anchor before admitting work. Arm
+main rules, and the exact configured scoped anchor before admitting work. Arm
 requires no other VM attached and clears old PF states only on that bridge.
+By default `--model-relay-port=0` retains the exact deny-only anchor. A
+nonzero root-configured port adds only a TCP pass from the pinned guest IPv4
+subnet to the pinned gateway address and that port; both IPv4/IPv6 block rules
+still follow. The helper refuses unrelated or changed anchor rules.
 `sandboxd` requires the same pin digest through `--pin-image` and the helper
 socket through `--pf-socket`; it stops
 ordinary guests on gate failure and only requests anchor removal after every
 VM has been deleted.
-The helper deliberately leaves the deny anchor in place on crash. The digest
-image must be provisioned first; the existing tagged Alpine cache was not
-available by digest. Neither launchd installation nor a live root-helper,
-full deny, egress, reboot, or failure-mode canary has been completed.
+The helper deliberately leaves the anchor in place on crash. The supervised
+deny-only Mac canary blocked previously successful guest IPv4, IPv6 ULA, and
+link-local connections while unrelated Mac/tailnet test traffic worked; the
+trusted pin was removed and the owned anchor read back empty. Live rule
+counters, helper failure while armed, reboot recovery, and any model pass
+rule remain unverified. Do not admit untrusted work.
 
 The optional fixed model relay transports TLS bytes without terminating TLS
 or handling credentials. Gitmoot's mTLS broker listens on its own
@@ -85,12 +92,15 @@ or handling credentials. Gitmoot's mTLS broker listens on its own
 certificate names the address seen by the guest. A supervised SSH reverse
 forward from that broker to the Mac binds only Mac `127.0.0.1:43184`:
 `ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
-The current PF anchor is deny-only: it blocks guest access to the model relay
-at `192.168.128.1:8443` as well as all other Mac services. Do **not** enable
-model access with this policy. Once the real mTLS broker and scoped lease exist,
-add a fixed guest-only pass rule before the deny rules and prove its counters,
-certificate rejection, lease expiry, and unrelated-client denial on the Mac.
-Only then launch sandboxd with
+The default PF anchor blocks the guest's model relay at
+`192.168.128.1:8443` along with all other Mac services. An optional
+root-configured `--model-relay-port=8443` generates only a guest-subnet TCP
+pass to the pinned IPv4 gateway and that port before the deny rules; a Mac
+`pfctl -vnf` syntax-only check rendered the pass and both denies, but **no
+model pass rule has been loaded**. Do not set this flag or enable model access
+until Gitmoot's mTLS broker and scoped lease are provisioned and the pass
+counter, certificate rejection, lease expiry, and unrelated-client denial
+are proved on the Mac. Then launch sandboxd with
 `--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184 --model-relay-guest-cidr 192.168.128.0/24`.
 The relay admits only guest
 subnet source addresses, caps concurrent connections, and forwards to that

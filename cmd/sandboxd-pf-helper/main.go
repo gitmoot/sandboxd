@@ -27,6 +27,7 @@ func run(ctx context.Context, args []string) error {
 	ipv4 := flags.String("network-ipv4", "", "pinned dedicated network IPv4 subnet")
 	prefix := flags.String("network-ipv6", "", "pinned dedicated network ULA prefix")
 	mainHash := flags.String("main-rules-sha256", "", "SHA-256 of the reviewed pfctl -sr output")
+	modelRelayPort := flags.Int("model-relay-port", 0, "fixed guest-to-gateway model TCP port; zero retains deny-only PF")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -38,6 +39,7 @@ func run(ctx context.Context, args []string) error {
 		WorkerHome: *home, WorkerID: *workerID, ContainerCLI: *cli,
 		Network: *network, PinImage: *pinImage,
 		GatewayIPv4: *gateway, IPv4Subnet: *ipv4, IPv6Prefix: *prefix, MainRulesSHA256: *mainHash,
+		ModelRelayPort: *modelRelayPort,
 	})
 	if err != nil {
 		return err
