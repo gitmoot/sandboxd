@@ -127,7 +127,7 @@ func TestGuestUploadRequiresCapabilityAndConfinedPath(t *testing.T) {
 	if got := request("http://mac.private.test/files?username=user&path=/home/user/../etc/passwd", "job-capability").Code; got != http.StatusBadRequest {
 		t.Fatalf("traversal accepted: %d", got)
 	}
-	if got := request("http://mac.private.test/files?username=user&path=/home/user/input", "job-capability").Code; got != http.StatusOK || guest.uploaded != "source bytes" {
+	if got := request("http://mac.private.test:8443/files?username=user&path=/home/user/input", "job-capability").Code; got != http.StatusOK || guest.uploaded != "source bytes" {
 		t.Fatalf("valid upload failed: status=%d data=%q", got, guest.uploaded)
 	}
 	h.MaxUploadBytes = 4

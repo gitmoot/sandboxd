@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,8 +41,10 @@ func (d *fakeDriver) List(context.Context) ([]vm.Instance, error) {
 		return nil, d.listError
 	}
 	out := make([]vm.Instance, 0, len(d.instances))
-	for _, instance := range d.instances {
-		out = append(out, instance)
+	for id, instance := range d.instances {
+		if strings.HasPrefix(id, "sandboxd-") {
+			out = append(out, instance)
+		}
 	}
 	return out, nil
 }
@@ -52,7 +55,7 @@ func (d *fakeDriver) Run(context.Context, string, vm.Command, io.Writer, io.Writ
 func (d *fakeDriver) Destroy(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if _, ok := d.instances[id]; !ok {
+	if _, ok := d.instances[id]; !ok || !strings.HasPrefix(id, "sandboxd-") {
 		return errors.New("not owned by driver")
 	}
 	delete(d.instances, id)
@@ -330,5 +333,29 @@ func TestNewAttemptFencesOldGuestWithoutDeletingNewVM(t *testing.T) {
 	}
 	if !service.Authorize(second.ID, second.Token) {
 		t.Fatal("old attempt teardown revoked the new attempt")
+	}
+}
+
+func TestReconcileReapsOwnedVMWithoutLedgerBeforeAdmitting(t *testing.T) {
+	const orphan = "sandboxd-00000000000000000000000000000001"
+	driver := &fakeDriver{instances: map[string]vm.Instance{orphan: {ID: orphan, Running: true}}}
+	service := openService(t, driver) // Fresh ledger after loss of the prior ledger file.
+	created := request(t, service, http.MethodPost, "/sandboxes", createBody("new-job", 1))
+	if created.Code != http.StatusCreated {
+		t.Fatalf("fresh reservation after orphan discovery: %d %s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		ID    string `json:"sandboxID"`
+		Token string `json:"envdAccessToken"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	driver.mu.Lock()
+	orphanGone := len(driver.destroyed) == 1 && driver.destroyed[0] == orphan
+	oneLiveVM := len(driver.instances) == 1 && driver.instances[payload.ID].Running
+	driver.mu.Unlock()
+	if !orphanGone || !oneLiveVM || !service.Authorize(payload.ID, payload.Token) {
+		t.Fatal("ledger loss left an owned orphan running or revoked the replacement VM")
 	}
 }

@@ -51,7 +51,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, ok := sandboxHostID(r.Host, h.Domain)
-	if h.GatewayHost != "" && strings.EqualFold(r.Host, h.GatewayHost) {
+	if h.GatewayHost != "" && strings.EqualFold(hostName(r.Host), hostName(h.GatewayHost)) {
 		headerID := r.Header.Get("E2b-Sandbox-Id")
 		if r.Header.Get("E2b-Sandbox-Port") == "49983" && validSandboxID(headerID) {
 			id, ok = headerID, true
@@ -76,11 +76,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func sandboxHostID(host, domain string) (string, bool) {
+func hostName(host string) string {
 	if name, _, err := net.SplitHostPort(host); err == nil {
 		host = name
 	}
-	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return strings.TrimSuffix(host, ".")
+}
+
+func sandboxHostID(host, domain string) (string, bool) {
+	host = strings.ToLower(hostName(host))
 	domain = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(domain), "."))
 	if domain == "" {
 		return "", false

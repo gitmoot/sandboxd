@@ -21,6 +21,11 @@ reserved as `unknown` for reconciliation. Set
 `SANDBOXD_CONFORMANCE_CANCEL=1` to check cancellation against a real VM;
 the Mac run removed both its VM and its private volume.
 
+Before reserving capacity, reconciliation destroys driver-owned VMs that
+have no live ledger row; a failed inventory or destroy blocks admission.
+If the ledger itself is lost, separately inspect labeled private volumes
+without a VM: VM inventory alone cannot prove those volumes were removed.
+
 Run conformance against an already running, private sandboxd instance with a real guest image:
 
 ```sh

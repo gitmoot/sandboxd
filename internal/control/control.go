@@ -364,8 +364,9 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 }
 
 // reconcile uses only the driver's complete successful inventory. Unknown or
-// failed observations never release a reservation, and only ledger-owned IDs
-// may be passed to Destroy. All callers hold s.mu.
+// failed observations never release a reservation. List returns only VMs
+// owned by this driver; orphaned owned VMs must be destroyed before admission.
+// All callers hold s.mu.
 func (s *Service) reconcile(ctx context.Context) error {
 	instances, err := s.driver.List(ctx)
 	if err != nil {
@@ -388,6 +389,7 @@ func (s *Service) reconcile(ctx context.Context) error {
 	now := time.Now()
 	for _, row := range rows {
 		instance, exists := inventory[row.ID]
+		delete(inventory, row.ID)
 		// A failed Create can complete late; even a formerly running VM can
 		// leave a job-owned volume after its container disappears. Confirm
 		// allocation cleanup before marking absence.
@@ -416,6 +418,11 @@ func (s *Service) reconcile(ctx context.Context) error {
 			return err
 		}
 		if err := s.ledger.SetState(ctx, row.ID, "gone"); err != nil {
+			return err
+		}
+	}
+	for id := range inventory {
+		if err := s.driver.Destroy(ctx, id); err != nil {
 			return err
 		}
 	}
