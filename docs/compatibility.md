@@ -85,8 +85,12 @@ or handling credentials. Gitmoot's mTLS broker listens on its own
 certificate names the address seen by the guest. A supervised SSH reverse
 forward from that broker to the Mac binds only Mac `127.0.0.1:43184`:
 `ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
-Only after a Mac admin installs and proves the root helper's firewall policy
-and a real mTLS model lease exists, launch sandboxd with
+The current PF anchor is deny-only: it blocks guest access to the model relay
+at `192.168.128.1:8443` as well as all other Mac services. Do **not** enable
+model access with this policy. Once the real mTLS broker and scoped lease exist,
+add a fixed guest-only pass rule before the deny rules and prove its counters,
+certificate rejection, lease expiry, and unrelated-client denial on the Mac.
+Only then launch sandboxd with
 `--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184 --model-relay-guest-cidr 192.168.128.0/24`.
 The relay admits only guest
 subnet source addresses, caps concurrent connections, and forwards to that

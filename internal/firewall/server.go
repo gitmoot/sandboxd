@@ -384,7 +384,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	// Chown/Chmod after Listen would leave a window where other local users
+	// could connect. No other goroutine creates files during this operation.
+	previousUmask := syscall.Umask(0o177)
 	listener, err := net.Listen("unix", s.config.SocketPath)
+	syscall.Umask(previousUmask)
 	if err != nil {
 		return err
 	}

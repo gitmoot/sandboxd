@@ -574,15 +574,15 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 	}
 	err = c.Wait()
 	close(done)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	select {
 	case gateErr := <-failed:
 		cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
 		defer stop()
 		return 0, errors.Join(fmt.Errorf("firewall lost during guest execution: %w", gateErr), d.Destroy(cleanupCtx, id))
 	default:
-	}
-	if ctx.Err() != nil {
-		return 0, ctx.Err()
 	}
 	if err == nil {
 		return 0, nil
