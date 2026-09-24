@@ -41,6 +41,9 @@ func run(ctx context.Context, args []string) error {
 	workerID := flags.String("worker-id", "", "stable trusted worker identity recorded for every VM")
 	cpus := flags.Int("cpus", 2, "CPU limit for each VM")
 	memory := flags.Int("memory-mib", 4096, "memory limit in MiB for each VM")
+	relayListen := flags.String("model-relay-listen", "", "optional IPv4 listener for fixed mTLS model gateway relay")
+	relayTarget := flags.String("model-relay-target", "", "loopback endpoint of a fixed SSH reverse tunnel")
+	relayGuestCIDR := flags.String("model-relay-guest-cidr", "", "private IPv4 guest subnet permitted to connect")
 	maxVMs := flags.Int("max-vms", 2, "maximum concurrent VMs")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-job lifetime")
 	if err := flags.Parse(args); err != nil {
@@ -93,16 +96,39 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
+	relayListener, guestSubnet, err := openModelRelay(*relayListen, *relayTarget, *relayGuestCIDR)
+	if err != nil {
+		return err
+	}
+	if relayListener != nil {
+		defer relayListener.Close()
+	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 20}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	log.Printf("sandboxd listening on %s behind private HTTPS proxy", listener.Addr())
+	var relayDone chan error
+	if relayListener != nil {
+		relayDone = make(chan error, 1)
+		go func() { relayDone <- serveModelRelay(ctx, relayListener, *relayTarget, guestSubnet) }()
+		log.Printf("model relay listening on %s for %s, forwarding only to %s", relayListener.Addr(), guestSubnet, *relayTarget)
+	}
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
 		return err
+	case err := <-relayDone:
+		_ = server.Close()
+		if err == nil && ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			return errors.New("model relay stopped unexpectedly")
+		}
+		return fmt.Errorf("model relay stopped: %w", err)
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()

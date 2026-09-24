@@ -59,4 +59,21 @@ run untrusted PR code until Mac admin firewall rules deny guest-subnet access
 to the host except the fixed mTLS gateway relay. No firewall rule or private
 HTTPS endpoint was deployed in the compatibility exercise.
 
+The optional fixed model relay transports TLS bytes without terminating TLS
+or handling credentials. Gitmoot's mTLS broker listens on its own
+`127.0.0.1:8443` and advertises `https://192.168.128.1:8443`, so its server
+certificate names the address seen by the guest. A supervised SSH reverse
+forward from that broker to the Mac binds only Mac `127.0.0.1:43184`:
+`ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
+Only after
+the Mac firewall is installed and verified, launch sandboxd with
+`--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184 --model-relay-guest-cidr 192.168.128.0/24`.
+The relay admits only guest
+subnet source addresses, caps concurrent connections, and forwards to that
+one loopback port; Gitmoot's mTLS certificate and short-lived lease still
+authorize each model request. Source admission is not a firewall for other
+Mac services. Recheck the actual network subnet after any Apple network
+recreation. A dummy broker round-trip passed, but no PF rule, real model
+lease, or production relay was enabled.
+
 Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result.
