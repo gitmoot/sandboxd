@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gitmoot/sandboxd/internal/firewall"
 )
 
 const (
@@ -28,6 +30,7 @@ const (
 var appleID = regexp.MustCompile(`^sandboxd-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 var envName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z_0-9]*$`)
 var appleNetworkName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+var pinDigest = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 
 // AppleDriver uses Apple container 1.4.1's one-VM-per-container runtime.
 // Each guest has a read-only root, a fixed-size private ext4 home volume,
@@ -36,21 +39,30 @@ var appleNetworkName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 type AppleDriver struct {
 	cli      string
 	images   map[string]struct{}
+	pinImage string
 	network  string
 	workerID string
+	gate     firewall.Gate
 }
 
 var _ Driver = (*AppleDriver)(nil)
 
 // NewAppleDriver requires an absolute CLI path, an exact image allowlist, a
-// dedicated host-only network, and a stable worker identity. It never falls
-// back to the default NAT or claims another worker's VMs.
-func NewAppleDriver(cliPath string, images []string, network, workerID string) (*AppleDriver, error) {
+// dedicated host-only network, a stable worker identity, and a privileged PF
+// gate. It never falls back to the default NAT or runs without that gate.
+func NewAppleDriver(cliPath string, images []string, network, workerID, pinImage string, gate firewall.Gate) (*AppleDriver, error) {
 	if !filepath.IsAbs(cliPath) || filepath.Clean(cliPath) != cliPath || strings.ContainsRune(cliPath, 0) {
 		return nil, fmt.Errorf("Apple container CLI path must be absolute and clean")
 	}
 	if len(images) == 0 {
 		return nil, fmt.Errorf("Apple container image allowlist must not be empty")
+	}
+	if gate == nil {
+		return nil, fmt.Errorf("privileged firewall gate is required")
+	}
+	if pinImage == "" || pinImage[0] == '-' || !pinDigest.MatchString(pinImage) ||
+		strings.IndexFunc(pinImage, func(r rune) bool { return r <= ' ' || r == 127 }) >= 0 {
+		return nil, fmt.Errorf("trusted pin VM image must be an OCI digest reference")
 	}
 	allowed := make(map[string]struct{}, len(images))
 	for _, image := range images {
@@ -65,7 +77,7 @@ func NewAppleDriver(cliPath string, images []string, network, workerID string) (
 	if !appleNetworkName.MatchString(workerID) {
 		return nil, fmt.Errorf("invalid Apple container worker ID %q", workerID)
 	}
-	return &AppleDriver{cli: cliPath, images: allowed, network: network, workerID: workerID}, nil
+	return &AppleDriver{cli: cliPath, images: allowed, pinImage: pinImage, network: network, workerID: workerID, gate: gate}, nil
 }
 
 func validAppleID(id string) error {
@@ -103,6 +115,33 @@ type appleContainer struct {
 	Configuration struct {
 		ID     string            `json:"id"`
 		Labels map[string]string `json:"labels"`
+		Image  struct {
+			Reference string `json:"reference"`
+		} `json:"image"`
+		Networks []struct {
+			Network string `json:"network"`
+		} `json:"networks"`
+		InitProcess struct {
+			Executable string   `json:"executable"`
+			Arguments  []string `json:"arguments"`
+			User       struct {
+				ID struct {
+					UID int `json:"uid"`
+					GID int `json:"gid"`
+				} `json:"id"`
+			} `json:"user"`
+		} `json:"initProcess"`
+		Mounts           []json.RawMessage `json:"mounts"`
+		PublishedPorts   []json.RawMessage `json:"publishedPorts"`
+		PublishedSockets []json.RawMessage `json:"publishedSockets"`
+		DNS              json.RawMessage   `json:"dns"`
+		CapAdd           []string          `json:"capAdd"`
+		Resources        struct {
+			CPUs          int   `json:"cpus"`
+			MemoryInBytes int64 `json:"memoryInBytes"`
+		} `json:"resources"`
+		ReadOnly bool     `json:"readOnly"`
+		CapDrop  []string `json:"capDrop"`
 	} `json:"configuration"`
 	Status struct {
 		State string `json:"state"`
@@ -233,6 +272,9 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if spec.CPUs <= 0 || spec.MemoryMiB <= 0 {
 		return Instance{}, fmt.Errorf("CPU and memory limits must be positive")
 	}
+	if err := d.Ready(ctx); err != nil {
+		return Instance{}, fmt.Errorf("firewall is not armed before guest creation: %w", err)
+	}
 	if err := d.checkNetwork(ctx); err != nil {
 		return Instance{}, err
 	}
@@ -287,6 +329,9 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 			err = fmt.Errorf("container %q did not become running", spec.ID)
 		}
 		return Instance{}, errors.Join(err, d.cleanupCreated(spec.ID))
+	}
+	if err := d.Ready(ctx); err != nil {
+		return Instance{}, errors.Join(fmt.Errorf("firewall lost after guest start: %w", err), d.cleanupCreated(spec.ID))
 	}
 	if _, err := d.output(ctx, "exec", "--user", "0:0", spec.ID,
 		"/bin/chown", "1000:1000", "/home/user"); err != nil {
@@ -458,6 +503,9 @@ func (d *AppleDriver) CopyIn(ctx context.Context, id, source, destination string
 // Cancellation kills the host CLI; Destroy tears down remaining guest processes.
 // OnStart receives the host CLI PID, not the guest PID.
 func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdout, stderr io.Writer) (int, error) {
+	if err := d.Ready(ctx); err != nil {
+		return 0, fmt.Errorf("firewall is not armed before guest execution: %w", err)
+	}
 	item, found, err := d.lookup(ctx, id)
 	if err != nil {
 		return 0, err
@@ -496,15 +544,43 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 	}
 	args = append(args, id)
 	args = append(args, command.Args...)
-	c := d.command(ctx, args...)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c := d.command(runCtx, args...)
 	c.Stdout, c.Stderr = stdout, stderr
 	if err := c.Start(); err != nil {
 		return 0, err
 	}
+	failed := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := d.Ready(runCtx); err != nil {
+					failed <- err
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	if command.OnStart != nil {
 		command.OnStart(c.Process.Pid)
 	}
 	err = c.Wait()
+	close(done)
+	select {
+	case gateErr := <-failed:
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		return 0, errors.Join(fmt.Errorf("firewall lost during guest execution: %w", gateErr), d.Destroy(cleanupCtx, id))
+	default:
+	}
 	if ctx.Err() != nil {
 		return 0, ctx.Err()
 	}
