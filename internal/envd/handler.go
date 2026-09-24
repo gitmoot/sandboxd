@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -22,6 +23,7 @@ const (
 	maxStartBytes    = 1 << 20
 	maxOutputChunk   = 64 << 10
 	defaultMaxUpload = 512 << 20
+	defaultMaxOutput = 64 << 20
 	connectMediaType = "application/connect+json"
 )
 
@@ -40,6 +42,7 @@ type Handler struct {
 	// hostname instead of requiring wildcard sandbox DNS and certificates.
 	GatewayHost    string
 	MaxUploadBytes int64
+	MaxOutputBytes int64
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -211,7 +214,11 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request, id, token string
 	w.Header().Set("connect-protocol-version", "1")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
-	stream := &eventWriter{w: w, flush: flusher}
+	limit := h.MaxOutputBytes
+	if limit <= 0 {
+		limit = defaultMaxOutput
+	}
+	stream := &eventWriter{w: w, flush: flusher, outputLimit: limit}
 	started := false
 	command := vm.Command{Args: append([]string{request.Process.Command}, request.Process.Args...), Dir: request.Process.Dir, Env: request.Process.Env, User: "user"}
 	command.OnStart = func(pid int) {
@@ -221,7 +228,10 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request, id, token string
 		}
 	}
 	code, err := h.Driver.Run(r.Context(), id, command, &outputWriter{stream: stream, kind: "stdout"}, &outputWriter{stream: stream, kind: "stderr"})
-	if err != nil || !started {
+	stream.outputMu.Lock()
+	outputErr := stream.outputErr
+	stream.outputMu.Unlock()
+	if err != nil || outputErr != nil || !started {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = h.Authorizer.Abort(cleanup, id, token)
 		cancel()
@@ -239,9 +249,13 @@ func safeGuestDir(dir string) bool {
 }
 
 type eventWriter struct {
-	mu    sync.Mutex
-	w     http.ResponseWriter
-	flush http.Flusher
+	mu          sync.Mutex
+	outputMu    sync.Mutex
+	w           http.ResponseWriter
+	flush       http.Flusher
+	outputBytes int64
+	outputErr   error
+	outputLimit int64
 }
 
 func (s *eventWriter) event(event any) error {
@@ -274,11 +288,22 @@ type outputWriter struct {
 }
 
 func (o *outputWriter) Write(p []byte) (int, error) {
+	o.stream.outputMu.Lock()
+	defer o.stream.outputMu.Unlock()
+	if o.stream.outputErr != nil {
+		return 0, o.stream.outputErr
+	}
 	for offset := 0; offset < len(p); {
 		end := min(offset+maxOutputChunk, len(p))
+		if int64(end-offset) > o.stream.outputLimit-o.stream.outputBytes {
+			o.stream.outputErr = errors.New("guest output exceeds stream limit")
+			return offset, o.stream.outputErr
+		}
 		if err := o.stream.event(map[string]any{"event": map[string]any{"data": map[string][]byte{o.kind: p[offset:end]}}}); err != nil {
+			o.stream.outputErr = err
 			return offset, err
 		}
+		o.stream.outputBytes += int64(end - offset)
 		offset = end
 	}
 	return len(p), nil

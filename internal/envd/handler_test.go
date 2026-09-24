@@ -225,3 +225,55 @@ func TestCanceledGuestStreamRevokesBeforeReturning(t *testing.T) {
 		t.Fatal("canceled stream did not revoke its VM")
 	}
 }
+
+type noisyGuestFixture struct{ guestFixture }
+
+func (*noisyGuestFixture) Run(_ context.Context, _ string, command vm.Command, stdout, stderr io.Writer) (int, error) {
+	command.OnStart(123)
+	if _, err := stdout.Write([]byte("good")); err != nil {
+		return 0, err
+	}
+	// A guest exit status can mask an asynchronous stdout copy error in os/exec.
+	_, _ = stderr.Write([]byte("overflow"))
+	return 0, nil
+}
+
+func TestGuestOutputBudgetAbortsVM(t *testing.T) {
+	auth := abortRecorder{calls: make(chan string, 1)}
+	h := &Handler{Driver: &noisyGuestFixture{}, Authorizer: auth, GatewayHost: "mac.private.test", MaxOutputBytes: 4}
+	body := framed(0, []byte(`{"process":{"cmd":"/bin/echo","cwd":"/home/user"}}`))
+	r := httptest.NewRequest(http.MethodPost, "http://mac.private.test/process.Process/Start", bytes.NewReader(body))
+	r.Header.Set("X-Access-Token", "job-capability")
+	r.Header.Set("E2b-Sandbox-Id", "sandboxd-a1")
+	r.Header.Set("E2b-Sandbox-Port", "49983")
+	r.Header.Set("Content-Type", connectMediaType)
+	r.Header.Set("connect-protocol-version", "1")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unexpected process response: %d", w.Code)
+	}
+	select {
+	case got := <-auth.calls:
+		if got != "sandboxd-a1:job-capability" {
+			t.Fatalf("wrong VM aborted after output overflow: %s", got)
+		}
+	default:
+		t.Fatal("overflow did not abort the VM")
+	}
+	frames := bytes.NewReader(w.Body.Bytes())
+	_, _ = nextFrame(t, frames) // start
+	_, data := nextFrame(t, frames)
+	var event struct {
+		Event struct {
+			Data map[string][]byte `json:"data"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil || string(event.Event.Data["stdout"]) != "good" {
+		t.Fatalf("stream lost the accepted output: %s, %v", data, err)
+	}
+	flag, terminal := nextFrame(t, frames)
+	if flag != 2 || !bytes.Contains(terminal, []byte("unavailable")) || frames.Len() != 0 {
+		t.Fatalf("overflow returned a successful process stream: %s", terminal)
+	}
+}
