@@ -212,6 +212,13 @@ the worker. It then:
   closed afterwards;
 - installs itself as `/usr/local/libexec/sandboxd-pf-helper` and the
   release's `sandboxd` as `/usr/local/libexec/sandboxd` (root:wheel, 0755);
+- runs, from then on, every `container` command as the worker inside the
+  worker's own launchd session: `launchctl asuser <uid> /usr/bin/sudo -n -H
+  -u #<uid> -g #<gid> -- container …`. Apple's container API server is a
+  per-user launchd agent that a system daemon can't reach directly. This
+  needs the stock `root ALL=(ALL) ALL` sudoers rule (or any rule letting
+  root run commands as the worker without a password); with a sudoers that
+  denies it, every arm fails with sudo's message in the helper log;
 - writes `/Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist`
   (starts at boot, restarted if it exits) and loads it, replacing a loaded
   job;

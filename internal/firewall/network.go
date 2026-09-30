@@ -18,6 +18,10 @@ func (s *Server) runContainer(ctx context.Context, args ...string) ([]byte, erro
 	name, argv := workerContainerCommand(s.config.WorkerUID, s.config.WorkerGID, s.config.ContainerCLI, args)
 	cmd := exec.CommandContext(ctx, name, argv...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + s.config.WorkerHome}
+	// launchctl asuser spawns sudo, which spawns the CLI: on timeout, kill the
+	// whole process group, not just launchctl, so a wedged CLI can't linger.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	out, err := cmd.Output()
 	if err != nil {
 		var exit *exec.ExitError
