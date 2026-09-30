@@ -341,6 +341,9 @@ func TestSlotConfigurationIsStrict(t *testing.T) {
 		"name=sandboxd-slot-1,ipv4=192.168.130.7/24,gw=192.168.130.1,ipv6=fd1e:68b8:2ef4:5d01::/64",
 		"name=sandboxd-slot-1,ipv4=8.8.8.0/24,gw=8.8.8.1,ipv6=fd1e:68b8:2ef4:5d01::/64",
 		"name=sandboxd-slot-1,ipv4=192.168.130.0/24,gw=192.168.130.1,ipv6=2001:db8::/64",
+		// Wider than /24: the model relay only admits a /24-or-narrower
+		// guest subnet, so such a slot would fail at startup with the relay on.
+		"name=sandboxd-slot-1,ipv4=192.168.128.0/23,gw=192.168.128.1,ipv6=fd1e:68b8:2ef4:5d01::/64",
 	} {
 		if _, err := ParseSlot(value); err == nil {
 			t.Errorf("accepted slot %q", value)

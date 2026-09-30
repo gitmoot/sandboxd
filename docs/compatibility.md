@@ -121,7 +121,7 @@ sandboxd-pf-helper ... \
 sandboxd ... (the same three --slot flags) [--max-vms N]
 ```
 
-Each `--slot` needs exactly the keys `name`, `ipv4` (canonical private /16 to
+Each `--slot` needs exactly the keys `name`, `ipv4` (canonical private /24 to
 /30 containing `gw`), `gw` (private IPv4) and `ipv6` (canonical ULA /48 to
 /64), in any order; unknown or repeated keys, a duplicate network, or
 overlapping subnets are rejected; at most 16 slots. `--max-vms` defaults to
