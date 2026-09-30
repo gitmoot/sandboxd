@@ -46,7 +46,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	workerID := flags.String("worker-id", "", "stable trusted worker identity recorded for every VM")
 	cpus := flags.Int("cpus", 2, "CPU limit for each VM")
 	memory := flags.Int("memory-mib", 4096, "memory limit in MiB for each VM")
-	relayListen := flags.String("model-relay-listen", "", "optional IPv4 listener for fixed mTLS model gateway relay")
+	relayListen := flags.String("model-relay-listen", "", "optional <first slot gateway>:<port> listener for the fixed mTLS model gateway relay")
 	relayTarget := flags.String("model-relay-target", "", "loopback endpoint of a fixed SSH reverse tunnel")
 	maxVMs := flags.Int("max-vms", 0, "maximum concurrent VMs; zero means one per slot, never more than the slots")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-job lifetime")
@@ -73,6 +73,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	if *maxVMs < 1 || *maxVMs > len(slots) {
 		return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slots))
+	}
+	if err := checkModelRelayListen(*relayListen, slots[0].Gateway); err != nil {
+		return err
 	}
 	key, err := os.ReadFile(*keyFile)
 	if err != nil {

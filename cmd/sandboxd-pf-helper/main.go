@@ -46,7 +46,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		flags.StringVar(&opts.PinImage, "pin-image", helpersvc.DefaultPinImage, "trusted digest-pinned bridge VM image")
 		flags.StringVar(&opts.ContainerCLI, "container-cli", helpersvc.DefaultContainerCLI, "root-owned Apple container CLI")
 		flags.StringVar(&opts.MainRulesSHA256, "main-rules-sha256", "", "SHA-256 of the reviewed pfctl -sr output (default: of the current output)")
-		flags.IntVar(&opts.ModelRelayPort, "model-relay-port", 0, "fixed guest-to-gateway model TCP port; zero retains deny-only PF")
+		flags.IntVar(&opts.ModelRelayPort, "model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero retains deny-only PF")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -80,7 +80,7 @@ func serve(ctx context.Context, args []string) error {
 	flags.Var(&slots, "slot", "repeatable owned Apple host-only network slot: name=<network>,ipv4=<subnet>,gw=<gateway>,ipv6=<ula-prefix>")
 	pinImage := flags.String("pin-image", "", "trusted digest-pinned bridge VM image")
 	mainHash := flags.String("main-rules-sha256", "", "SHA-256 of the reviewed pfctl -sr output")
-	modelRelayPort := flags.Int("model-relay-port", 0, "fixed guest-to-gateway model TCP port; zero retains deny-only PF")
+	modelRelayPort := flags.Int("model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero retains deny-only PF")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

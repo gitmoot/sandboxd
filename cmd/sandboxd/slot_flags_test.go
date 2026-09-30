@@ -22,6 +22,16 @@ func TestServiceRequiresSlotsAndBoundsCapacityByThem(t *testing.T) {
 		{[]string{"-slot", "name=sandboxd-slot-1"}, "all required"},
 		// Valid slots with derived capacity get as far as reading the API key.
 		{[]string{"-slot", slot1, "-slot", slot2}, "read API key"},
+		// The model relay listens only on the first slot's gateway, the one
+		// address the helper passes from every slot.
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.131.1:43181", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "0.0.0.0:43181", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:43181", "-model-relay-target", "127.0.0.1:43184"},
+			"read API key"},
 	} {
 		err := run(context.Background(), append(append([]string(nil), base...), tc.args...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

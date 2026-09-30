@@ -17,8 +17,23 @@ const (
 	maxModelRelayConnectionsPerGuest = 4
 )
 
+// checkModelRelayListen requires the relay to listen on the first slot's
+// gateway: the one Mac address the PF helper passes from every slot, and the
+// one IP that Gitmoot's credential gateway URL and certificate name.
+func checkModelRelayListen(listenAddress string, relayAddress netip.Addr) error {
+	if listenAddress == "" {
+		return nil
+	}
+	host, _, splitErr := net.SplitHostPort(listenAddress)
+	addr, parseErr := netip.ParseAddr(host)
+	if splitErr != nil || parseErr != nil || addr != relayAddress {
+		return fmt.Errorf("model relay listen must be the first slot's gateway %s with a port (the one relay address the PF helper passes), not %q", relayAddress, listenAddress)
+	}
+	return nil
+}
+
 // openModelRelay admits only the slot IPv4 subnets, matching the helper's
-// per-slot pass rule. Listen and target enable it together.
+// pass rules. Listen and target enable it together.
 func openModelRelay(listenAddress, target string, guests []netip.Prefix) (net.Listener, error) {
 	if listenAddress == "" && target == "" {
 		return nil, nil

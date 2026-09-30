@@ -71,6 +71,47 @@ func TestInstallWritesTheLaunchdJobWithEveryResolvedFlag(t *testing.T) {
 	}
 }
 
+// The owner enables the relay by rerunning install from the installed helper
+// (after sandboxd-helper-update): it installs itself onto its own path.
+func TestInstallFromTheInstalledHelperReplacesItSafely(t *testing.T) {
+	m := newFakeMac(t)
+	if err := m.install(InstallOptions{}); err != nil {
+		t.Fatalf("install: %v\n%s", err, m.out.String())
+	}
+	m.host.Executable = func() (string, error) { return m.host.helperPath(), nil }
+	// Rewriting a running Mac binary in place can kill it; install must
+	// replace the path with a new file instead.
+	before := map[string]fs.FileInfo{}
+	var err error
+	for _, rel := range []string{"usr/local/libexec/sandboxd-pf-helper", "usr/local/libexec/sandboxd"} {
+		if before[rel], err = os.Stat(m.path(rel)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.out.Reset()
+	if err := m.install(InstallOptions{ModelRelayPort: 43181}); err != nil {
+		t.Fatalf("install from the installed path: %v\n%s", err, m.out.String())
+	}
+	for rel, body := range map[string]string{"usr/local/libexec/sandboxd-pf-helper": "helper v1", "usr/local/libexec/sandboxd": "sandboxd v1"} {
+		after, err := os.Stat(m.path(rel))
+		if err != nil || m.read(rel) != body || after.Mode().Perm() != 0o755 {
+			t.Fatalf("%s = %q (%v), want %q mode 0755", rel, m.read(rel), err, body)
+		}
+		if os.SameFile(before[rel], after) {
+			t.Fatalf("%s was rewritten in place under the running helper", rel)
+		}
+	}
+	plist, err := parsePlist([]byte(m.read("Library/LaunchDaemons/" + Label + ".plist")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := m.wantArgs(fmt.Sprintf("%x", sha256.Sum256([]byte(m.pfRules))))
+	want[len(want)-1] = "43181"
+	if !reflect.DeepEqual(plist["ProgramArguments"], want) {
+		t.Fatalf("relay job args\n got %#v\nwant %#v", plist["ProgramArguments"], want)
+	}
+}
+
 func TestInstallRefusesSettingsTheHelperWouldRefuse(t *testing.T) {
 	for name, opts := range map[string]InstallOptions{
 		"tag instead of digest": {PinImage: "docker.io/library/alpine:latest"},

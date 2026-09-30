@@ -148,19 +148,20 @@ func TestTwoSlotsArmExactMultiBridgePolicy(t *testing.T) {
 	if err != nil || got != "bridge110,bridge111" {
 		t.Fatalf("did not arm both slot bridges: %q %v", got, err)
 	}
+	// Every slot passes only to the first slot's gateway: the one relay address.
 	const policy = "pass in quick on bridge110 inet proto tcp from 192.168.130.0/24 to 192.168.130.1 port 8443\n" +
 		"block in quick on bridge110 inet from any to any\n" +
 		"block in quick on bridge110 inet6 from any to any\n" +
-		"pass in quick on bridge111 inet proto tcp from 192.168.131.0/24 to 192.168.131.1 port 8443\n" +
+		"pass in quick on bridge111 inet proto tcp from 192.168.131.0/24 to 192.168.130.1 port 8443\n" +
 		"block in quick on bridge111 inet from any to any\n" +
 		"block in quick on bridge111 inet6 from any to any\n"
 	if len(h.loadedText) != 1 || h.loadedText[0] != policy {
-		t.Fatalf("loaded policy is not the exact two-slot deny policy:\n%q", h.loadedText)
+		t.Fatalf("loaded policy is not the exact two-slot relay policy:\n%q", h.loadedText)
 	}
 	const readback = "pass in quick on bridge110 inet proto tcp from 192.168.130.0/24 to 192.168.130.1 port = 8443 flags S/SA keep state\n" +
 		"block drop in quick on bridge110 inet all\n" +
 		"block drop in quick on bridge110 inet6 all\n" +
-		"pass in quick on bridge111 inet proto tcp from 192.168.131.0/24 to 192.168.131.1 port = 8443 flags S/SA keep state\n" +
+		"pass in quick on bridge111 inet proto tcp from 192.168.131.0/24 to 192.168.130.1 port = 8443 flags S/SA keep state\n" +
 		"block drop in quick on bridge111 inet all\n" +
 		"block drop in quick on bridge111 inet6 all"
 	if h.loaded != readback {
@@ -177,10 +178,15 @@ func TestTwoSlotsArmExactMultiBridgePolicy(t *testing.T) {
 		t.Fatalf("rearm did not adopt the exact policy: %v %v", err, h.flushes)
 	}
 
-	// A slot-2 gateway exception granted to slot 1's subnet is a broadening.
+	// Slot 1's subnet admitted on slot 2's bridge is not the policy.
 	h.loaded = strings.Replace(readback, "from 192.168.131.0/24", "from 192.168.130.0/24", 1)
 	if _, err := h.s.check(ctx); err == nil {
 		t.Fatal("accepted a model pass crossing slots")
+	}
+	// Slot 2's own gateway is not the relay address.
+	h.loaded = strings.Replace(readback, "from 192.168.131.0/24 to 192.168.130.1", "from 192.168.131.0/24 to 192.168.131.1", 1)
+	if _, err := h.s.check(ctx); err == nil {
+		t.Fatal("accepted a model pass to slot 2's own gateway")
 	}
 	// Only one slot's rules loaded.
 	h.loaded = h.s.canonicalPolicy([]string{"bridge110"})
@@ -267,6 +273,94 @@ func TestMissingOrChangedSlotBridgeRefusesArmAndCheck(t *testing.T) {
 	h.pins["sandboxd-slot-2"] = true
 	if _, err := h.s.check(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRelayPassTargetsFirstSlotGatewayForEverySlot(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Slots = mustSlots(t,
+		"name=sandboxd-internal,ipv4=192.168.128.0/24,gw=192.168.128.1,ipv6=fd1e:68b8:2ef4:5d00::/64",
+		"name=sandboxd-slot-2,ipv4=192.168.130.0/24,gw=192.168.130.1,ipv6=fd1e:68b8:2ef4:5d02::/64",
+		"name=sandboxd-slot-3,ipv4=192.168.131.0/24,gw=192.168.131.1,ipv6=fd1e:68b8:2ef4:5d03::/64")
+	cfg.ModelRelayPort = 43181
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridges := []string{"bridge101", "bridge102", "bridge103"}
+	const policy = "pass in quick on bridge101 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 43181\n" +
+		"block in quick on bridge101 inet from any to any\n" +
+		"block in quick on bridge101 inet6 from any to any\n" +
+		"pass in quick on bridge102 inet proto tcp from 192.168.130.0/24 to 192.168.128.1 port 43181\n" +
+		"block in quick on bridge102 inet from any to any\n" +
+		"block in quick on bridge102 inet6 from any to any\n" +
+		"pass in quick on bridge103 inet proto tcp from 192.168.131.0/24 to 192.168.128.1 port 43181\n" +
+		"block in quick on bridge103 inet from any to any\n" +
+		"block in quick on bridge103 inet6 from any to any\n"
+	if got := s.policy(bridges); got != policy {
+		t.Fatalf("relay pass is not the first slot's gateway for every slot:\n%s", got)
+	}
+	const readback = "pass in quick on bridge101 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state\n" +
+		"block drop in quick on bridge101 inet all\n" +
+		"block drop in quick on bridge101 inet6 all\n" +
+		"pass in quick on bridge102 inet proto tcp from 192.168.130.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state\n" +
+		"block drop in quick on bridge102 inet all\n" +
+		"block drop in quick on bridge102 inet6 all\n" +
+		"pass in quick on bridge103 inet proto tcp from 192.168.131.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state\n" +
+		"block drop in quick on bridge103 inet all\n" +
+		"block drop in quick on bridge103 inet6 all"
+	if got := s.canonicalPolicy(bridges); got != readback || pfctlReadback(policy, false) != readback {
+		t.Fatalf("unexpected three-slot relay readback:\n%s", got)
+	}
+}
+
+// denyOnlyReadback is what a relay-off helper leaves in the anchor for the
+// two-slot host's bridges.
+const denyOnlyReadback = "block drop in quick on bridge110 inet all\n" +
+	"block drop in quick on bridge110 inet6 all\n" +
+	"block drop in quick on bridge111 inet all\n" +
+	"block drop in quick on bridge111 inet6 all"
+
+func TestArmReplacesOnlyTheExactDenyOnlyAnchor(t *testing.T) {
+	ctx := context.Background()
+	bridges := []string{"bridge110", "bridge111"}
+	relayOff := newTwoSlotHost(t, 0)
+	if _, err := relayOff.s.arm(ctx); err != nil || relayOff.loaded != denyOnlyReadback {
+		t.Fatalf("relay-off helper did not load the deny-only anchor: %v\n%s", err, relayOff.loaded)
+	}
+	for name, loaded := range map[string]string{
+		"bridges swapped":       strings.NewReplacer("bridge110", "bridge111", "bridge111", "bridge110").Replace(denyOnlyReadback),
+		"another bridge":        strings.ReplaceAll(denyOnlyReadback, "bridge111", "bridge112"),
+		"one slot only":         "block drop in quick on bridge110 inet all\nblock drop in quick on bridge110 inet6 all",
+		"foreign rule appended": denyOnlyReadback + "\npass in quick on bridge111 inet all",
+		"foreign rule first":    "pass in quick on bridge110 inet proto tcp from any to any port = 22 flags S/SA keep state\n" + denyOnlyReadback,
+		"optimizer order":       pfctlReadback(relayOff.s.policy(bridges), true),
+		"relay on another port": pfctlReadback(newTwoSlotHost(t, 8080).s.policy(bridges), false),
+	} {
+		h := newTwoSlotHost(t, 43181)
+		h.loaded = loaded
+		if _, err := h.s.arm(ctx); err == nil || !strings.Contains(err.Error(), "unexpected firewall policy") {
+			t.Errorf("%s: replaced an anchor that is not this helper's deny-only policy: %v", name, err)
+		}
+		if h.loaded != loaded || len(h.loadedText) != 0 || len(h.flushes) != 0 {
+			t.Errorf("%s: touched PF while refusing: %q %v", name, h.loadedText, h.flushes)
+		}
+	}
+
+	h := newTwoSlotHost(t, 43181)
+	h.loaded = denyOnlyReadback
+	if _, err := h.s.check(ctx); err == nil {
+		t.Fatal("check accepted the deny-only anchor as the configured relay policy")
+	}
+	if got, err := h.s.arm(ctx); err != nil || got != "bridge110,bridge111" {
+		t.Fatalf("did not replace the exact deny-only anchor: %q %v", got, err)
+	}
+	if len(h.loadedText) != 1 || h.loadedText[0] != h.s.policy(bridges) ||
+		h.loaded != h.s.canonicalPolicy(bridges) || !strings.Contains(h.loaded, "to 192.168.130.1 port = 43181") {
+		t.Fatalf("deny-only anchor not replaced by the relay policy:\n%s", h.loaded)
+	}
+	if h.flushes["bridge110"] != 1 || h.flushes["bridge111"] != 1 {
+		t.Fatalf("upgrade did not flush both slot bridges' states: %v", h.flushes)
 	}
 }
 
