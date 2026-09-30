@@ -1,0 +1,49 @@
+name: release
+# A tag v* on a reviewed main commit builds the release. The owner installs on
+# the Mac only an archive whose SHA-256 matches this release page, as seen in
+# the owner's own browser; sudo sandboxd-helper-update checks the same page.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refuse a tag that is not on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./... -count=1
+      - name: Build
+        run: |
+          set -eu
+          tag=${GITHUB_REF_NAME}
+          mkdir -p out mac
+          for cmd in sandboxd sandboxd-pf-helper; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-X main.version=$tag" -o "mac/$cmd" "./cmd/$cmd"
+          done
+          chmod 755 mac/sandboxd mac/sandboxd-pf-helper
+          tar --owner=0 --group=0 --numeric-owner -czf "out/sandboxd-$tag-darwin-arm64.tar.gz" -C mac sandboxd sandboxd-pf-helper
+          (cd out && sha256sum * > SHA256SUMS)
+          cat out/SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          {
+            echo "Built by GitHub Actions from commit \`$GITHUB_SHA\` (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+            echo
+            echo "Check the SHA-256 below in your own browser before a first install (docs/compatibility.md, Operating the PF helper)."
+            echo
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag

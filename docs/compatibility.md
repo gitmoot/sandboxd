@@ -61,8 +61,9 @@ a valid counter read. No production PF policy or private HTTPS endpoint was
 deployed. Do not run untrusted PR code or production routing on that evidence.
 
 The selected root-owned PF helper (`cmd/sandboxd-pf-helper`) has passed a
-bounded deny-only Mac canary, but is **not installed as a launchd service or
-approved for production traffic**. Its root-owned launchd
+bounded deny-only Mac canary, but is **not approved for production traffic**.
+`sandboxd-pf-helper install` makes it a launchd system service (see
+[Operating the PF helper](#operating-the-pf-helper)). Its root-owned launchd
 configuration must fix the dedicated worker UID/GID and HOME, worker ID,
 root-owned `container` CLI, every network slot (below), trusted pin image at
 an OCI digest, SHA-256 of reviewed `pfctl -sr` output, and a socket under a
@@ -114,13 +115,15 @@ Copy each network's actual `status.ipv4Subnet`, `status.ipv4Gateway` and
 for both binaries:
 
 ```sh
-sandboxd-pf-helper ... \
+sandboxd-pf-helper run ... \
   --slot name=sandboxd-slot-1,ipv4=192.168.130.0/24,gw=192.168.130.1,ipv6=fd1e:68b8:2ef4:5d01::/64 \
   --slot name=sandboxd-slot-2,ipv4=192.168.131.0/24,gw=192.168.131.1,ipv6=fd1e:68b8:2ef4:5d02::/64 \
   --slot name=sandboxd-slot-3,ipv4=192.168.132.0/24,gw=192.168.132.1,ipv6=fd1e:68b8:2ef4:5d03::/64
 sandboxd ... (the same three --slot flags) [--max-vms N]
 ```
 
+`sandboxd-pf-helper install` writes these `--slot` flags itself, one per
+labelled host-only network in name order, and prints them for `sandboxd`.
 Each `--slot` needs exactly the keys `name`, `ipv4` (canonical private /24 to
 /30 containing `gw`), `gw` (private IPv4) and `ipv6` (canonical ULA /48 to
 /64), in any order; unknown or repeated keys, a duplicate network, or
@@ -172,5 +175,98 @@ authorize each model request. Source admission is not a firewall for other
 Mac services. Recheck the actual network subnet after any Apple network
 recreation. A dummy broker round-trip passed, but no production PF rule,
 real model lease, or production relay was enabled.
+
+## Operating the PF helper
+
+Releases are built only by GitHub Actions (`.github/workflows/release.yml`)
+from a `vX.Y.Z` tag on `main`. Each release page lists the SHA-256 of
+`sandboxd-<tag>-darwin-arm64.tar.gz`, which holds `sandboxd` and
+`sandboxd-pf-helper`.
+
+### First install
+
+Create the slot networks first (above). Open the release page in your own
+browser, copy the archive's SHA-256, and run from the worker account (the
+account that owns the Apple container service; `sudo` tells the helper its
+UID, GID and home):
+
+```sh
+sudo sh -c 'set -e; d=$(mktemp -d /var/root/sandboxd.XXXXXX); cd "$d"; curl -fsSLO https://github.com/gitmoot/sandboxd/releases/download/<tag>/sandboxd-<tag>-darwin-arm64.tar.gz; echo "<sha256>  sandboxd-<tag>-darwin-arm64.tar.gz" | shasum -a 256 -c; tar -xzf sandboxd-<tag>-darwin-arm64.tar.gz; ./sandboxd-pf-helper install; cd /; rm -rf "$d"'
+```
+
+`install` refuses to run from a directory that anyone but root could write
+(hence `/var/root`), and refuses root itself or a missing `SUDO_*` identity as
+the worker. It then:
+
+- takes as slots every Apple network labelled
+  `gitmoot.sandboxd.network=apple-v1` in `hostOnly` mode, in name order, with
+  the subnet, gateway and IPv6 prefix Apple reports; it refuses if there is
+  none or any fails the `--slot` rules;
+- records the SHA-256 of the **current** `pfctl -sr` output as the reviewed
+  main ruleset. Compare the printed hash with the reviewed one, or pass
+  `--main-rules-sha256 <hash>`; other flags: `--worker-id` (default
+  `mac-local`), `--pin-image` (default the reviewed Alpine digest),
+  `--container-cli`, `--model-relay-port` (default `0`, deny-only);
+- stops a helper started by hand from a Terminal
+  (`/usr/local/libexec/sandboxd-pf-helper-<commit>`); that Terminal can be
+  closed afterwards;
+- installs itself as `/usr/local/libexec/sandboxd-pf-helper` and the
+  release's `sandboxd` as `/usr/local/libexec/sandboxd` (root:wheel, 0755);
+- writes `/Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist`
+  (starts at boot, restarted if it exits) and loads it, replacing a loaded
+  job;
+- writes `/usr/local/bin/sandboxd-helper-update`, unless `/usr/local/bin` or
+  a directory above it is a symlink or writable by anyone but root (as when
+  Homebrew owns it);
+- waits for the helper socket and prints the slots (the `--slot` flags
+  `sandboxd` needs), the rules hash and the version.
+
+Rerun the same one-liner (with the current release) after recreating slot
+networks, changing the reviewed PF main rules, or changing an install flag.
+
+### Updates
+
+```sh
+sudo sandboxd-helper-update                    # the latest release
+sudo sandboxd-helper-update --version v0.6.0   # a specific one, even older
+```
+
+Without `/usr/local/bin/sandboxd-helper-update`, run
+`sudo /usr/local/libexec/sandboxd-pf-helper update`. The update fetches the
+release from GitHub only, never from the agents' server, and installs it only
+if it was published by `github-actions[bot]`, is neither a draft nor a
+pre-release, its assets are exactly this release's download URLs, the archive
+matches the release's `SHA256SUMS`, and the archive holds exactly the two
+binaries as regular files. It says `already up to date` for the installed
+version and refuses a "latest" release older than the installed one unless
+`--version` asks for it. It refuses while any sandboxd guest VM is running
+(pin VMs do not count), because restarting the helper fails sandboxd's gate.
+It replaces both binaries, restarts the service
+(`launchctl kickstart -k`), waits for the socket and prints
+`<old> -> <new>`. Restart `sandboxd` afterwards to run its new binary.
+Check the running version with `/usr/local/libexec/sandboxd-pf-helper version`.
+
+### Logs, stop, uninstall
+
+```sh
+tail -f /Library/Logs/sandboxd-pf-helper.log
+sudo launchctl print system/org.gitmoot.sandboxd-pf-helper
+```
+
+Stop it until the next boot with
+`sudo launchctl bootout system/org.gitmoot.sandboxd-pf-helper`; start it
+again with
+`sudo launchctl bootstrap system /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist`.
+Stop `sandboxd` first: without the helper its gate fails and it stops guests.
+To uninstall, stop it, then:
+
+```sh
+sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \
+  /usr/local/libexec/sandboxd-pf-helper /usr/local/libexec/sandboxd \
+  /usr/local/bin/sandboxd-helper-update
+```
+
+Stopping the helper does not by itself remove its PF anchor; inspect it with
+`sudo pfctl -a com.apple/gitmoot-sandboxd -sr`.
 
 Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result.
