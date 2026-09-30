@@ -284,7 +284,7 @@ func (s *Server) check(ctx context.Context) (string, error) {
 		return "", err
 	}
 	if rules != s.canonicalPolicy(bridges) {
-		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s", strings.Join(bridges, ","))
+		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s; pfctl reports %q", strings.Join(bridges, ","), truncate(rules, 600))
 	}
 	return strings.Join(bridges, ","), nil
 }
@@ -333,10 +333,13 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err := file.Close(); err != nil {
 		return "", err
 	}
-	if _, err := s.pf(ctx, "-a", anchor, "-nf", file.Name()); err != nil {
+	// -o none: pfctl's default "basic" optimizer reorders rules on load, so
+	// with several slots the readback no longer matched the policy text and
+	// check refused it (seen on the Mac Studio with 3 slots, 2026-09-30).
+	if _, err := s.pf(ctx, "-a", anchor, "-o", "none", "-nf", file.Name()); err != nil {
 		return "", err
 	}
-	if _, err := s.pf(ctx, "-a", anchor, "-f", file.Name()); err != nil {
+	if _, err := s.pf(ctx, "-a", anchor, "-o", "none", "-f", file.Name()); err != nil {
 		return "", err
 	}
 	return s.clearBridgeStates(ctx, bridges)
@@ -481,4 +484,12 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		s.handle(conn)
 	}
+}
+
+// truncate bounds rule text quoted in an error.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

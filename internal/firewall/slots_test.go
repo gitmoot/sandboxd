@@ -105,15 +105,15 @@ func newTwoSlotHost(t *testing.T, relayPort int) *twoSlotHost {
 		case strings.HasPrefix(command, "-F states -i "):
 			h.flushes[args[3]]++
 			return nil, nil
-		case len(args) == 4 && args[0] == "-a" && args[1] == anchor && (args[2] == "-nf" || args[2] == "-f"):
-			input, err := os.ReadFile(args[3])
+		case len(args) >= 4 && args[0] == "-a" && args[1] == anchor && (args[len(args)-2] == "-nf" || args[len(args)-2] == "-f"):
+			input, err := os.ReadFile(args[len(args)-1])
 			if err != nil {
 				return nil, err
 			}
-			if args[2] == "-f" {
+			if args[len(args)-2] == "-f" {
 				h.loadedText = append(h.loadedText, string(input))
-				// The readback of what the helper just loaded, for the bridges it named.
-				h.loaded = s.canonicalPolicy(strings.Fields(bridgesIn(string(input))))
+				optimized := !(len(args) == 6 && args[2] == "-o" && args[3] == "none")
+				h.loaded = pfctlReadback(string(input), optimized)
 			}
 			return nil, nil
 		}
@@ -366,4 +366,26 @@ func TestSlotConfigurationIsStrict(t *testing.T) {
 	if _, err := NewServer(cfg); err == nil {
 		t.Error("accepted a helper with no slots")
 	}
+}
+
+// pfctlReadback is what `pfctl -a <anchor> -sr` prints for a loaded policy:
+// each rule in pfctl's normalized form, in load order. Without `-o none`,
+// pfctl's default basic optimizer groups the rules by address family (all
+// inet, then all inet6), measured with `pfctl -o basic -nvf` on the Mac
+// Studio 2026-09-30; that broke the 3-slot arm there.
+func pfctlReadback(policy string, optimized bool) string {
+	var out, inet6 []string
+	for _, line := range strings.Split(strings.TrimSpace(policy), "\n") {
+		line = strings.Replace(line, "block in quick", "block drop in quick", 1)
+		line = strings.Replace(line, " from any to any", " all", 1)
+		if strings.HasPrefix(line, "pass in quick") {
+			line = strings.Replace(line, " port ", " port = ", 1) + " flags S/SA keep state"
+		}
+		if optimized && strings.HasSuffix(line, " inet6 all") {
+			inet6 = append(inet6, line)
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(append(out, inet6...), "\n")
 }

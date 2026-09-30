@@ -120,9 +120,9 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 			stateFlushes++
 			return nil, nil
 		}
-		if len(args) == 4 && args[0] == "-a" && args[1] == anchor &&
-			(args[2] == "-nf" || args[2] == "-f") {
-			input, err := os.ReadFile(args[3])
+		if len(args) == 6 && args[0] == "-a" && args[1] == anchor && args[2] == "-o" && args[3] == "none" &&
+			(args[4] == "-nf" || args[4] == "-f") {
+			input, err := os.ReadFile(args[5])
 			if err != nil {
 				return nil, err
 			}
@@ -131,7 +131,7 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 			if string(input) != denyOnly {
 				return nil, fmt.Errorf("default policy is not deny-only: %s", input)
 			}
-			if args[2] == "-f" {
+			if args[4] == "-f" {
 				loaded = s.canonicalPolicy([]string{bridge})
 			}
 			return nil, nil
@@ -279,16 +279,16 @@ func TestModelRelayPolicyOnlyPassesPinnedGateway(t *testing.T) {
 		case "-F states -i bridge102":
 			return nil, nil
 		}
-		if len(args) == 4 && args[0] == "-a" && args[1] == anchor &&
-			(args[2] == "-nf" || args[2] == "-f") {
-			input, err := os.ReadFile(args[3])
+		if len(args) == 6 && args[0] == "-a" && args[1] == anchor && args[2] == "-o" && args[3] == "none" &&
+			(args[4] == "-nf" || args[4] == "-f") {
+			input, err := os.ReadFile(args[5])
 			if err != nil {
 				return nil, err
 			}
 			if string(input) != expectedPolicy {
 				return nil, fmt.Errorf("loaded a broader PF policy: %s", input)
 			}
-			if args[2] == "-f" {
+			if args[4] == "-f" {
 				loaded = expectedReadback
 			}
 			return nil, nil
