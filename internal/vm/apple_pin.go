@@ -110,6 +110,15 @@ func (d *AppleDriver) startPin(ctx context.Context, network string) error {
 	if err != nil {
 		return err
 	}
+	if found && item.Status.State != "running" {
+		// A Mac restart leaves every pin stopped (measured 2026-09-30).
+		// Replace it with a fresh one rather than restarting it, so the
+		// running pin always carries exactly the configuration created below.
+		if err := d.cleanupPin(network); err != nil {
+			return fmt.Errorf("replace stopped pin VM for network %q: %w", network, err)
+		}
+		found = false
+	}
 	if found {
 		return d.verifyPin(item, network)
 	}

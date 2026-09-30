@@ -101,6 +101,37 @@ func (d *AppleDriver) command(ctx context.Context, args ...string) *exec.Cmd {
 	return c
 }
 
+// EnsureSystem starts Apple's container services if they are not running.
+// They do not start by themselves after a Mac restart (measured 2026-09-30:
+// "apiserver is not running and not registered with launchd"), and the
+// worker may start them without privileges. The kernel is not (re)installed.
+func (d *AppleDriver) EnsureSystem(ctx context.Context) error {
+	if out, err := d.output(ctx, "system", "status"); err == nil && systemRunning(out) {
+		return nil
+	}
+	if _, err := d.output(ctx, "system", "start", "--disable-kernel-install"); err != nil {
+		return err
+	}
+	out, err := d.output(ctx, "system", "status")
+	if err != nil {
+		return err
+	}
+	if !systemRunning(out) {
+		return fmt.Errorf("container system services are not running after start")
+	}
+	return nil
+}
+
+// systemRunning reads `container system status`: a "status running" row.
+func systemRunning(out []byte) bool {
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "status" && f[1] == "running" {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *AppleDriver) output(ctx context.Context, args ...string) ([]byte, error) {
 	c := d.command(ctx, args...)
 	out, err := c.Output()
