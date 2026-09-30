@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -40,14 +41,14 @@ func run(ctx context.Context, args []string) (runErr error) {
 	template := flags.String("template", "", "allowlisted E2B-compatible template identifier")
 	domain := flags.String("domain", "", "private sandbox DNS domain")
 	gatewayHost := flags.String("gateway-host", "", "private HTTPS hostname for header-routed guest traffic")
-	network := flags.String("network", "", "dedicated labeled host-only Apple container network")
+	var slots firewall.SlotFlags
+	flags.Var(&slots, "slot", "repeatable dedicated labeled host-only Apple network slot, one guest each: name=<network>,ipv4=<subnet>,gw=<gateway>,ipv6=<ula-prefix>")
 	workerID := flags.String("worker-id", "", "stable trusted worker identity recorded for every VM")
 	cpus := flags.Int("cpus", 2, "CPU limit for each VM")
 	memory := flags.Int("memory-mib", 4096, "memory limit in MiB for each VM")
 	relayListen := flags.String("model-relay-listen", "", "optional IPv4 listener for fixed mTLS model gateway relay")
 	relayTarget := flags.String("model-relay-target", "", "loopback endpoint of a fixed SSH reverse tunnel")
-	relayGuestCIDR := flags.String("model-relay-guest-cidr", "", "private IPv4 guest subnet permitted to connect")
-	maxVMs := flags.Int("max-vms", 2, "maximum concurrent VMs")
+	maxVMs := flags.Int("max-vms", 0, "maximum concurrent VMs; zero means one per slot, never more than the slots")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-job lifetime")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -60,9 +61,18 @@ func run(ctx context.Context, args []string) (runErr error) {
 		return fmt.Errorf("listen address must be an explicit loopback IP and port")
 	}
 	if *database == "" || *keyFile == "" || *image == "" || *pinImage == "" || *pfSocket == "" ||
-		*template == "" || *gatewayHost == "" || *domain == "" || *network == "" || *workerID == "" ||
+		*template == "" || *gatewayHost == "" || *domain == "" || *workerID == "" ||
 		strings.ContainsAny(*gatewayHost, "/?# ") {
-		return fmt.Errorf("db, api-key-file, image, pin-image, pf-socket, template, domain, gateway-host, network and worker-id are required")
+		return fmt.Errorf("db, api-key-file, image, pin-image, pf-socket, template, domain, gateway-host and worker-id are required")
+	}
+	if err := firewall.ValidateSlots(slots); err != nil {
+		return err
+	}
+	if *maxVMs == 0 {
+		*maxVMs = len(slots)
+	}
+	if *maxVMs < 1 || *maxVMs > len(slots) {
+		return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slots))
 	}
 	key, err := os.ReadFile(*keyFile)
 	if err != nil {
@@ -80,7 +90,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	driver, err := vm.NewAppleDriver(*cli, []string{*image}, *network, *workerID, *pinImage, gate)
+	driver, err := vm.NewAppleDriver(*cli, []string{*image}, slots.Networks(), *workerID, *pinImage, gate)
 	if err != nil {
 		return err
 	}
@@ -105,14 +115,14 @@ func run(ctx context.Context, args []string) (runErr error) {
 			runErr = errors.Join(runErr, fmt.Errorf("PF anchor cleanup: %w", err))
 		}
 	}()
-	bridge, err := gate.Arm(ctx)
+	bridges, err := gate.Arm(ctx)
 	if err != nil {
 		return fmt.Errorf("arm privileged firewall: %w", err)
 	}
-	log.Printf("sandbox guest bridge %s guarded by root PF helper", bridge)
+	log.Printf("sandbox guest bridges %s guarded by root PF helper", bridges)
 	service, err := control.Open(ctx, *database, driver, control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: *image, Domain: *domain, WorkerID: *workerID,
-		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL,
+		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slots.Networks(),
 	})
 	if err != nil {
 		return err
@@ -132,7 +142,11 @@ func run(ctx context.Context, args []string) (runErr error) {
 		return err
 	}
 	defer listener.Close()
-	relayListener, guestSubnet, err := openModelRelay(*relayListen, *relayTarget, *relayGuestCIDR)
+	guestSubnets := make([]netip.Prefix, len(slots))
+	for i, slot := range slots {
+		guestSubnets[i] = slot.IPv4
+	}
+	relayListener, err := openModelRelay(*relayListen, *relayTarget, guestSubnets)
 	if err != nil {
 		return err
 	}
@@ -146,8 +160,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 	var relayDone chan error
 	if relayListener != nil {
 		relayDone = make(chan error, 1)
-		go func() { relayDone <- serveModelRelay(ctx, relayListener, *relayTarget, guestSubnet) }()
-		log.Printf("model relay listening on %s for %s, forwarding only to %s", relayListener.Addr(), guestSubnet, *relayTarget)
+		go func() { relayDone <- serveModelRelay(ctx, relayListener, *relayTarget, guestSubnets) }()
+		log.Printf("model relay listening on %s for %v, forwarding only to %s", relayListener.Addr(), guestSubnets, *relayTarget)
 	}
 	guardCtx, stopGuard := context.WithCancel(context.Background())
 	defer stopGuard()

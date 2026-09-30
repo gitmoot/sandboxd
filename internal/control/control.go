@@ -13,6 +13,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,10 +25,13 @@ import (
 )
 
 // Config fixes the only permitted VM shape, template and public guest domain.
+// Slots are the dedicated guest networks, each used by at most one VM at a
+// time; MaxVMs may not exceed them.
 type Config struct {
 	APIKey, TemplateID, Image, Domain, WorkerID string
 	CPUs, MemoryMiB, MaxVMs                     int
 	MaxTTL                                      time.Duration
+	Slots                                       []string
 }
 
 type Service struct {
@@ -46,9 +50,15 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	if driver == nil || cfg.APIKey == "" || strings.TrimSpace(cfg.TemplateID) == "" || strings.TrimSpace(cfg.Image) == "" || strings.TrimSpace(cfg.WorkerID) == "" ||
 		cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
 		cfg.CPUs < 1 || cfg.CPUs > math.MaxInt32 || cfg.MemoryMiB < 128 || cfg.MemoryMiB > math.MaxInt32 ||
-		cfg.MaxVMs < 1 || cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
+		cfg.MaxVMs < 1 || cfg.MaxVMs > len(cfg.Slots) || cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
 		return nil, errors.New("invalid sandbox control configuration")
 	}
+	for i, slot := range cfg.Slots {
+		if strings.TrimSpace(slot) == "" || slices.Contains(cfg.Slots[:i], slot) {
+			return nil, errors.New("sandbox network slots must be distinct and non-empty")
+		}
+	}
+	cfg.Slots = slices.Clone(cfg.Slots)
 	ledger, err := store.Open(ctx, path)
 	if err != nil {
 		return nil, err
@@ -335,16 +345,18 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		unavailable(w)
 		return
 	}
-	err = s.ledger.Reserve(r.Context(), row, s.cfg.MaxVMs)
+	slot, err := s.ledger.Reserve(r.Context(), row, s.cfg.MaxVMs, s.cfg.Slots)
 	if errors.Is(err, store.ErrCapacity) || errors.Is(err, store.ErrStale) {
 		http.Error(w, "sandbox capacity or owner conflict", http.StatusConflict)
 		return
 	}
 	if err != nil {
+		// Includes store.ErrLegacySlot: a live pre-slot row blocks admission
+		// until reconciliation proves it gone.
 		unavailable(w)
 		return
 	}
-	instance, err := s.driver.Create(r.Context(), vm.Spec{ID: row.ID, Image: s.cfg.Image, CPUs: s.cfg.CPUs, MemoryMiB: s.cfg.MemoryMiB})
+	instance, err := s.driver.Create(r.Context(), vm.Spec{ID: row.ID, Image: s.cfg.Image, Network: slot, CPUs: s.cfg.CPUs, MemoryMiB: s.cfg.MemoryMiB})
 	if err != nil || instance.ID != row.ID || !instance.Running {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
@@ -408,7 +420,10 @@ func (s *Service) reconcile(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if row.State == "running" && instance.Running && current && now.Before(row.Ends) {
+		// A guest observed off its recorded slot may share a network with
+		// another guest; never keep it. Legacy rows have no recorded slot.
+		onSlot := row.Slot == "" || instance.Network == row.Slot
+		if row.State == "running" && instance.Running && onSlot && current && now.Before(row.Ends) {
 			continue
 		}
 		if err := s.ledger.SetState(ctx, row.ID, "unknown"); err != nil {

@@ -24,7 +24,8 @@ type response struct {
 }
 
 // Gate is the root helper's attestation contract. A successful Check means
-// PF is enabled and the exact root-configured scoped policy is active on the pinned bridge.
+// PF is enabled and the exact root-configured scoped policy is active on
+// every slot's pinned bridge. Arm returns those bridges comma-separated in slot order.
 type Gate interface {
 	Arm(context.Context) (string, error)
 	Check(context.Context) error
@@ -72,8 +73,8 @@ func (c *Client) call(ctx context.Context, action string) (string, error) {
 	return reply.Bridge, nil
 }
 
-// Arm asks the helper to guard the sandbox bridge. Apple adds the bridge's
-// IPv6 ULA address a few seconds after the pin VM starts (measured ~4 s on
+// Arm asks the helper to guard every slot bridge. Apple adds a bridge's
+// IPv6 ULA address a few seconds after its pin VM starts (measured ~4 s on
 // the Mac Studio), and the helper refuses a bridge without it. Only that
 // refusal is retried, until ArmSettle elapses; nothing is loaded before the
 // helper attests the exact bridge, so waiting changes no policy.
@@ -98,8 +99,8 @@ var ArmSettle = 30 * time.Second
 
 var armRetryInterval = 500 * time.Millisecond
 
-// bridgeNotReady is the helper's refusal while no bridge carries the
-// configured IPv4 gateway, IPv6 ULA and link-local addresses.
+// bridgeNotReady is the helper's refusal while some slot has no bridge
+// carrying its configured IPv4 gateway, IPv6 ULA and link-local addresses.
 const bridgeNotReady = "sandbox bridge is missing or its addresses changed"
 
 func (c *Client) Check(ctx context.Context) error {

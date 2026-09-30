@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,23 +35,23 @@ var pinDigest = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 
 // AppleDriver uses Apple container 1.4.1's one-VM-per-container runtime.
 // Each guest has a read-only root, a fixed-size private ext4 home volume,
-// bounded tmpfs mounts, and a dedicated host-only network. No writable host
-// paths are exposed to the guest.
+// bounded tmpfs mounts, and exclusive use of one dedicated host-only slot
+// network. No writable host paths are exposed to the guest.
 type AppleDriver struct {
 	cli      string
 	images   map[string]struct{}
 	pinImage string
-	network  string
+	networks []string
 	workerID string
 	gate     firewall.Gate
 }
 
 var _ Driver = (*AppleDriver)(nil)
 
-// NewAppleDriver requires an absolute CLI path, an exact image allowlist, a
-// dedicated host-only network, a stable worker identity, and a privileged PF
-// gate. It never falls back to the default NAT or runs without that gate.
-func NewAppleDriver(cliPath string, images []string, network, workerID, pinImage string, gate firewall.Gate) (*AppleDriver, error) {
+// NewAppleDriver requires an absolute CLI path, an exact image allowlist, the
+// dedicated host-only slot networks, a stable worker identity, and a privileged
+// PF gate. It never falls back to the default NAT or runs without that gate.
+func NewAppleDriver(cliPath string, images []string, networks []string, workerID, pinImage string, gate firewall.Gate) (*AppleDriver, error) {
 	if !filepath.IsAbs(cliPath) || filepath.Clean(cliPath) != cliPath || strings.ContainsRune(cliPath, 0) {
 		return nil, fmt.Errorf("Apple container CLI path must be absolute and clean")
 	}
@@ -71,13 +72,18 @@ func NewAppleDriver(cliPath string, images []string, network, workerID, pinImage
 		}
 		allowed[image] = struct{}{}
 	}
-	if !appleNetworkName.MatchString(network) || network == "default" {
-		return nil, fmt.Errorf("invalid private Apple container network %q", network)
+	if len(networks) == 0 {
+		return nil, fmt.Errorf("at least one private Apple container slot network is required")
+	}
+	for i, network := range networks {
+		if !appleNetworkName.MatchString(network) || network == "default" || slices.Contains(networks[:i], network) {
+			return nil, fmt.Errorf("invalid or duplicate private Apple container network %q", network)
+		}
 	}
 	if !appleNetworkName.MatchString(workerID) {
 		return nil, fmt.Errorf("invalid Apple container worker ID %q", workerID)
 	}
-	return &AppleDriver{cli: cliPath, images: allowed, pinImage: pinImage, network: network, workerID: workerID, gate: gate}, nil
+	return &AppleDriver{cli: cliPath, images: allowed, pinImage: pinImage, networks: slices.Clone(networks), workerID: workerID, gate: gate}, nil
 }
 
 func validAppleID(id string) error {
@@ -241,7 +247,8 @@ type appleNetwork struct {
 	} `json:"configuration"`
 }
 
-func (d *AppleDriver) checkNetwork(ctx context.Context) error {
+// checkNetworks requires every named network to be an owned host-only network.
+func (d *AppleDriver) checkNetworks(ctx context.Context, names ...string) error {
 	out, err := d.output(ctx, "network", "list", "--format", "json")
 	if err != nil {
 		return err
@@ -250,16 +257,37 @@ func (d *AppleDriver) checkNetwork(ctx context.Context) error {
 	if err := json.Unmarshal(out, &networks); err != nil || networks == nil {
 		return fmt.Errorf("incomplete Apple network inventory: %w", errors.Join(err, errors.New("no network list")))
 	}
-	for _, network := range networks {
-		if network.ID != d.network {
+	for _, name := range names {
+		index := slices.IndexFunc(networks, func(network appleNetwork) bool { return network.ID == name })
+		if index < 0 {
+			return fmt.Errorf("Apple host-only network %q is absent", name)
+		}
+		network := networks[index]
+		if network.Configuration.Mode != "hostOnly" || network.Configuration.Labels["gitmoot.sandboxd.network"] != "apple-v1" {
+			return fmt.Errorf("Apple network %q is not an owned host-only network", name)
+		}
+	}
+	return nil
+}
+
+// slotFree refuses a slot network already used by any VM other than its pin,
+// running or not: guests sharing an Apple network can reach each other.
+func (d *AppleDriver) slotFree(ctx context.Context, network string) error {
+	items, err := d.inventory(ctx)
+	if err != nil {
+		return err
+	}
+	for _, item := range items {
+		if item.Configuration.ID == d.pinID(network) {
 			continue
 		}
-		if network.Configuration.Mode != "hostOnly" || network.Configuration.Labels["gitmoot.sandboxd.network"] != "apple-v1" {
-			return fmt.Errorf("Apple network %q is not an owned host-only network", d.network)
+		for _, attached := range item.Configuration.Networks {
+			if attached.Network == network {
+				return fmt.Errorf("slot network %q is already used by VM %q", network, item.Configuration.ID)
+			}
 		}
-		return nil
 	}
-	return fmt.Errorf("Apple host-only network %q is absent", d.network)
+	return nil
 }
 
 func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
@@ -275,7 +303,13 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if err := d.Ready(ctx); err != nil {
 		return Instance{}, fmt.Errorf("firewall is not armed before guest creation: %w", err)
 	}
-	if err := d.checkNetwork(ctx); err != nil {
+	if !slices.Contains(d.networks, spec.Network) {
+		return Instance{}, fmt.Errorf("guest network %q is not a configured slot", spec.Network)
+	}
+	if err := d.checkNetworks(ctx, spec.Network); err != nil {
+		return Instance{}, err
+	}
+	if err := d.slotFree(ctx, spec.Network); err != nil {
 		return Instance{}, err
 	}
 	_, exists, err := d.lookup(ctx, spec.ID)
@@ -302,7 +336,7 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	}
 	out, err = d.output(ctx, "create", "--name", spec.ID,
 		"--label", appleOwnerLabel, "--label", appleWorkerLabel+"="+d.workerID,
-		"--network", d.network, "--platform", "linux/arm64",
+		"--network", spec.Network, "--platform", "linux/arm64",
 		"--cpus", strconv.Itoa(spec.CPUs), "--memory", strconv.Itoa(spec.MemoryMiB)+"M",
 		"--read-only", "--mount", "type=volume,source="+spec.ID+",target=/home/user",
 		"--tmpfs", "/tmp:size=512M,mode=1777", "--tmpfs", "/var/tmp:size=256M,mode=1777",
@@ -337,7 +371,7 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 		"/bin/chown", "1000:1000", "/home/user"); err != nil {
 		return Instance{}, errors.Join(err, d.cleanupCreated(spec.ID))
 	}
-	return Instance{ID: spec.ID, Running: true}, nil
+	return Instance{ID: spec.ID, Running: true, Network: spec.Network}, nil
 }
 
 func (d *AppleDriver) cleanupCreated(id string) error {
@@ -359,11 +393,15 @@ func (d *AppleDriver) List(ctx context.Context) ([]Instance, error) {
 		if err := validAppleID(item.Configuration.ID); err != nil {
 			return nil, err
 		}
+		var network string
+		if len(item.Configuration.Networks) == 1 {
+			network = item.Configuration.Networks[0].Network
+		}
 		switch item.Status.State {
 		case "running":
-			instances = append(instances, Instance{ID: item.Configuration.ID, Running: true})
+			instances = append(instances, Instance{ID: item.Configuration.ID, Running: true, Network: network})
 		case "stopped", "stopping":
-			instances = append(instances, Instance{ID: item.Configuration.ID})
+			instances = append(instances, Instance{ID: item.Configuration.ID, Network: network})
 		default:
 			return nil, fmt.Errorf("unknown status %q for container %q", item.Status.State, item.Configuration.ID)
 		}

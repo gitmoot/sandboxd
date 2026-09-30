@@ -12,7 +12,7 @@ import (
 )
 
 const testPinImage = "example/pin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-const testPinJSON = `{"configuration":{"id":"sandboxd-pin-3c00d0a9d4c2eb08","labels":{"gitmoot.sandboxd.pin":"apple-v1","gitmoot.sandboxd.worker":"mac-local"},"image":{"reference":"` + testPinImage + `"},"networks":[{"network":"sandboxd-internal"}],"initProcess":{"executable":"/bin/sleep","arguments":["2147483647"],"user":{"id":{"uid":1000,"gid":1000}}},"readOnly":true,"capDrop":["ALL"],"capAdd":[],"mounts":[],"publishedPorts":[],"publishedSockets":[],"dns":null,"resources":{"cpus":1,"memoryInBytes":268435456}},"status":{"state":"running"}}`
+const testPinJSON = `{"configuration":{"id":"sandboxd-pin-fa7da416a4998248","labels":{"gitmoot.sandboxd.pin":"apple-v1","gitmoot.sandboxd.worker":"mac-local"},"image":{"reference":"` + testPinImage + `"},"networks":[{"network":"sandboxd-internal"}],"initProcess":{"executable":"/bin/sleep","arguments":["2147483647"],"user":{"id":{"uid":1000,"gid":1000}}},"readOnly":true,"capDrop":["ALL"],"capAdd":[],"mounts":[],"publishedPorts":[],"publishedSockets":[],"dns":null,"resources":{"cpus":1,"memoryInBytes":268435456}},"status":{"state":"running"}}`
 
 type fakeGate struct{ err error }
 
@@ -73,7 +73,7 @@ func TestAppleInventoryOwnershipAndDestroy(t *testing.T) {
  {"configuration":{"id":"sandboxd-c1","labels":{"gitmoot.sandboxd.owner":"apple-v1","gitmoot.sandboxd.worker":"another-worker"}},"status":{"state":"running"}},
  {"configuration":{"id":"other","labels":{}},"status":{"state":"running"}}
 ]`, `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, &fakeGate{})
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, &fakeGate{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,15 +109,15 @@ func TestAppleInventoryOwnershipAndDestroy(t *testing.T) {
 func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 	cli, log := fakeAppleCLI(t, "["+testPinJSON+"]", `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
 	gate := &fakeGate{err: errors.New("PF disabled")}
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, gate)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	if _, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "untrusted:latest", CPUs: 2, MemoryMiB: 512}); err == nil {
+	if _, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "untrusted:latest", Network: "sandboxd-internal", CPUs: 2, MemoryMiB: 512}); err == nil {
 		t.Fatal("create accepted an image outside the allowlist")
 	}
-	if _, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "example/image:arm64", CPUs: 2, MemoryMiB: 512}); err == nil {
+	if _, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "example/image:arm64", Network: "sandboxd-internal", CPUs: 2, MemoryMiB: 512}); err == nil {
 		t.Fatal("created an untrusted guest while PF was disabled")
 	}
 	calls, err := os.ReadFile(log)
@@ -125,7 +125,7 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		t.Fatalf("unprotected create reached volume allocation: %v %s", err, calls)
 	}
 	gate.err = nil
-	instance, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "example/image:arm64", CPUs: 2, MemoryMiB: 512})
+	instance, err := d.Create(ctx, Spec{ID: "sandboxd-new", Image: "example/image:arm64", Network: "sandboxd-internal", CPUs: 2, MemoryMiB: 512})
 	if err != nil || !instance.Running || instance.ID != "sandboxd-new" {
 		t.Fatalf("create did not start an owned VM: %v, %v", instance, err)
 	}
@@ -203,11 +203,11 @@ func TestAppleCreateRejectsUntrustedGuestNetwork(t *testing.T) {
 		`[]`,
 	} {
 		cli, calls := fakeAppleCLI(t, "[]", network)
-		d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, &fakeGate{})
+		d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, &fakeGate{})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := d.Create(context.Background(), Spec{ID: "sandboxd-new", Image: "example/image:arm64", CPUs: 2, MemoryMiB: 512}); err == nil {
+		if _, err := d.Create(context.Background(), Spec{ID: "sandboxd-new", Image: "example/image:arm64", Network: "sandboxd-internal", CPUs: 2, MemoryMiB: 512}); err == nil {
 			t.Fatalf("created VM without owned host-only network: %s", network)
 		}
 		logged, err := os.ReadFile(calls)

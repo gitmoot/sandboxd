@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 )
@@ -16,40 +17,43 @@ const (
 	maxModelRelayConnectionsPerGuest = 4
 )
 
-func openModelRelay(listenAddress, target, guestCIDR string) (net.Listener, netip.Prefix, error) {
-	if listenAddress == "" && target == "" && guestCIDR == "" {
-		return nil, netip.Prefix{}, nil
+// openModelRelay admits only the slot IPv4 subnets, matching the helper's
+// per-slot pass rule. Listen and target enable it together.
+func openModelRelay(listenAddress, target string, guests []netip.Prefix) (net.Listener, error) {
+	if listenAddress == "" && target == "" {
+		return nil, nil
 	}
-	if listenAddress == "" || target == "" || guestCIDR == "" {
-		return nil, netip.Prefix{}, errors.New("model relay requires listen, loopback target, and guest CIDR together")
+	if listenAddress == "" || target == "" || len(guests) == 0 {
+		return nil, errors.New("model relay requires listen, loopback target, and guest slot subnets together")
 	}
-	guest, err := netip.ParsePrefix(guestCIDR)
-	if err != nil || !guest.Addr().Is4() || !guest.Addr().IsPrivate() ||
-		guest.Bits() < 24 || guest.Addr() != guest.Masked().Addr() {
-		return nil, netip.Prefix{}, errors.New("model relay guest CIDR must be a canonical private IPv4 /24 or narrower")
+	for _, guest := range guests {
+		if !guest.IsValid() || !guest.Addr().Is4() || !guest.Addr().IsPrivate() ||
+			guest.Bits() < 24 || guest.Addr() != guest.Masked().Addr() {
+			return nil, errors.New("model relay guest subnets must be canonical private IPv4 /24 or narrower")
+		}
 	}
 	listenHost, _, err := net.SplitHostPort(listenAddress)
 	if err != nil || net.ParseIP(listenHost).To4() == nil {
-		return nil, netip.Prefix{}, errors.New("model relay listen must have an explicit IPv4 address and port")
+		return nil, errors.New("model relay listen must have an explicit IPv4 address and port")
 	}
 	targetHost, _, err := net.SplitHostPort(target)
 	if err != nil || net.ParseIP(targetHost) == nil || !net.ParseIP(targetHost).IsLoopback() {
-		return nil, netip.Prefix{}, errors.New("model relay target must be an explicit loopback IP and port")
+		return nil, errors.New("model relay target must be an explicit loopback IP and port")
 	}
 	if _, err := net.ResolveTCPAddr("tcp4", target); err != nil {
-		return nil, netip.Prefix{}, fmt.Errorf("invalid model relay target: %w", err)
+		return nil, fmt.Errorf("invalid model relay target: %w", err)
 	}
 	listener, err := net.Listen("tcp4", listenAddress)
 	if err != nil {
-		return nil, netip.Prefix{}, fmt.Errorf("listen for model relay: %w", err)
+		return nil, fmt.Errorf("listen for model relay: %w", err)
 	}
-	return listener, guest, nil
+	return listener, nil
 }
 
 // serveModelRelay forwards raw TLS bytes to one loopback endpoint. The broker
 // verifies a short-lived client certificate and lease; source filtering here
 // is defense in depth, not a substitute for guest-to-host firewall rules.
-func serveModelRelay(ctx context.Context, listener net.Listener, target string, guest netip.Prefix) error {
+func serveModelRelay(ctx context.Context, listener net.Listener, target string, guests []netip.Prefix) error {
 	defer listener.Close()
 	stopped := make(chan struct{})
 	defer close(stopped)
@@ -78,7 +82,7 @@ func serveModelRelay(ctx context.Context, listener net.Listener, target string, 
 			continue
 		}
 		address, ok := netip.AddrFromSlice(peer.IP)
-		if !ok || !guest.Contains(address.Unmap()) {
+		if !ok || !slices.ContainsFunc(guests, func(guest netip.Prefix) bool { return guest.Contains(address.Unmap()) }) {
 			_ = inbound.Close()
 			continue
 		}

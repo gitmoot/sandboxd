@@ -27,8 +27,8 @@ printf '%%s\n' "$*" >> %q
 case "$1" in
   network) printf '%%s\n' '[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]' ;;
   list) cat %q ;;
-  create) printf 'sandboxd-pin-3c00d0a9d4c2eb08\n'; printf '%%s\n' %q > %q ;;
-  start) printf 'sandboxd-pin-3c00d0a9d4c2eb08\n'; printf '%%s\n' %q > %q ;;
+  create) printf 'sandboxd-pin-fa7da416a4998248\n'; printf '%%s\n' %q > %q ;;
+  start) printf 'sandboxd-pin-fa7da416a4998248\n'; printf '%%s\n' %q > %q ;;
   delete) printf '[]\n' > %q ;;
   *) exit 88 ;;
 esac
@@ -37,7 +37,7 @@ esac
 		t.Fatal(err)
 	}
 	gate := &fakeGate{}
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, gate)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ esac
 		t.Fatal(err)
 	}
 	gate := &cancelRaceGate{entered: make(chan struct{})}
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, gate)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, gate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ esac
 			close(gate.release)
 		}
 	}()
-	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, "sandboxd-internal", "mac-local", testPinImage, gate)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, gate)
 	if err != nil {
 		t.Fatal(err)
 	}

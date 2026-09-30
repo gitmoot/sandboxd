@@ -14,12 +14,36 @@ import (
 
 const testMainRules = "anchor \"com.apple/*\" all\n"
 const testPinImage = "example/pin@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-const testNetworkJSON = `[{"configuration":{"name":"sandboxd-internal","mode":"hostOnly","plugin":"container-network-vmnet","labels":{"gitmoot.sandboxd.network":"apple-v1"}},"status":{"ipv4Gateway":"192.168.128.1","ipv4Subnet":"192.168.128.0/24","ipv6Subnet":"fd1e:68b8:2ef4:5d5a::/64"}}]`
-const testPinJSON = `[{"configuration":{"id":"sandboxd-pin-3c00d0a9d4c2eb08","labels":{"gitmoot.sandboxd.pin":"apple-v1","gitmoot.sandboxd.worker":"mac-local"},"image":{"reference":"` + testPinImage + `"},"networks":[{"network":"sandboxd-internal"}],"initProcess":{"executable":"/bin/sleep","arguments":["2147483647"],"user":{"id":{"uid":1000,"gid":1000}}},"readOnly":true,"capDrop":["ALL"],"capAdd":[],"mounts":[],"publishedPorts":[],"publishedSockets":[],"dns":null,"resources":{"cpus":1,"memoryInBytes":268435456}},"status":{"state":"running"}}]`
+const testSlot = "name=sandboxd-internal,ipv4=192.168.128.0/24,gw=192.168.128.1,ipv6=fd1e:68b8:2ef4:5d5a::/64"
+
+var testNetworkJSON = networkJSON("sandboxd-internal", "192.168.128.1", "192.168.128.0/24", "fd1e:68b8:2ef4:5d5a::/64")
+var testPinJSON = "[" + pinJSON("sandboxd-internal") + "]"
+
+func networkJSON(name, gateway, ipv4, ipv6 string) string {
+	return `[{"configuration":{"name":"` + name + `","mode":"hostOnly","plugin":"container-network-vmnet","labels":{"gitmoot.sandboxd.network":"apple-v1"}},"status":{"ipv4Gateway":"` + gateway + `","ipv4Subnet":"` + ipv4 + `","ipv6Subnet":"` + ipv6 + `"}}]`
+}
+
+// pinJSON is one slot's trusted pin VM, without the surrounding list.
+func pinJSON(network string) string {
+	return `{"configuration":{"id":"` + PinID("mac-local", network) + `","labels":{"gitmoot.sandboxd.pin":"apple-v1","gitmoot.sandboxd.worker":"mac-local"},"image":{"reference":"` + testPinImage + `"},"networks":[{"network":"` + network + `"}],"initProcess":{"executable":"/bin/sleep","arguments":["2147483647"],"user":{"id":{"uid":1000,"gid":1000}}},"readOnly":true,"capDrop":["ALL"],"capAdd":[],"mounts":[],"publishedPorts":[],"publishedSockets":[],"dns":null,"resources":{"cpus":1,"memoryInBytes":268435456}},"status":{"state":"running"}}`
+}
 
 func testMainHash() string {
 	hash := sha256.Sum256([]byte(testMainRules))
 	return hex.EncodeToString(hash[:])
+}
+
+func mustSlots(t *testing.T, values ...string) []Slot {
+	t.Helper()
+	slots := make([]Slot, len(values))
+	for i, value := range values {
+		slot, err := ParseSlot(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		slots[i] = slot
+	}
+	return slots
 }
 
 func testConfig(t *testing.T) Config {
@@ -27,9 +51,7 @@ func testConfig(t *testing.T) Config {
 	return Config{
 		SocketPath: filepath.Join(t.TempDir(), "helper.sock"), WorkerUID: 501, WorkerGID: 20,
 		WorkerHome: "/Users/jerry", WorkerID: "mac-local", ContainerCLI: "/usr/local/bin/container",
-		Network: "sandboxd-internal", PinImage: testPinImage,
-		GatewayIPv4: "192.168.128.1", IPv4Subnet: "192.168.128.0/24",
-		IPv6Prefix:      "fd1e:68b8:2ef4:5d5a::/64",
+		Slots: mustSlots(t, testSlot), PinImage: testPinImage,
 		MainRulesSHA256: testMainHash(),
 	}
 }
@@ -110,7 +132,7 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 				return nil, fmt.Errorf("default policy is not deny-only: %s", input)
 			}
 			if args[2] == "-f" {
-				loaded = s.canonicalPolicy(bridge)
+				loaded = s.canonicalPolicy([]string{bridge})
 			}
 			return nil, nil
 		}
@@ -183,7 +205,7 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 	if _, err := s.arm(ctx); err == nil {
 		t.Fatal("overwrote unexpected existing policy")
 	}
-	loaded = s.canonicalPolicy("bridge102")
+	loaded = s.canonicalPolicy([]string{"bridge102"})
 	bridge = ""
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted policy after bridge vanished")
@@ -213,13 +235,13 @@ func TestModelRelayPolicyOnlyPassesPinnedGateway(t *testing.T) {
 	const expectedPolicy = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 8443\n" +
 		"block in quick on bridge102 inet from any to any\n" +
 		"block in quick on bridge102 inet6 from any to any\n"
-	if got := s.policy("bridge102"); got != expectedPolicy {
+	if got := s.policy([]string{"bridge102"}); got != expectedPolicy {
 		t.Fatalf("model exception is not confined to the fixed guest gateway:\n%s", got)
 	}
 	const expectedReadback = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port = 8443 flags S/SA keep state\n" +
 		"block drop in quick on bridge102 inet all\n" +
 		"block drop in quick on bridge102 inet6 all"
-	if got := s.canonicalPolicy("bridge102"); got != expectedReadback {
+	if got := s.canonicalPolicy([]string{"bridge102"}); got != expectedReadback {
 		t.Fatalf("unexpected Mac PF policy readback:\n%s", got)
 	}
 

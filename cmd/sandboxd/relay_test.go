@@ -25,11 +25,11 @@ func TestModelRelayForwardsOnlyPermittedGuestSources(t *testing.T) {
 
 	for _, tc := range []struct {
 		name    string
-		guest   string
+		guests  []string
 		allowed bool
 	}{
-		{name: "guest", guest: "127.0.0.0/8", allowed: true},
-		{name: "foreign source", guest: "192.168.128.0/24", allowed: false},
+		{name: "guest in second slot", guests: []string{"192.168.130.0/24", "127.0.0.0/8"}, allowed: true},
+		{name: "foreign source", guests: []string{"192.168.128.0/24", "192.168.130.0/24"}, allowed: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -38,7 +38,11 @@ func TestModelRelayForwardsOnlyPermittedGuestSources(t *testing.T) {
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan error, 1)
-			go func() { done <- serveModelRelay(ctx, listener, target, netip.MustParsePrefix(tc.guest)) }()
+			var guests []netip.Prefix
+			for _, guest := range tc.guests {
+				guests = append(guests, netip.MustParsePrefix(guest))
+			}
+			go func() { done <- serveModelRelay(ctx, listener, target, guests) }()
 			before := requests.Load()
 			resp, err := client.Get("http://" + listener.Addr().String() + "/model")
 			if tc.allowed {
@@ -71,7 +75,8 @@ func TestModelRelayForwardsOnlyPermittedGuestSources(t *testing.T) {
 
 func TestModelRelayRefusesBroadGuestCIDRAndNonLoopbackTarget(t *testing.T) {
 	for _, guest := range []string{"0.0.0.0/0", "8.8.8.0/24", "192.168.128.17/24"} {
-		listener, _, err := openModelRelay("127.0.0.1:0", "127.0.0.1:43184", guest)
+		listener, err := openModelRelay("127.0.0.1:0", "127.0.0.1:43184",
+			[]netip.Prefix{netip.MustParsePrefix("192.168.130.0/24"), netip.MustParsePrefix(guest)})
 		if listener != nil {
 			_ = listener.Close()
 		}
@@ -80,7 +85,7 @@ func TestModelRelayRefusesBroadGuestCIDRAndNonLoopbackTarget(t *testing.T) {
 		}
 	}
 	for _, target := range []string{"192.168.1.1:43184", "localhost:43184"} {
-		listener, _, err := openModelRelay("127.0.0.1:0", target, "192.168.128.0/24")
+		listener, err := openModelRelay("127.0.0.1:0", target, []netip.Prefix{netip.MustParsePrefix("192.168.128.0/24")})
 		if listener != nil {
 			_ = listener.Close()
 		}
@@ -114,7 +119,7 @@ func TestModelRelayLimitsConnectionsPerSource(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveModelRelay(ctx, listener, broker.Addr().String(), netip.MustParsePrefix("127.0.0.0/8"))
+		done <- serveModelRelay(ctx, listener, broker.Addr().String(), []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")})
 	}()
 	for range maxModelRelayConnectionsPerGuest {
 		conn, err := net.DialTimeout("tcp4", listener.Addr().String(), time.Second)

@@ -31,7 +31,7 @@ type fakeDriver struct {
 func (d *fakeDriver) Create(_ context.Context, spec vm.Spec) (vm.Instance, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	instance := vm.Instance{ID: spec.ID, Running: true}
+	instance := vm.Instance{ID: spec.ID, Running: true, Network: spec.Network}
 	d.instances[spec.ID] = instance
 	return instance, d.createError
 }
@@ -70,7 +70,7 @@ func (d *fakeDriver) Destroy(_ context.Context, id string) error {
 func openService(t *testing.T, driver *fakeDriver) *Service {
 	t.Helper()
 	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver,
-		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64", Domain: "sandbox.example", WorkerID: "mac-local", CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour})
+		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64", Domain: "sandbox.example", WorkerID: "mac-local", CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour, Slots: []string{"slot-1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestInventoryPagesPreserveCompleteRunningSet(t *testing.T) {
 	driver := &fakeDriver{instances: make(map[string]vm.Instance)}
 	service, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver,
 		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64", Domain: "sandbox.example", WorkerID: "mac-local",
-			CPUs: 2, MemoryMiB: 512, MaxVMs: 2, MaxTTL: time.Hour})
+			CPUs: 2, MemoryMiB: 512, MaxVMs: 2, MaxTTL: time.Hour, Slots: []string{"slot-1", "slot-2"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestRestartDoesNotReassignLiveVMToNewWorker(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.sqlite")
 	driver := &fakeDriver{instances: make(map[string]vm.Instance)}
 	cfg := Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64",
-		Domain: "sandbox.example", WorkerID: "mac-original", CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour}
+		Domain: "sandbox.example", WorkerID: "mac-original", CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour, Slots: []string{"slot-1"}}
 	first, err := Open(context.Background(), path, driver, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +306,7 @@ func TestNewAttemptFencesOldGuestWithoutDeletingNewVM(t *testing.T) {
 	driver := &fakeDriver{instances: make(map[string]vm.Instance)}
 	service, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver,
 		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64",
-			Domain: "sandbox.example", WorkerID: "mac-local", CPUs: 2, MemoryMiB: 512, MaxVMs: 2, MaxTTL: time.Hour})
+			Domain: "sandbox.example", WorkerID: "mac-local", CPUs: 2, MemoryMiB: 512, MaxVMs: 2, MaxTTL: time.Hour, Slots: []string{"slot-1", "slot-2"}})
 	if err != nil {
 		t.Fatal(err)
 	}

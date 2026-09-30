@@ -23,7 +23,7 @@ func TestDurableCapacityAndAttemptFence(t *testing.T) {
 	start := time.Now()
 	row := Row{ID: "first", TokenHash: make([]byte, 32), Metadata: "{}", JobID: "review", Attempt: 1,
 		TemplateID: "review", Image: "linux-arm64", WorkerID: "mac-local", Generation: 2, Started: start, Ends: start.Add(time.Hour)}
-	if err := ledger.Reserve(ctx, row, 1); err != nil {
+	if _, err := ledger.Reserve(ctx, row, 1, testSlots); err != nil {
 		t.Fatal(err)
 	}
 	if err := ledger.Close(); err != nil {
@@ -40,18 +40,18 @@ func TestDurableCapacityAndAttemptFence(t *testing.T) {
 	second := row
 	second.ID = "second"
 	second.JobID = "other"
-	if err := ledger.Reserve(ctx, second, 1); !errors.Is(err, ErrCapacity) {
+	if _, err := ledger.Reserve(ctx, second, 1, testSlots); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("concurrency slot was released without proof of absence: %v", err)
 	}
 	if err := ledger.SetState(ctx, row.ID, "gone"); err != nil {
 		t.Fatal(err)
 	}
 	second.JobID = row.JobID
-	if err := ledger.Reserve(ctx, second, 1); !errors.Is(err, ErrStale) {
+	if _, err := ledger.Reserve(ctx, second, 1, testSlots); !errors.Is(err, ErrStale) {
 		t.Fatalf("duplicate attempt after restart: %v", err)
 	}
 	second.Attempt = 2
-	if err := ledger.Reserve(ctx, second, 1); err != nil {
+	if _, err := ledger.Reserve(ctx, second, 1, testSlots); err != nil {
 		t.Fatalf("new attempt should replace proved-gone slot: %v", err)
 	}
 }
@@ -72,7 +72,8 @@ func TestConcurrentReservationsDoNotOversubscribe(t *testing.T) {
 			row := Row{ID: string(rune('a' + i)), TokenHash: make([]byte, 32), Metadata: "{}",
 				TemplateID: "review", Image: "linux-arm64", WorkerID: "mac-local",
 				JobID: string(rune('A' + i)), Attempt: 1, Started: now, Ends: now.Add(time.Hour)}
-			results <- ledger.Reserve(ctx, row, 1)
+			_, err := ledger.Reserve(ctx, row, 1, testSlots)
+			results <- err
 		}(i)
 	}
 	close(start)
@@ -125,7 +126,7 @@ func TestLegacyLedgerPreservesUnknownWorkerAndCapacity(t *testing.T) {
 	newRow := Row{ID: "new-vm", TokenHash: make([]byte, 32), Metadata: "{}", JobID: "new-job",
 		TemplateID: "review", Image: "linux-arm64", WorkerID: "mac-local", Attempt: 1,
 		Started: time.Now(), Ends: time.Now().Add(time.Minute)}
-	if err := ledger.Reserve(ctx, newRow, 1); !errors.Is(err, ErrCapacity) {
+	if _, err := ledger.Reserve(ctx, newRow, 2, []string{"slot-1", "slot-2"}); !errors.Is(err, ErrLegacySlot) {
 		t.Fatalf("migration released an unconfirmed old VM: %v", err)
 	}
 }

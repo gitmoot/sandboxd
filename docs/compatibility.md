@@ -64,21 +64,80 @@ The selected root-owned PF helper (`cmd/sandboxd-pf-helper`) has passed a
 bounded deny-only Mac canary, but is **not installed as a launchd service or
 approved for production traffic**. Its root-owned launchd
 configuration must fix the dedicated worker UID/GID and HOME, worker ID,
-root-owned `container` CLI, `sandboxd-internal` network, trusted pin image at
-an OCI digest, IPv4 gateway and subnet, IPv6 ULA prefix, SHA-256 of reviewed
-`pfctl -sr` output, and a socket under a root-owned non-writable directory.
-It checks the network label/mode, a read-only capability-dropped pin VM,
-unique live bridge, PF enabled and not skipping that interface, unchanged
-main rules, and the exact configured scoped anchor before admitting work. Arm
-requires no other VM attached and clears old PF states only on that bridge.
+root-owned `container` CLI, every network slot (below), trusted pin image at
+an OCI digest, SHA-256 of reviewed `pfctl -sr` output, and a socket under a
+root-owned non-writable directory. For every slot it checks the network
+label/mode/addresses, a read-only capability-dropped pin VM on that network,
+and exactly one live bridge carrying that slot's gateway, ULA and link-local
+addresses (a bridge matching two slots, or two bridges matching one slot, is
+refused); then PF enabled and not skipping any slot bridge, unchanged main
+rules, and the exact configured anchor covering every slot bridge in slot
+order. A slot network used by two VMs other than its pin, or a VM joining a
+slot network to any other network, fails the check. Arm requires no VM other
+than the pins on any slot network and clears old PF states only on the slot
+bridges; it retries while any slot bridge is still configuring.
 By default `--model-relay-port=0` retains the exact deny-only anchor. A
-nonzero root-configured port adds only a TCP pass from the pinned guest IPv4
-subnet to the pinned gateway address and that port; both IPv4/IPv6 block rules
-still follow. The helper refuses unrelated or changed anchor rules.
-`sandboxd` requires the same pin digest through `--pin-image` and the helper
-socket through `--pf-socket`; it stops
+nonzero root-configured port adds, per slot, only a TCP pass from that slot's
+IPv4 subnet to that slot's gateway address and that port; both IPv4/IPv6
+block rules still follow. The helper refuses unrelated or changed anchor rules.
+`sandboxd` requires the same pin digest through `--pin-image`, the same
+`--slot` list, and the helper socket through `--pf-socket`; it stops
 ordinary guests on gate failure and only requests anchor removal after every
 VM has been deleted.
+
+### Network slots: one host-only network per concurrent guest
+
+Two guests on the same Apple host-only network can reach each other: PF on
+the Mac never sees traffic inside one bridge, and macOS has no bridge
+`private` flag. Guests on separate host-only networks could not reach each
+other on the Mac Studio (TCP and ping blocked, with IP forwarding on). So
+every concurrent guest gets its own network, a **slot**, and concurrency
+equals the number of slots.
+
+Create one network per slot with distinct, non-overlapping subnets:
+
+```sh
+container network create --internal --subnet 192.168.130.0/24 --subnet-v6 fd1e:68b8:2ef4:5d01::/64 \
+  --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-1
+container network create --internal --subnet 192.168.131.0/24 --subnet-v6 fd1e:68b8:2ef4:5d02::/64 \
+  --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-2
+container network create --internal --subnet 192.168.132.0/24 --subnet-v6 fd1e:68b8:2ef4:5d03::/64 \
+  --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-3
+```
+
+Copy each network's actual `status.ipv4Subnet`, `status.ipv4Gateway` and
+`status.ipv6Subnet` from `container network inspect <name>` (mode must be
+`hostOnly`) into one `--slot` per network, identical and in the same order
+for both binaries:
+
+```sh
+sandboxd-pf-helper ... \
+  --slot name=sandboxd-slot-1,ipv4=192.168.130.0/24,gw=192.168.130.1,ipv6=fd1e:68b8:2ef4:5d01::/64 \
+  --slot name=sandboxd-slot-2,ipv4=192.168.131.0/24,gw=192.168.131.1,ipv6=fd1e:68b8:2ef4:5d02::/64 \
+  --slot name=sandboxd-slot-3,ipv4=192.168.132.0/24,gw=192.168.132.1,ipv6=fd1e:68b8:2ef4:5d03::/64
+sandboxd ... (the same three --slot flags) [--max-vms N]
+```
+
+Each `--slot` needs exactly the keys `name`, `ipv4` (canonical private /16 to
+/30 containing `gw`), `gw` (private IPv4) and `ipv6` (canonical ULA /48 to
+/64), in any order; unknown or repeated keys, a duplicate network, or
+overlapping subnets are rejected; at most 16 slots. `--max-vms` defaults to
+the slot count and may not exceed it. The service starts one pin VM per slot
+(`sandboxd-pin-` plus a hash of the worker ID and network), records each
+reservation's slot durably in the ledger (a unique index forbids two live rows
+on one slot), and attaches each guest only to its slot network. A slot is
+free again only once its row is `gone`; an `unknown` guest keeps its slot.
+Reconciliation destroys a guest observed on a network other than its slot.
+
+This replaces the single `--network`/`--gateway-ipv4`/`--network-ipv4`/
+`--network-ipv6` helper flags and the service `--network` flag. To keep the
+old `sandboxd-internal` network, pass it as one `--slot`. Stop the previous
+build cleanly first so it removes its old pin VM (named from the worker ID
+alone); a leftover VM on a slot network blocks arming. A ledger from a
+pre-slot build keeps its rows; while any of them is not `gone`, admission is
+refused (their guests' networks are unknown) until reconciliation proves
+them gone.
+
 The helper deliberately leaves the anchor in place on crash. The supervised
 deny-only Mac canary blocked previously successful guest IPv4, IPv6 ULA, and
 link-local connections while unrelated Mac/tailnet test traffic worked; the
@@ -88,22 +147,23 @@ rule remain unverified. Do not admit untrusted work.
 
 The optional fixed model relay transports TLS bytes without terminating TLS
 or handling credentials. Gitmoot's mTLS broker listens on its own
-`127.0.0.1:8443` and advertises `https://192.168.128.1:8443`, so its server
-certificate names the address seen by the guest. A supervised SSH reverse
+`127.0.0.1:8443` and advertises its slot's gateway, e.g.
+`https://192.168.130.1:8443`, so its server certificate must name every slot
+gateway address a guest can see. A supervised SSH reverse
 forward from that broker to the Mac binds only Mac `127.0.0.1:43184`:
 `ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
-The default PF anchor blocks the guest's model relay at
-`192.168.128.1:8443` along with all other Mac services. An optional
-root-configured `--model-relay-port=8443` generates only a guest-subnet TCP
-pass to the pinned IPv4 gateway and that port before the deny rules; a Mac
+The default PF anchor blocks the guest's model relay at its slot gateway
+port 8443 along with all other Mac services. An optional
+root-configured `--model-relay-port=8443` generates, per slot, only a
+slot-subnet TCP pass to that slot's IPv4 gateway and that port before the deny rules; a Mac
 `pfctl -vnf` syntax-only check rendered the pass and both denies, but **no
 model pass rule has been loaded**. Do not set this flag or enable model access
 until Gitmoot's mTLS broker and scoped lease are provisioned and the pass
 counter, certificate rejection, lease expiry, and unrelated-client denial
 are proved on the Mac. Then launch sandboxd with
-`--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184 --model-relay-guest-cidr 192.168.128.0/24`.
-The relay admits only guest
-subnet source addresses, caps concurrent connections, and forwards to that
+`--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184`.
+The relay admits only source addresses in the configured slot IPv4 subnets
+(the former `--model-relay-guest-cidr` flag is gone), caps concurrent connections, and forwards to that
 one loopback port; Gitmoot's mTLS certificate and short-lived lease still
 authorize each model request. Source admission is not a firewall for other
 Mac services. Recheck the actual network subnet after any Apple network

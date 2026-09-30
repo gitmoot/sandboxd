@@ -17,6 +17,9 @@ import (
 var (
 	ErrCapacity = errors.New("sandbox capacity exhausted")
 	ErrStale    = errors.New("stale or duplicate job attempt")
+	// ErrLegacySlot refuses admission while a live row predates network slots:
+	// its guest's network is unknown, so no slot can be proven free.
+	ErrLegacySlot = errors.New("live sandbox without a recorded network slot")
 )
 
 type Row struct {
@@ -31,8 +34,11 @@ type Row struct {
 	Generation int64
 	Fence      string
 	State      string
-	Started    time.Time
-	Ends       time.Time
+	// Slot is the guest's exclusive network slot. It stays occupied until the
+	// row is gone; "" marks a row created before slots were recorded.
+	Slot    string
+	Started time.Time
+	Ends    time.Time
 }
 
 type Store struct {
@@ -86,7 +92,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			job_id TEXT NOT NULL, attempt INTEGER NOT NULL, generation INTEGER NOT NULL,
 			fence TEXT NOT NULL, state TEXT NOT NULL,
 			template_id TEXT NOT NULL DEFAULT '', image TEXT NOT NULL DEFAULT '',
-			worker_id TEXT NOT NULL DEFAULT '',
+			worker_id TEXT NOT NULL DEFAULT '', slot TEXT NOT NULL DEFAULT '',
 			started_ns INTEGER NOT NULL, ends_ns INTEGER NOT NULL
 		)`,
 		"CREATE INDEX IF NOT EXISTS sandboxes_job ON sandboxes(job_id, generation DESC, attempt DESC)",
@@ -102,12 +108,18 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		release()
 		return nil, err
 	}
+	// Durable exclusivity: no two live rows ever share a slot.
+	if _, err := db.ExecContext(ctx, "CREATE UNIQUE INDEX IF NOT EXISTS sandboxes_live_slot ON sandboxes(slot) WHERE state <> 'gone' AND slot <> ''"); err != nil {
+		_ = db.Close()
+		release()
+		return nil, fmt.Errorf("initialize ledger slot index: %w", err)
+	}
 	return &Store{db: db, lock: lock}, nil
 }
 
-// Old development ledgers lacked template, image and worker identity. Preserve
-// their rows and reservations; an unknown identity is never inferred as a new
-// worker during recovery.
+// Old development ledgers lacked template, image, worker and slot identity.
+// Preserve their rows and reservations; an unknown identity is never inferred
+// as a new worker or a free slot during recovery.
 func migrateIdentity(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx, "PRAGMA table_info(sandboxes)")
 	if err != nil {
@@ -129,7 +141,7 @@ func migrateIdentity(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	for _, name := range []string{"template_id", "image", "worker_id"} {
+	for _, name := range []string{"template_id", "image", "worker_id", "slot"} {
 		if existing[name] {
 			continue
 		}
@@ -149,20 +161,24 @@ func (s *Store) Close() error {
 	return err
 }
 
-// Reserve serializes capacity and fencing checks with insertion. An exclusive
-// filesystem lock also prevents a second service from reconciling an in-flight
-// Create in another process.
-func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int) (err error) {
+// Reserve serializes capacity, fencing and slot checks with insertion, and
+// returns the exclusive network slot recorded for the new row: the first of
+// slots held by no row that is not gone. An exclusive filesystem lock also
+// prevents a second service from reconciling an in-flight Create in another process.
+func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int, slots []string) (slot string, err error) {
 	if row.TemplateID == "" || row.Image == "" || row.WorkerID == "" {
-		return errors.New("sandbox template, image and worker identity are required")
+		return "", errors.New("sandbox template, image and worker identity are required")
+	}
+	if len(slots) == 0 {
+		return "", errors.New("sandbox network slots are required")
 	}
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer conn.Close()
 	if _, err = conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return err
+		return "", err
 	}
 	defer func() {
 		if err != nil {
@@ -172,33 +188,64 @@ func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int) (err error) {
 	var generation, attempt int64
 	err = conn.QueryRowContext(ctx, "SELECT generation,attempt FROM sandboxes WHERE job_id=? ORDER BY generation DESC,attempt DESC LIMIT 1", row.JobID).Scan(&generation, &attempt)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return "", err
 	}
 	if err == nil && (row.Generation < generation || row.Generation == generation && row.Attempt <= attempt) {
-		return ErrStale
+		return "", ErrStale
 	}
-	var active int
-	if err = conn.QueryRowContext(ctx, "SELECT count(*) FROM sandboxes WHERE state <> 'gone'").Scan(&active); err != nil {
-		return err
+	live, err := conn.QueryContext(ctx, "SELECT slot FROM sandboxes WHERE state <> 'gone'")
+	if err != nil {
+		return "", err
+	}
+	occupied := make(map[string]bool)
+	active, legacy := 0, false
+	for live.Next() {
+		var held string
+		if err = live.Scan(&held); err != nil {
+			live.Close()
+			return "", err
+		}
+		active++
+		legacy = legacy || held == ""
+		occupied[held] = true
+	}
+	err = live.Err()
+	live.Close()
+	if err != nil {
+		return "", err
+	}
+	if legacy {
+		return "", ErrLegacySlot
 	}
 	if active >= maxVMs {
-		return ErrCapacity
+		return "", ErrCapacity
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,started_ns,ends_ns)
-		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
-		row.TemplateID, row.Image, row.WorkerID, row.Started.UnixNano(), row.Ends.UnixNano())
+	for _, candidate := range slots {
+		if candidate != "" && !occupied[candidate] {
+			slot = candidate
+			break
+		}
+	}
+	if slot == "" {
+		return "", ErrCapacity
+	}
+	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,started_ns,ends_ns)
+		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
+		row.TemplateID, row.Image, row.WorkerID, slot, row.Started.UnixNano(), row.Ends.UnixNano())
 	if err != nil {
-		return err
+		return "", err
 	}
-	_, err = conn.ExecContext(ctx, "COMMIT")
-	return err
+	if _, err = conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return "", err
+	}
+	return slot, nil
 }
 
 func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	var row Row
 	var start, end int64
 	err := scanner.Scan(&row.ID, &row.TokenHash, &row.Metadata, &row.JobID, &row.Attempt, &row.Generation, &row.Fence, &row.State,
-		&row.TemplateID, &row.Image, &row.WorkerID, &start, &end)
+		&row.TemplateID, &row.Image, &row.WorkerID, &row.Slot, &start, &end)
 	if err == nil {
 		row.Started = time.Unix(0, start).UTC()
 		row.Ends = time.Unix(0, end).UTC()
@@ -206,7 +253,7 @@ func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	return row, err
 }
 
-const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,started_ns,ends_ns"
+const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,started_ns,ends_ns"
 
 func (s *Store) Get(ctx context.Context, id string) (Row, error) {
 	return scanRow(s.db.QueryRowContext(ctx, "SELECT "+columns+" FROM sandboxes WHERE id=?", id))

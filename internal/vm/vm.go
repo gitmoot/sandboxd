@@ -8,17 +8,22 @@ import (
 
 // Spec describes one disposable Linux VM. ID is an opaque, service-owned name;
 // the driver must never interpret an arbitrary client-provided path as an ID.
+// Network is the guest's exclusive slot network, assigned by the ledger; the
+// guest is attached to it and nothing else.
 type Spec struct {
 	ID        string
 	Image     string
+	Network   string
 	CPUs      int
 	MemoryMiB int
 }
 
-// Instance is a positive observation of a VM owned by this driver.
+// Instance is a positive observation of a VM owned by this driver. Network is
+// its only attached network, or "" when it is not attached to exactly one.
 type Instance struct {
 	ID      string
 	Running bool
+	Network string
 }
 
 // Command is executed inside a running VM without a host shell.

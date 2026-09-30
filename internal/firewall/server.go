@@ -27,7 +27,7 @@ var ownedName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 var imageDigest = regexp.MustCompile(`@sha256:[0-9a-f]{64}$`)
 
 // Config is supplied by root-owned launchd configuration, never by the worker.
-// The bridge address and ULA prefix are pinned to the dedicated host-only network.
+// Each slot pins one dedicated host-only network's bridge addresses and ULA prefix.
 type Config struct {
 	SocketPath   string
 	WorkerUID    int
@@ -35,29 +35,21 @@ type Config struct {
 	WorkerHome   string
 	WorkerID     string
 	ContainerCLI string
-	Network      string
+	Slots        []Slot
 	PinImage     string
-	GatewayIPv4  string
-	IPv4Subnet   string
-	IPv6Prefix   string
-	// ModelRelayPort enables only a fixed IPv4 guest-to-gateway TCP exception.
-	// Zero keeps the anchor deny-only until the mTLS broker and lease are ready.
+	// ModelRelayPort enables only a fixed IPv4 guest-to-gateway TCP exception
+	// per slot. Zero keeps the anchor deny-only until the mTLS broker and lease are ready.
 	ModelRelayPort  int
 	MainRulesSHA256 string
 }
 
 type Server struct {
-	config        Config
-	gateway       netip.Addr
-	ipv4          netip.Prefix
-	ipv6          netip.Prefix
-	mainHash      [sha256.Size]byte
-	modelPass     string
-	modelReadback string
-	interfaces    func() ([]net.Interface, error)
-	addrs         func(net.Interface) ([]net.Addr, error)
-	pf            func(context.Context, ...string) ([]byte, error)
-	container     func(context.Context, ...string) ([]byte, error)
+	config     Config
+	mainHash   [sha256.Size]byte
+	interfaces func() ([]net.Interface, error)
+	addrs      func(net.Interface) ([]net.Addr, error)
+	pf         func(context.Context, ...string) ([]byte, error)
+	container  func(context.Context, ...string) ([]byte, error)
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -67,23 +59,11 @@ func NewServer(cfg Config) (*Server, error) {
 	}
 	if !filepath.IsAbs(cfg.WorkerHome) || filepath.Clean(cfg.WorkerHome) != cfg.WorkerHome ||
 		!filepath.IsAbs(cfg.ContainerCLI) || filepath.Clean(cfg.ContainerCLI) != cfg.ContainerCLI ||
-		!ownedName.MatchString(cfg.WorkerID) || !ownedName.MatchString(cfg.Network) ||
-		cfg.Network == "default" || !imageDigest.MatchString(cfg.PinImage) {
-		return nil, fmt.Errorf("invalid root-configured worker, network, or trusted pin image")
+		!ownedName.MatchString(cfg.WorkerID) || !imageDigest.MatchString(cfg.PinImage) {
+		return nil, fmt.Errorf("invalid root-configured worker or trusted pin image")
 	}
-	gateway, err := netip.ParseAddr(cfg.GatewayIPv4)
-	if err != nil || !gateway.Is4() || !gateway.IsPrivate() {
-		return nil, fmt.Errorf("firewall gateway must be a private IPv4 address")
-	}
-	ipv4, err := netip.ParsePrefix(cfg.IPv4Subnet)
-	if err != nil || !ipv4.Addr().Is4() || ipv4.Masked() != ipv4 ||
-		!ipv4.Contains(gateway) || ipv4.Bits() < 16 || ipv4.Bits() > 30 {
-		return nil, fmt.Errorf("firewall IPv4 subnet must contain the gateway")
-	}
-	prefix, err := netip.ParsePrefix(cfg.IPv6Prefix)
-	if err != nil || !prefix.Addr().Is6() || prefix.Bits() < 48 || prefix.Bits() > 64 ||
-		prefix.Masked() != prefix || !prefix.Addr().IsPrivate() {
-		return nil, fmt.Errorf("firewall IPv6 network must be a canonical private /48 to /64 prefix")
+	if err := ValidateSlots(cfg.Slots); err != nil {
+		return nil, err
 	}
 	if cfg.ModelRelayPort != 0 && (cfg.ModelRelayPort < 1024 || cfg.ModelRelayPort > 65535) {
 		return nil, fmt.Errorf("model relay port must be 1024-65535 or zero to deny all")
@@ -92,14 +72,9 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil || len(rawHash) != sha256.Size {
 		return nil, fmt.Errorf("root-configured PF main rules SHA-256 is required")
 	}
-	s := &Server{config: cfg, gateway: gateway, ipv4: ipv4, ipv6: prefix, interfaces: net.Interfaces,
+	cfg.Slots = append([]Slot(nil), cfg.Slots...)
+	s := &Server{config: cfg, interfaces: net.Interfaces,
 		addrs: func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }}
-	if cfg.ModelRelayPort != 0 {
-		endpoint := " inet proto tcp from " + ipv4.String() + " to " + gateway.String() + " port "
-		port := strconv.Itoa(cfg.ModelRelayPort)
-		s.modelPass = endpoint + port + "\n"
-		s.modelReadback = endpoint + "= " + port + " flags S/SA keep state\n"
-	}
 	copy(s.mainHash[:], rawHash)
 	s.pf = s.runPF
 	s.container = s.runContainer
@@ -122,63 +97,127 @@ func (s *Server) runPF(ctx context.Context, args ...string) ([]byte, error) {
 	return out, nil
 }
 
-func (s *Server) discover() (string, error) {
+// discover attributes each up bridge to at most one slot by that slot's exact
+// IPv4 gateway, ULA prefix and a link-local address. The result has one entry
+// per slot in configured order; "" means that slot's bridge is absent.
+func (s *Server) discover() ([]string, error) {
 	interfaces, err := s.interfaces()
 	if err != nil {
-		return "", fmt.Errorf("enumerate Mac interfaces: %w", err)
+		return nil, fmt.Errorf("enumerate Mac interfaces: %w", err)
 	}
-	var found string
+	found := make([]string, len(s.config.Slots))
 	for _, iface := range interfaces {
 		if !bridgeName.MatchString(iface.Name) || iface.Flags&net.FlagUp == 0 {
 			continue
 		}
 		addrs, err := s.addrs(iface)
 		if err != nil {
-			return "", fmt.Errorf("read %s addresses: %w", iface.Name, err)
+			return nil, fmt.Errorf("read %s addresses: %w", iface.Name, err)
 		}
-		var ipv4, ula, linkLocal bool
+		var prefixes []netip.Prefix
+		var linkLocal bool
 		for _, addr := range addrs {
 			prefix, err := netip.ParsePrefix(addr.String())
 			if err != nil {
 				continue
 			}
-			ip := prefix.Addr()
-			ipv4 = ipv4 || ip == s.gateway && prefix.Masked() == s.ipv4
-			ula = ula || ip.Is6() && prefix.Masked() == s.ipv6
-			linkLocal = linkLocal || ip.Is6() && ip.IsLinkLocalUnicast()
+			prefixes = append(prefixes, prefix)
+			linkLocal = linkLocal || prefix.Addr().Is6() && prefix.Addr().IsLinkLocalUnicast()
 		}
-		if ipv4 && ula && linkLocal {
-			if found != "" {
-				return "", fmt.Errorf("multiple bridges match the sandbox network")
+		if !linkLocal {
+			continue
+		}
+		matched := false
+		for i, slot := range s.config.Slots {
+			var ipv4, ula bool
+			for _, prefix := range prefixes {
+				ip := prefix.Addr()
+				ipv4 = ipv4 || ip == slot.Gateway && prefix.Masked() == slot.IPv4
+				ula = ula || ip.Is6() && prefix.Masked() == slot.IPv6
 			}
-			found = iface.Name
+			if !ipv4 || !ula {
+				continue
+			}
+			if matched {
+				return nil, fmt.Errorf("bridge %s matches more than one sandbox network slot", iface.Name)
+			}
+			if found[i] != "" {
+				return nil, fmt.Errorf("multiple bridges match sandbox network %s", slot.Network)
+			}
+			matched = true
+			found[i] = iface.Name
 		}
-	}
-	if found == "" {
-		return "", errors.New(bridgeNotReady)
 	}
 	return found, nil
 }
 
-func (s *Server) policy(bridge string) string {
-	rules := "block in quick on " + bridge + " inet from any to any\n" +
-		"block in quick on " + bridge + " inet6 from any to any\n"
-	if s.modelPass != "" {
-		return "pass in quick on " + bridge + s.modelPass + rules
+// attested requires a discovered bridge for every slot.
+func (s *Server) attested() ([]string, error) {
+	bridges, err := s.discover()
+	if err != nil {
+		return nil, err
 	}
-	return rules
+	for i, bridge := range bridges {
+		if bridge == "" {
+			return nil, fmt.Errorf("%s for network %s", bridgeNotReady, s.config.Slots[i].Network)
+		}
+	}
+	return bridges, nil
 }
 
-func (s *Server) canonicalPolicy(bridge string) string {
-	rules := "block drop in quick on " + bridge + " inet all\n" +
-		"block drop in quick on " + bridge + " inet6 all"
-	if s.modelReadback != "" {
-		return "pass in quick on " + bridge + s.modelReadback + rules
+// policy is the anchor text loaded for bridges, one per slot in slot order.
+func (s *Server) policy(bridges []string) string {
+	var rules strings.Builder
+	for i, bridge := range bridges {
+		if s.config.ModelRelayPort != 0 {
+			slot := s.config.Slots[i]
+			rules.WriteString("pass in quick on " + bridge + " inet proto tcp from " + slot.IPv4.String() +
+				" to " + slot.Gateway.String() + " port " + strconv.Itoa(s.config.ModelRelayPort) + "\n")
+		}
+		rules.WriteString("block in quick on " + bridge + " inet from any to any\n" +
+			"block in quick on " + bridge + " inet6 from any to any\n")
 	}
-	return rules
+	return rules.String()
 }
 
-func (s *Server) pfReady(ctx context.Context, bridge string) error {
+// canonicalPolicy is pfctl's exact readback of policy(bridges).
+func (s *Server) canonicalPolicy(bridges []string) string {
+	lines := make([]string, 0, 3*len(bridges))
+	for i, bridge := range bridges {
+		if s.config.ModelRelayPort != 0 {
+			slot := s.config.Slots[i]
+			lines = append(lines, "pass in quick on "+bridge+" inet proto tcp from "+slot.IPv4.String()+
+				" to "+slot.Gateway.String()+" port = "+strconv.Itoa(s.config.ModelRelayPort)+" flags S/SA keep state")
+		}
+		lines = append(lines, "block drop in quick on "+bridge+" inet all", "block drop in quick on "+bridge+" inet6 all")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// loadedBridges recovers the per-slot bridges named by an anchor in this
+// helper's shape. Callers still require an exact canonical match.
+func (s *Server) loadedBridges(rules string) ([]string, bool) {
+	perSlot := 2
+	if s.config.ModelRelayPort != 0 {
+		perSlot = 3
+	}
+	lines := strings.Split(rules, "\n")
+	if len(lines) != perSlot*len(s.config.Slots) {
+		return nil, false
+	}
+	bridges := make([]string, len(s.config.Slots))
+	for i := range bridges {
+		bridge, prefixed := strings.CutPrefix(lines[(i+1)*perSlot-2], "block drop in quick on ")
+		bridge, suffixed := strings.CutSuffix(bridge, " inet all")
+		if !prefixed || !suffixed || !bridgeName.MatchString(bridge) {
+			return nil, false
+		}
+		bridges[i] = bridge
+	}
+	return bridges, true
+}
+
+func (s *Server) pfReady(ctx context.Context, bridges []string) error {
 	info, err := s.pf(ctx, "-s", "info")
 	if err != nil {
 		return err
@@ -203,12 +242,14 @@ func (s *Server) pfReady(ctx context.Context, bridge string) error {
 	if sha256.Sum256(main) != s.mainHash {
 		return fmt.Errorf("Mac PF main rules changed from the reviewed baseline")
 	}
-	iface, err := s.pf(ctx, "-s", "Interfaces", "-v", "-i", bridge)
-	if err != nil {
-		return err
-	}
-	if !strings.Contains(string(iface), bridge) || strings.Contains(strings.ToLower(string(iface)), "skip") {
-		return fmt.Errorf("PF does not confirm filtering on %s", bridge)
+	for _, bridge := range bridges {
+		iface, err := s.pf(ctx, "-s", "Interfaces", "-v", "-i", bridge)
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(string(iface), bridge) || strings.Contains(strings.ToLower(string(iface)), "skip") {
+			return fmt.Errorf("PF does not confirm filtering on %s", bridge)
+		}
 	}
 	return nil
 }
@@ -226,25 +267,26 @@ func (s *Server) rules(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// check attests every slot and returns their bridges, comma-separated in slot order.
 func (s *Server) check(ctx context.Context) (string, error) {
 	if err := s.verifyNetwork(ctx); err != nil {
 		return "", err
 	}
-	bridge, err := s.discover()
+	bridges, err := s.attested()
 	if err != nil {
 		return "", err
 	}
-	if err := s.pfReady(ctx, bridge); err != nil {
+	if err := s.pfReady(ctx, bridges); err != nil {
 		return "", err
 	}
 	rules, err := s.rules(ctx)
 	if err != nil {
 		return "", err
 	}
-	if rules != s.canonicalPolicy(bridge) {
-		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s", bridge)
+	if rules != s.canonicalPolicy(bridges) {
+		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s", strings.Join(bridges, ","))
 	}
-	return bridge, nil
+	return strings.Join(bridges, ","), nil
 }
 
 func (s *Server) arm(ctx context.Context) (string, error) {
@@ -254,19 +296,19 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err := s.attached(ctx, true); err != nil {
 		return "", err
 	}
-	bridge, err := s.discover()
+	bridges, err := s.attested()
 	if err != nil {
 		return "", err
 	}
-	if err := s.pfReady(ctx, bridge); err != nil {
+	if err := s.pfReady(ctx, bridges); err != nil {
 		return "", err
 	}
 	rules, err := s.rules(ctx)
 	if err != nil {
 		return "", err
 	}
-	if rules == s.canonicalPolicy(bridge) {
-		return s.clearBridgeStates(ctx, bridge)
+	if rules == s.canonicalPolicy(bridges) {
+		return s.clearBridgeStates(ctx, bridges)
 	}
 	if rules != "" {
 		return "", fmt.Errorf("refusing to replace an unexpected firewall policy")
@@ -280,7 +322,7 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 		file.Close()
 		return "", err
 	}
-	if _, err := io.WriteString(file, s.policy(bridge)); err != nil {
+	if _, err := io.WriteString(file, s.policy(bridges)); err != nil {
 		file.Close()
 		return "", err
 	}
@@ -297,14 +339,16 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if _, err := s.pf(ctx, "-a", anchor, "-f", file.Name()); err != nil {
 		return "", err
 	}
-	return s.clearBridgeStates(ctx, bridge)
+	return s.clearBridgeStates(ctx, bridges)
 }
 
-// Arm clears only states on the attested dedicated bridge. An old state can
+// Arm clears only states on the attested slot bridges. An old state can
 // bypass newly installed filter rules even when their text is correct.
-func (s *Server) clearBridgeStates(ctx context.Context, bridge string) (string, error) {
-	if _, err := s.pf(ctx, "-F", "states", "-i", bridge); err != nil {
-		return "", err
+func (s *Server) clearBridgeStates(ctx context.Context, bridges []string) (string, error) {
+	for _, bridge := range bridges {
+		if _, err := s.pf(ctx, "-F", "states", "-i", bridge); err != nil {
+			return "", err
+		}
 	}
 	return s.check(ctx)
 }
@@ -313,10 +357,14 @@ func (s *Server) disarm(ctx context.Context) error {
 	if err := s.drained(ctx); err != nil {
 		return err
 	}
-	if _, err := s.discover(); err == nil {
-		return fmt.Errorf("refusing to clear PF while the sandbox bridge is present")
-	} else if !strings.Contains(err.Error(), "missing or its addresses changed") {
+	bridges, err := s.discover()
+	if err != nil {
 		return err
+	}
+	for i, bridge := range bridges {
+		if bridge != "" {
+			return fmt.Errorf("refusing to clear PF while the bridge for sandbox network %s is present", s.config.Slots[i].Network)
+		}
 	}
 	rules, err := s.rules(ctx)
 	if err != nil {
@@ -325,12 +373,8 @@ func (s *Server) disarm(ctx context.Context) error {
 	if rules == "" {
 		return nil
 	}
-	parts := strings.Split(rules, "\n")
-	if len(parts) < 2 || !strings.HasPrefix(parts[len(parts)-2], "block drop in quick on ") {
-		return fmt.Errorf("refusing to clear an unexpected PF anchor")
-	}
-	bridge := strings.TrimSuffix(strings.TrimPrefix(parts[len(parts)-2], "block drop in quick on "), " inet all")
-	if !bridgeName.MatchString(bridge) || rules != s.canonicalPolicy(bridge) {
+	loaded, ok := s.loadedBridges(rules)
+	if !ok || rules != s.canonicalPolicy(loaded) {
 		return fmt.Errorf("refusing to clear an unexpected PF anchor")
 	}
 	if _, err := s.pf(ctx, "-a", anchor, "-F", "rules"); err != nil {
