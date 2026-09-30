@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -71,9 +72,35 @@ func (c *Client) call(ctx context.Context, action string) (string, error) {
 	return reply.Bridge, nil
 }
 
+// Arm asks the helper to guard the sandbox bridge. Apple adds the bridge's
+// IPv6 ULA address a few seconds after the pin VM starts (measured ~4 s on
+// the Mac Studio), and the helper refuses a bridge without it. Only that
+// refusal is retried, until ArmSettle elapses; nothing is loaded before the
+// helper attests the exact bridge, so waiting changes no policy.
 func (c *Client) Arm(ctx context.Context) (string, error) {
-	return c.call(ctx, "arm")
+	deadline := time.Now().Add(ArmSettle)
+	for {
+		bridge, err := c.call(ctx, "arm")
+		if err == nil || !strings.Contains(err.Error(), bridgeNotReady) || !time.Now().Before(deadline) {
+			return bridge, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", errors.Join(err, ctx.Err())
+		case <-time.After(armRetryInterval):
+		}
+	}
 }
+
+// ArmSettle bounds how long Arm waits for the pin VM's bridge to finish
+// configuring.
+var ArmSettle = 30 * time.Second
+
+var armRetryInterval = 500 * time.Millisecond
+
+// bridgeNotReady is the helper's refusal while no bridge carries the
+// configured IPv4 gateway, IPv6 ULA and link-local addresses.
+const bridgeNotReady = "sandbox bridge is missing or its addresses changed"
 
 func (c *Client) Check(ctx context.Context) error {
 	_, err := c.call(ctx, "check")

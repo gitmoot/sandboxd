@@ -155,7 +155,7 @@ func (s *Server) discover() (string, error) {
 		}
 	}
 	if found == "" {
-		return "", fmt.Errorf("sandbox bridge is missing or its addresses changed")
+		return "", errors.New(bridgeNotReady)
 	}
 	return found, nil
 }
