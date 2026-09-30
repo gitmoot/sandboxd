@@ -164,9 +164,12 @@ func (h *Host) sourceBinaries() (helper, sandboxd []byte, err error) {
 }
 
 // stopLegacyHelpers stops helpers started by hand from a Terminal before the
-// service existed: /usr/local/libexec/sandboxd-pf-helper-<commit>.
+// service existed: sandboxd-pf-helper-<commit>, however the path was spelled
+// (absolute, ./, or another directory). A missed one would keep the socket,
+// so the new service would crash-loop while install saw the socket and
+// reported success.
 func (h *Host) stopLegacyHelpers(ctx context.Context) error {
-	legacy := regexp.MustCompile("^" + regexp.QuoteMeta(filepath.Join(h.Libexec, "sandboxd-pf-helper-")) + "[0-9a-f]{7}$")
+	legacy := regexp.MustCompile(`(^|/)sandboxd-pf-helper-[0-9a-f]{7}$`)
 	find := func() ([]int, error) {
 		out, err := h.Run(ctx, nil, "/bin/ps", "-axww", "-o", "pid=,command=")
 		if err != nil {

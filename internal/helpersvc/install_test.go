@@ -385,13 +385,17 @@ func TestInstallStopsHandStartedHelpersAndReplacesTheJob(t *testing.T) {
 		"4245 " + m.path("usr/local/libexec/sandboxd-pf-helper") + " run --socket x",
 		"4246 /usr/bin/less " + legacy,
 		"4247 /elsewhere" + legacy + " --socket x",
+		// Started from another directory or as ./: still a hand-started
+		// helper holding the socket (review P3).
+		"4248 ./sandboxd-pf-helper-4ae1ed5 --socket x",
+		"4249 /tmp/sandboxd-pf-helper-c423255 --socket x",
 	}
 	m.loaded = true
 	if err := m.install(InstallOptions{}); err != nil {
 		t.Fatalf("%v\n%s", err, m.out.String())
 	}
-	if !reflect.DeepEqual(m.killed, []int{4242}) {
-		t.Fatalf("killed %v, want only the hand-started helper 4242", m.killed)
+	if !reflect.DeepEqual(m.killed, []int{4242, 4247, 4248, 4249}) {
+		t.Fatalf("killed %v, want every hand-started helper however its path is spelled", m.killed)
 	}
 	wantLaunchd := []string{
 		"print system/" + Label,

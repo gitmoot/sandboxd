@@ -57,7 +57,7 @@ func ParseSlot(value string) (Slot, error) {
 	slot.IPv4, err = netip.ParsePrefix(fields["ipv4"])
 	if err != nil || !slot.IPv4.Addr().Is4() || slot.IPv4.Masked() != slot.IPv4 ||
 		!slot.IPv4.Contains(slot.Gateway) || slot.IPv4.Bits() < 24 || slot.IPv4.Bits() > 30 {
-		return Slot{}, fmt.Errorf("slot %q: IPv4 subnet must be a canonical /16 to /30 containing the gateway", value)
+		return Slot{}, fmt.Errorf("slot %q: IPv4 subnet must be a canonical /24 to /30 containing the gateway", value)
 	}
 	slot.IPv6, err = netip.ParsePrefix(fields["ipv6"])
 	if err != nil || !slot.IPv6.Addr().Is6() || slot.IPv6.Bits() < 48 || slot.IPv6.Bits() > 64 ||
