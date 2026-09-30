@@ -94,14 +94,17 @@ other on the Mac Studio (TCP and ping blocked, with IP forwarding on). So
 every concurrent guest gets its own network, a **slot**, and concurrency
 equals the number of slots.
 
-Create one network per slot with distinct, non-overlapping subnets:
+Create one network per slot with distinct, non-overlapping IPv4 subnets. Let
+Apple choose each IPv6 ULA prefix: with `--subnet-v6`, `container` 1.4.1
+reports the prefix as a host address (`fd…::1/64`), which never equals the
+canonical `--slot` value, so the helper refuses that network.
 
 ```sh
-container network create --internal --subnet 192.168.130.0/24 --subnet-v6 fd1e:68b8:2ef4:5d01::/64 \
+container network create --internal --subnet 192.168.130.0/24 \
   --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-1
-container network create --internal --subnet 192.168.131.0/24 --subnet-v6 fd1e:68b8:2ef4:5d02::/64 \
+container network create --internal --subnet 192.168.131.0/24 \
   --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-2
-container network create --internal --subnet 192.168.132.0/24 --subnet-v6 fd1e:68b8:2ef4:5d03::/64 \
+container network create --internal --subnet 192.168.132.0/24 \
   --label gitmoot.sandboxd.network=apple-v1 sandboxd-slot-3
 ```
 
