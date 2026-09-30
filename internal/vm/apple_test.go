@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -187,7 +188,7 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		"exec --user 0:0 sandboxd-new /bin/chown 1000:1000 /home/user",
 		"exec --user 1000:1000 --workdir /tmp --env X=value sandboxd-new /bin/false -n",
 		"stats --format json --no-stream sandboxd-new",
-		"exec --interactive --user 1000:1000 sandboxd-new /bin/sh -c umask 077; cat > \"$1\" sh /tmp/upload",
+		"exec --interactive --user 1000:1000 sandboxd-new /bin/sh -c " + copyInScript + " sh /tmp/upload",
 		"volume delete sandboxd-new",
 	} {
 		if !strings.Contains(string(calls), expected) {
@@ -213,6 +214,67 @@ func TestAppleCreateRejectsUntrustedGuestNetwork(t *testing.T) {
 		logged, err := os.ReadFile(calls)
 		if err != nil || strings.Contains(string(logged), "volume create") {
 			t.Fatalf("allocated a volume despite unsafe network: %s, %v", logged, err)
+		}
+	}
+}
+
+// The guest-side upload script, run by a real /bin/sh: an upload into a
+// directory that does not exist yet (Gitmoot's credential material on a fresh
+// volume) must create it, owner-only, and write the exact bytes.
+func TestCopyInScriptCreatesMissingParentDirectories(t *testing.T) {
+	root := t.TempDir()
+	dest := filepath.Join(root, ".gitmoot", "credential-gateway", "ca.pem")
+	cmd := exec.Command("/bin/sh", "-c", copyInScript, "sh", dest)
+	cmd.Stdin = strings.NewReader("cert bytes")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("upload into a missing directory: %v: %s", err, out)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != "cert bytes" {
+		t.Fatalf("uploaded %q, %v", got, err)
+	}
+	for _, p := range []string{dest, filepath.Dir(dest), filepath.Dir(filepath.Dir(dest))} {
+		info, err := os.Stat(p)
+		if err != nil || info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s is not owner-only: %v %v", p, info.Mode(), err)
+		}
+	}
+}
+
+// A bare command name must be found on the request's PATH, as E2B's envd
+// does: Gitmoot starts its runtime as "omp" with its upload directory first
+// on PATH (sandboxd#10). This runs the produced argv for real, with only that
+// PATH, and checks the uploaded program ran.
+func TestBareCommandResolvesAgainstTheRequestPATH(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "runtime", "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "omp"), []byte("#!/bin/sh\necho uploaded-omp \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"PATH": bin + ":/usr/bin:/bin"}
+	argv, err := guestArgv([]string{"omp", "--version"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = []string{"PATH=" + env["PATH"]}
+	out, err := cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "uploaded-omp --version" {
+		t.Fatalf("bare name not resolved on the request PATH: %q %v (argv %q)", out, err, argv)
+	}
+	for _, unchanged := range [][]string{{"/bin/false", "-n"}} {
+		if got, _ := guestArgv(unchanged, env); strings.Join(got, " ") != strings.Join(unchanged, " ") {
+			t.Fatalf("absolute command rewritten: %q", got)
+		}
+	}
+	if got, _ := guestArgv([]string{"omp"}, map[string]string{"X": "1"}); strings.Join(got, " ") != "omp" {
+		t.Fatalf("command without request PATH rewritten: %q", got)
+	}
+	for _, bad := range []string{"A=B", "-i"} {
+		if _, err := guestArgv([]string{bad}, env); err == nil {
+			t.Fatalf("accepted bare name %q that env would treat as an option or assignment", bad)
 		}
 	}
 }
