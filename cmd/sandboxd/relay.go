@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -24,9 +25,13 @@ func checkModelRelayListen(listenAddress string, relayAddress netip.Addr) error 
 	if listenAddress == "" {
 		return nil
 	}
-	host, _, splitErr := net.SplitHostPort(listenAddress)
+	host, portText, splitErr := net.SplitHostPort(listenAddress)
 	addr, parseErr := netip.ParseAddr(host)
-	if splitErr != nil || parseErr != nil || addr != relayAddress {
+	// A fixed, explicit port: an empty or 0 port would make the listener bind
+	// an ephemeral port the PF pass rule and Gitmoot's URL never name.
+	port, portErr := strconv.Atoi(portText)
+	if splitErr != nil || parseErr != nil || addr != relayAddress || portErr != nil ||
+		strconv.Itoa(port) != portText || port < 1024 || port > 65535 {
 		return fmt.Errorf("model relay listen must be the first slot's gateway %s with a port (the one relay address the PF helper passes), not %q", relayAddress, listenAddress)
 	}
 	return nil

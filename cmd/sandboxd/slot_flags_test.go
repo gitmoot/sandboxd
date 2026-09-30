@@ -30,6 +30,18 @@ func TestServiceRequiresSlotsAndBoundsCapacityByThem(t *testing.T) {
 			"model relay listen must be the first slot's gateway 192.168.130.1"},
 		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1", "-model-relay-target", "127.0.0.1:43184"},
 			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		// A fixed port the PF pass and Gitmoot's URL can name: no empty, zero,
+		// ephemeral-by-accident, out-of-range, padded or suffixed port.
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:0", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:99999", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:043181", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
+		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:443", "-model-relay-target", "127.0.0.1:43184"},
+			"model relay listen must be the first slot's gateway 192.168.130.1"},
 		{[]string{"-slot", slot1, "-slot", slot2, "-model-relay-listen", "192.168.130.1:43181", "-model-relay-target", "127.0.0.1:43184"},
 			"read API key"},
 	} {
