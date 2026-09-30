@@ -20,11 +20,12 @@ import (
 )
 
 type fakeDriver struct {
-	mu          sync.Mutex
-	instances   map[string]vm.Instance
-	createError error
-	listError   error
-	destroyed   []string
+	mu           sync.Mutex
+	instances    map[string]vm.Instance
+	createError  error
+	listError    error
+	destroyError error
+	destroyed    []string
 }
 
 func (d *fakeDriver) Create(_ context.Context, spec vm.Spec) (vm.Instance, error) {
@@ -55,6 +56,9 @@ func (d *fakeDriver) Run(context.Context, string, vm.Command, io.Writer, io.Writ
 func (d *fakeDriver) Destroy(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.destroyError != nil {
+		return d.destroyError
+	}
 	if _, ok := d.instances[id]; !ok || !strings.HasPrefix(id, "sandboxd-") {
 		return errors.New("not owned by driver")
 	}
@@ -357,5 +361,76 @@ func TestReconcileReapsOwnedVMWithoutLedgerBeforeAdmitting(t *testing.T) {
 	driver.mu.Unlock()
 	if !orphanGone || !oneLiveVM || !service.Authorize(payload.ID, payload.Token) {
 		t.Fatal("ledger loss left an owned orphan running or revoked the replacement VM")
+	}
+}
+
+func createSandbox(t *testing.T, s *Service, job string) (id, token string) {
+	t.Helper()
+	got := request(t, s, http.MethodPost, "/sandboxes", createBody(job, 1))
+	if got.Code != http.StatusCreated {
+		t.Fatalf("create %s: %d %s", job, got.Code, got.Body.String())
+	}
+	var created struct {
+		ID    string `json:"sandboxID"`
+		Token string `json:"envdAccessToken"`
+	}
+	if err := json.Unmarshal(got.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	return created.ID, created.Token
+}
+
+// A client retries a delete whose response it lost. The retry must succeed
+// without a second teardown, and the guest capability must be dead after the
+// first (sandboxd#7: duplicate delete, stale stream).
+func TestDuplicateDeleteIsIdempotentAndKillsTheGuestCapability(t *testing.T) {
+	d := &fakeDriver{instances: make(map[string]vm.Instance)}
+	s := openService(t, d)
+	id, token := createSandbox(t, s, "job-A")
+	for i := 1; i <= 2; i++ {
+		if got := request(t, s, http.MethodDelete, "/sandboxes/"+id, nil); got.Code != http.StatusNoContent {
+			t.Fatalf("delete #%d: %d %s", i, got.Code, got.Body.String())
+		}
+	}
+	if s.Authorize(id, token) {
+		t.Fatal("a deleted sandbox's guest token still authorizes")
+	}
+	if err := s.Abort(context.Background(), id, token); err == nil {
+		t.Fatal("a stale stream could abort (and act on) a deleted sandbox")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.destroyed) != 1 {
+		t.Fatalf("teardowns = %d, want exactly 1", len(d.destroyed))
+	}
+}
+
+// A delete that cannot reach the VM layer (partition) must not release the
+// reservation: the VM may still exist. Capacity comes back only once a later
+// teardown succeeds (sandboxd#7: network partition).
+func TestDeleteDuringPartitionHoldsCapacityUntilTeardownSucceeds(t *testing.T) {
+	d := &fakeDriver{instances: make(map[string]vm.Instance)}
+	s := openService(t, d)
+	id, token := createSandbox(t, s, "job-A")
+	d.mu.Lock()
+	d.destroyError = errors.New("worker unreachable")
+	d.mu.Unlock()
+	if got := request(t, s, http.MethodDelete, "/sandboxes/"+id, nil); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete during partition: %d, want 503", got.Code)
+	}
+	if s.Authorize(id, token) {
+		t.Fatal("guest token still authorizes after a delete was requested")
+	}
+	if got := request(t, s, http.MethodPost, "/sandboxes", createBody("job-B", 1)); got.Code == http.StatusCreated {
+		t.Fatal("capacity was released while the old VM may still exist")
+	}
+	d.mu.Lock()
+	d.destroyError = nil
+	d.mu.Unlock()
+	createSandbox(t, s, "job-B")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, alive := d.instances[id]; alive {
+		t.Fatal("the partitioned VM was never torn down")
 	}
 }
