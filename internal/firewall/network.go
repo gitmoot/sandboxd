@@ -3,9 +3,11 @@ package firewall
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 )
@@ -13,16 +15,31 @@ import (
 func (s *Server) runContainer(ctx context.Context, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, s.config.ContainerCLI, args...)
+	name, argv := workerContainerCommand(s.config.WorkerUID, s.config.WorkerGID, s.config.ContainerCLI, args)
+	cmd := exec.CommandContext(ctx, name, argv...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=" + s.config.WorkerHome}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
-		Uid: uint32(s.config.WorkerUID), Gid: uint32(s.config.WorkerGID),
-	}}
 	out, err := cmd.Output()
 	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && len(exit.Stderr) > 0 {
+			return nil, fmt.Errorf("Apple container %s: %w: %s", args[0], err, truncate(strings.TrimSpace(string(exit.Stderr)), 300))
+		}
 		return nil, fmt.Errorf("Apple container %s: %w", args[0], err)
 	}
 	return out, nil
+}
+
+// workerContainerCommand runs the container CLI as the worker inside the
+// worker's per-user launchd bootstrap. Apple's container API server is a
+// per-user launchd agent (gui/<uid>), so a CLI started from the helper's
+// system-domain launchd job cannot find it even with the worker's uid; the
+// helper then failed every arm with "exit status 1" (Mac Studio, v0.1.0,
+// 2026-09-30). `launchctl asuser` (root only) enters that bootstrap; sudo,
+// which root may always run without a password, then drops to the worker.
+func workerContainerCommand(uid, gid int, cli string, args []string) (string, []string) {
+	argv := []string{"asuser", strconv.Itoa(uid), "/usr/bin/sudo", "-n", "-H",
+		"-u", "#" + strconv.Itoa(uid), "-g", "#" + strconv.Itoa(gid), "--", cli}
+	return "/bin/launchctl", append(argv, args...)
 }
 
 // verifyNetwork attests every slot network, its trusted pin, and that no
