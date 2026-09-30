@@ -389,3 +389,14 @@ func pfctlReadback(policy string, optimized bool) string {
 	}
 	return strings.Join(append(out, inet6...), "\n")
 }
+
+// Apple's container API server is a per-user launchd agent, so the helper's
+// system daemon must enter the worker's bootstrap (launchctl asuser, as root)
+// and only then drop to the worker (sudo -u #uid -g #gid).
+func TestContainerRunsAsTheWorkerInItsLaunchdSession(t *testing.T) {
+	name, argv := workerContainerCommand(501, 20, "/usr/local/bin/container", []string{"list", "--all"})
+	want := []string{"asuser", "501", "/usr/bin/sudo", "-n", "-H", "-u", "#501", "-g", "#20", "--", "/usr/local/bin/container", "list", "--all"}
+	if name != "/bin/launchctl" || strings.Join(argv, " ") != strings.Join(want, " ") {
+		t.Fatalf("command = %s %q, want /bin/launchctl %q", name, argv, want)
+	}
+}
