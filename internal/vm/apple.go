@@ -516,9 +516,9 @@ func guestArgv(args []string, env map[string]string) ([]string, error) {
 	if len(env) == 0 {
 		return args, nil
 	}
-	// env would parse a command containing "=" as another assignment, and a
-	// leading "-" as an option.
-	if strings.Contains(args[0], "=") || strings.HasPrefix(args[0], "-") {
+	// env would parse a leading "-" as an option; such a name was never
+	// runnable (container exec itself took it as a flag).
+	if strings.HasPrefix(args[0], "-") {
 		return nil, fmt.Errorf("unsafe guest command name %q", args[0])
 	}
 	keys := make([]string, 0, len(env))
@@ -529,6 +529,12 @@ func guestArgv(args []string, env map[string]string) ([]string, error) {
 	argv := []string{"/usr/bin/env", "--"}
 	for _, key := range keys {
 		argv = append(argv, key+"="+env[key])
+	}
+	// env would take a command containing "=" (e.g. /opt/x=y) as one more
+	// assignment. Hand it to sh as $0 instead: expanded words are never
+	// assignments, and exec keeps the process tree unchanged.
+	if strings.Contains(args[0], "=") {
+		argv = append(argv, "/bin/sh", "-c", `exec "$0" "$@"`)
 	}
 	return append(argv, args...), nil
 }

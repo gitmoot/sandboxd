@@ -268,9 +268,23 @@ func TestRequestEnvironmentOverridesTheImage(t *testing.T) {
 	if got, _ := guestArgv([]string{"/bin/false", "-n"}, nil); strings.Join(got, " ") != "/bin/false -n" {
 		t.Fatalf("request without variables rewritten: %q", got)
 	}
-	for _, bad := range []string{"A=B", "-i", "/opt/x=y"} {
-		if _, err := guestArgv([]string{bad}, env); err == nil {
-			t.Fatalf("accepted command %q that env would misparse", bad)
-		}
+	if _, err := guestArgv([]string{"-i"}, env); err == nil {
+		t.Fatal("accepted command -i that env would take as an option")
+	}
+	// A valid executable path containing "=" still runs, with the request's
+	// variables (#18 review).
+	weird := filepath.Join(filepath.Dir(bin), "x=y")
+	if err := os.WriteFile(weird, []byte("#!/bin/sh\necho \"weird $* home=$HOME\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	argv, err = guestArgv([]string{weird, "a b"}, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command(argv[0], argv[1:]...)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/image-home"}
+	out, err = cmd.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(out)) != "weird a b home=/home/request" {
+		t.Fatalf("executable path containing '=' did not run as itself: %q %v (argv %q)", out, err, argv)
 	}
 }
