@@ -65,6 +65,13 @@ case "$1" in
       delete) printf '[]\n' > volumes ;;
       *) exit 88 ;;
     esac ;;
+  system)
+    case "$2" in
+      status) cat systemstatus 2>/dev/null || { echo 'apiserver is not running and not registered with launchd' >&2; exit 1; } ;;
+      start) printf 'FIELD VALUE\nstatus running\n' > systemstatus ;;
+      *) exit 88 ;;
+    esac ;;
+  delete) printf '%%s\n' "$3"; cat "next.$3.deleted" > inventory ;;
   list) cat inventory ;;
   create) printf '%%s\n' "$3"; cat "next.$3" > inventory ;;
   start) printf '%%s\n' "$2"; cat "next.$2.started" > inventory ;;
@@ -183,5 +190,53 @@ func TestDriverRequiresDistinctSlotNetworks(t *testing.T) {
 		if _, err := NewAppleDriver("/usr/local/bin/container", []string{"example/image:arm64"}, networks, "mac-local", testPinImage, &fakeGate{}); err == nil {
 			t.Fatalf("accepted slot networks %q", networks)
 		}
+	}
+}
+
+// A Mac restart leaves every pin stopped. StartPin replaces a stopped pin
+// with a fresh one instead of refusing, so sandboxd recovers by itself.
+func TestStartPinReplacesAPinStoppedByARestart(t *testing.T) {
+	pin1ID := firewall.PinID("mac-local", "sandboxd-slot-1")
+	pin2 := slotPinJSON("sandboxd-slot-2", "running")
+	cli := newSlotCLI(t, inventoryJSON(slotPinJSON("sandboxd-slot-1", "stopped"), pin2), map[string]string{
+		pin1ID + ".deleted": inventoryJSON(pin2),
+		pin1ID:              inventoryJSON(slotPinJSON("sandboxd-slot-1", "stopped"), pin2),
+		pin1ID + ".started": inventoryJSON(slotPinJSON("sandboxd-slot-1", "running"), pin2),
+	})
+	d, err := NewAppleDriver(cli.path, []string{"example/image:arm64"}, testSlotNetworks, "mac-local", testPinImage, &fakeGate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StartPin(context.Background()); err != nil {
+		t.Fatalf("stopped pin after a restart: %v\n%s", err, cli.log(t))
+	}
+	log := cli.log(t)
+	if !strings.Contains(log, "delete --force "+pin1ID) || !strings.Contains(log, "create --name "+pin1ID+" ") {
+		t.Fatalf("stopped pin was not replaced:\n%s", log)
+	}
+	if err := d.Ready(context.Background()); err != nil {
+		t.Fatalf("not ready after replacing the pin: %v", err)
+	}
+}
+
+// Apple's container services don't start by themselves after a restart.
+func TestEnsureSystemStartsContainerServicesOnlyWhenStopped(t *testing.T) {
+	cli := newSlotCLI(t, inventoryJSON(), nil)
+	d, err := NewAppleDriver(cli.path, []string{"example/image:arm64"}, testSlotNetworks, "mac-local", testPinImage, &fakeGate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.EnsureSystem(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cli.log(t), "system start --disable-kernel-install") {
+		t.Fatalf("did not start stopped services:\n%s", cli.log(t))
+	}
+	before := strings.Count(cli.log(t), "system start")
+	if err := d.EnsureSystem(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(cli.log(t), "system start") != before {
+		t.Fatal("restarted services that were already running")
 	}
 }

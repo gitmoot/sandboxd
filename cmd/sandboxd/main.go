@@ -97,6 +97,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	if err := driver.EnsureSystem(ctx); err != nil {
+		return fmt.Errorf("start Apple container services: %w", err)
+	}
 	if err := driver.CleanupGuests(ctx); err != nil {
 		return fmt.Errorf("remove stale guest VMs before firewall admission: %w", err)
 	}
