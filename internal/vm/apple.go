@@ -503,6 +503,26 @@ func safeGuestPath(path string) bool {
 	return true
 }
 
+// guestArgv resolves a bare command name (no "/") against the request's own
+// PATH, as E2B's envd does. container exec resolves it against the image's
+// PATH instead, so Gitmoot's runtime, started as "omp" with
+// PATH=/home/user/.gitmoot/runtime/bin:..., was not found (sandboxd#10).
+// /usr/bin/env performs the lookup with the PATH passed by --env. A request
+// without PATH keeps the image's resolution unchanged.
+func guestArgv(args []string, env map[string]string) ([]string, error) {
+	name := args[0]
+	if strings.Contains(name, "/") {
+		return args, nil
+	}
+	if _, ok := env["PATH"]; !ok {
+		return args, nil
+	}
+	if strings.Contains(name, "=") || strings.HasPrefix(name, "-") {
+		return nil, fmt.Errorf("unsafe bare guest command name %q", name)
+	}
+	return append([]string{"/usr/bin/env", "--"}, args...), nil
+}
+
 // copyInScript writes stdin to "$1" as the guest user, creating missing parent
 // directories (mode 0700) first, as E2B's envd does for file writes. Gitmoot
 // uploads its credential material to /home/user/.gitmoot/credential-gateway/
@@ -618,7 +638,11 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 		args = append(args, "--env", key+"="+command.Env[key])
 	}
 	args = append(args, id)
-	args = append(args, command.Args...)
+	guest, err := guestArgv(command.Args, command.Env)
+	if err != nil {
+		return 0, err
+	}
+	args = append(args, guest...)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c := d.command(runCtx, args...)
