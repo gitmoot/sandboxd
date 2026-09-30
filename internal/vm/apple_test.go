@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -187,7 +188,7 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		"exec --user 0:0 sandboxd-new /bin/chown 1000:1000 /home/user",
 		"exec --user 1000:1000 --workdir /tmp --env X=value sandboxd-new /bin/false -n",
 		"stats --format json --no-stream sandboxd-new",
-		"exec --interactive --user 1000:1000 sandboxd-new /bin/sh -c umask 077; cat > \"$1\" sh /tmp/upload",
+		"exec --interactive --user 1000:1000 sandboxd-new /bin/sh -c " + copyInScript + " sh /tmp/upload",
 		"volume delete sandboxd-new",
 	} {
 		if !strings.Contains(string(calls), expected) {
@@ -213,6 +214,29 @@ func TestAppleCreateRejectsUntrustedGuestNetwork(t *testing.T) {
 		logged, err := os.ReadFile(calls)
 		if err != nil || strings.Contains(string(logged), "volume create") {
 			t.Fatalf("allocated a volume despite unsafe network: %s, %v", logged, err)
+		}
+	}
+}
+
+// The guest-side upload script, run by a real /bin/sh: an upload into a
+// directory that does not exist yet (Gitmoot's credential material on a fresh
+// volume) must create it, owner-only, and write the exact bytes.
+func TestCopyInScriptCreatesMissingParentDirectories(t *testing.T) {
+	root := t.TempDir()
+	dest := filepath.Join(root, ".gitmoot", "credential-gateway", "ca.pem")
+	cmd := exec.Command("/bin/sh", "-c", copyInScript, "sh", dest)
+	cmd.Stdin = strings.NewReader("cert bytes")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("upload into a missing directory: %v: %s", err, out)
+	}
+	got, err := os.ReadFile(dest)
+	if err != nil || string(got) != "cert bytes" {
+		t.Fatalf("uploaded %q, %v", got, err)
+	}
+	for _, p := range []string{dest, filepath.Dir(dest), filepath.Dir(filepath.Dir(dest))} {
+		info, err := os.Stat(p)
+		if err != nil || info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("%s is not owner-only: %v %v", p, info.Mode(), err)
 		}
 	}
 }

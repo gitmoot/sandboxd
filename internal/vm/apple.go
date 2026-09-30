@@ -503,6 +503,12 @@ func safeGuestPath(path string) bool {
 	return true
 }
 
+// copyInScript writes stdin to "$1" as the guest user, creating missing parent
+// directories (mode 0700) first, as E2B's envd does for file writes. Gitmoot
+// uploads its credential material to /home/user/.gitmoot/credential-gateway/
+// on a fresh volume, where that directory does not exist yet (sandboxd#10).
+const copyInScript = `umask 077; mkdir -p -- "$(dirname -- "$1")" && cat > "$1"`
+
 // CopyIn snapshots at most 512 MiB of a regular host file and streams it to
 // the guest's mounted filesystem; Apple's copy command bypasses live mounts.
 func (d *AppleDriver) CopyIn(ctx context.Context, id, source, destination string) error {
@@ -555,7 +561,7 @@ func (d *AppleDriver) CopyIn(ctx context.Context, id, source, destination string
 		return err
 	}
 	c := d.command(ctx, "exec", "--interactive", "--user", "1000:1000", id,
-		"/bin/sh", "-c", `umask 077; cat > "$1"`, "sh", destination)
+		"/bin/sh", "-c", copyInScript, "sh", destination)
 	c.Stdin = staged
 	out, err := c.CombinedOutput()
 	if ctx.Err() != nil {
