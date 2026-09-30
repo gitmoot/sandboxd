@@ -217,6 +217,39 @@ Mac services. Recheck the actual network subnets after any Apple network
 recreation. A dummy broker round-trip passed, but no production PF rule,
 real model lease, or production relay was enabled.
 
+## Review image module cache
+
+Guests have no network egress, so Go cannot download modules inside a review.
+The review image (`images/linux-arm64/Dockerfile`) therefore bakes a
+pre-downloaded module cache at `/opt/gomodcache`, outside the `/home/user`
+volume, root-owned and read-only to uid 1000. A throwaway build stage fetches
+each repository in `GOMOD_REPOS` at a pinned commit (no credentials; public
+repositories only), runs `go mod download all` plus
+`go list -deps -test ./...` in every module (and at a `go.work` root), then
+checks the result offline with `go mod verify` and `GOPROXY=off go list`.
+Only the cache is copied into the final image; the clones are discarded.
+
+The image sets `GOMODCACHE=/opt/gomodcache GOPROXY=off GOSUMDB=off
+GOFLAGS=-mod=readonly GOTOOLCHAIN=local`. `go.sum` is still enforced: a
+changed hash fails with `checksum mismatch` and a missing entry with
+`missing go.sum entry`. The build cache (`GOCACHE`) stays on the writable
+`/home/user` volume.
+
+Rebuild rule: the cache matches the pinned commits only. A review of a branch
+whose `go.mod`/`go.sum` adds or bumps a module fails offline (for example
+`mkdir /opt/gomodcache/cache/download/...: read-only file system`, or
+`missing go.sum entry`). After any listed repository's `main`
+changes its module graph (or the Go toolchain changes), bump its commit in
+`GOMOD_REPOS`, rebuild on the Mac under a new local tag, and point
+`sandboxd --image` at that tag. Pass `--build-arg GOMOD_REPOS=...` for a
+one-off build; commit the new pins so the image stays reproducible.
+
+To add a repository routed to the Mac, append
+`https://github.com/<owner>/<repo>@<full 40-character commit>` to
+`GOMOD_REPOS`. It must build with the image's Go version under
+`GOTOOLCHAIN=local`; the image build fails if any of its modules cannot be
+downloaded, verified, or resolved offline.
+
 ## Operating the PF helper
 
 Releases are built only by GitHub Actions (`.github/workflows/release.yml`)
