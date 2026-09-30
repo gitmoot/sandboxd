@@ -79,8 +79,13 @@ than the pins on any slot network and clears old PF states only on the slot
 bridges; it retries while any slot bridge is still configuring.
 By default `--model-relay-port=0` retains the exact deny-only anchor. A
 nonzero root-configured port adds, per slot, only a TCP pass from that slot's
-IPv4 subnet to that slot's gateway address and that port; both IPv4/IPv6
-block rules still follow. The helper refuses unrelated or changed anchor rules.
+IPv4 subnet to the **first** slot's gateway address (the one relay address)
+and that port; both IPv4/IPv6 block rules still follow. Arm loads the
+configured anchor into an empty anchor, or replaces the exact deny-only anchor
+a relay-off helper loaded for the same attested bridges in slot order (so
+enabling the relay needs no manual `pfctl` flush). It refuses any other
+unrelated or changed anchor rules, including a deny-only anchor naming other
+bridges.
 `sandboxd` requires the same pin digest through `--pin-image`, the same
 `--slot` list, and the helper socket through `--pf-socket`; it stops
 ordinary guests on gate failure and only requests anchor removal after every
@@ -152,27 +157,63 @@ counters, helper failure while armed, reboot recovery, and any model pass
 rule remain unverified. Do not admit untrusted work.
 
 The optional fixed model relay transports TLS bytes without terminating TLS
-or handling credentials. Gitmoot's mTLS broker listens on its own
-`127.0.0.1:8443` and advertises its slot's gateway, e.g.
-`https://192.168.130.1:8443`, so its server certificate must name every slot
-gateway address a guest can see. A supervised SSH reverse
-forward from that broker to the Mac binds only Mac `127.0.0.1:43184`:
+or handling credentials. Gitmoot advertises **one** credential gateway URL
+whose server certificate carries one IP SAN, and Apple `container` 1.4.1 has
+no `--add-host` for per-guest names, so every slot uses the same relay
+address: the **first** slot's gateway, e.g. `https://192.168.128.1:43181`.
+A guest on another slot reaches it through its own default gateway and the
+Mac delivers it locally; this cross-slot path has not been measured on the
+Mac yet. Gitmoot's mTLS broker listens on its own `127.0.0.1:8443`; a
+supervised SSH reverse forward from that broker to the Mac binds only Mac
+`127.0.0.1:43184`:
 `ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
-The default PF anchor blocks the guest's model relay at its slot gateway
-port 8443 along with all other Mac services. An optional
-root-configured `--model-relay-port=8443` generates, per slot, only a
-slot-subnet TCP pass to that slot's IPv4 gateway and that port before the deny rules; a Mac
-`pfctl -vnf` syntax-only check rendered the pass and both denies, but **no
-model pass rule has been loaded**. Do not set this flag or enable model access
-until Gitmoot's mTLS broker and scoped lease are provisioned and the pass
-counter, certificate rejection, lease expiry, and unrelated-client denial
-are proved on the Mac. Then launch sandboxd with
-`--model-relay-listen 0.0.0.0:8443 --model-relay-target 127.0.0.1:43184`.
-The relay admits only source addresses in the configured slot IPv4 subnets
+The default PF anchor blocks the relay along with all other Mac services. An
+optional root-configured `--model-relay-port=43181` generates, for every
+slot, only a TCP pass from that slot's IPv4 subnet to the first slot's
+gateway and that port, before that slot's deny rules. For slots
+`192.168.128.0/24`, `192.168.130.0/24` and `192.168.131.0/24` on
+`bridge101`..`bridge103` the helper loads (with `-o none`):
+
+```
+pass in quick on bridge101 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 43181
+block in quick on bridge101 inet from any to any
+block in quick on bridge101 inet6 from any to any
+pass in quick on bridge102 inet proto tcp from 192.168.130.0/24 to 192.168.128.1 port 43181
+block in quick on bridge102 inet from any to any
+block in quick on bridge102 inet6 from any to any
+pass in quick on bridge103 inet proto tcp from 192.168.131.0/24 to 192.168.128.1 port 43181
+block in quick on bridge103 inet from any to any
+block in quick on bridge103 inet6 from any to any
+```
+
+and accepts only this `pfctl -a com.apple/gitmoot-sandboxd -sr` readback:
+
+```
+pass in quick on bridge101 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge101 inet all
+block drop in quick on bridge101 inet6 all
+pass in quick on bridge102 inet proto tcp from 192.168.130.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge102 inet all
+block drop in quick on bridge102 inet6 all
+pass in quick on bridge103 inet proto tcp from 192.168.131.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge103 inet all
+block drop in quick on bridge103 inet6 all
+```
+
+Guest-to-guest isolation is unchanged: the only address a guest may reach
+is the Mac's own relay address; other slots' gateways and guests stay
+denied. **No model pass rule has been loaded on the Mac.** Do not set this
+flag or enable model access until Gitmoot's mTLS broker and scoped lease are
+provisioned and the pass counter, cross-slot delivery, certificate
+rejection, lease expiry, and unrelated-client denial are proved on the Mac.
+Then launch sandboxd with
+`--model-relay-listen 192.168.128.1:43181 --model-relay-target 127.0.0.1:43184`;
+sandboxd refuses a listen IP other than the first `--slot` gateway. The
+relay admits only source addresses in the configured slot IPv4 subnets
 (the former `--model-relay-guest-cidr` flag is gone), caps concurrent connections, and forwards to that
 one loopback port; Gitmoot's mTLS certificate and short-lived lease still
 authorize each model request. Source admission is not a firewall for other
-Mac services. Recheck the actual network subnet after any Apple network
+Mac services. Recheck the actual network subnets after any Apple network
 recreation. A dummy broker round-trip passed, but no production PF rule,
 real model lease, or production relay was enabled.
 
@@ -229,7 +270,27 @@ the worker. It then:
   `sandboxd` needs), the rules hash and the version.
 
 Rerun the same one-liner (with the current release) after recreating slot
-networks, changing the reviewed PF main rules, or changing an install flag.
+networks, changing the reviewed PF main rules, or changing an install flag,
+or rerun the installed helper itself, which keeps all of the checks above and
+replaces its own binary by rename.
+
+### Enabling the model relay
+
+Once the relay may be enabled (see the model relay section), with no guest
+VMs running:
+
+```sh
+sudo sandboxd-helper-update
+sudo /usr/local/libexec/sandboxd-pf-helper install --model-relay-port 43181
+```
+
+Pass the same `--worker-id`, `--pin-image`, `--container-cli` or
+`--main-rules-sha256` as the first install if you changed them there. Then
+restart `sandboxd` with
+`--model-relay-listen <first slot gateway>:43181 --model-relay-target 127.0.0.1:43184`.
+Its startup arm replaces the deny-only anchor with the relay policy in one
+`pfctl` load; until then the helper's check refuses the deny-only anchor, so
+a `sandboxd` still running from before stops guest work.
 
 ### Updates
 

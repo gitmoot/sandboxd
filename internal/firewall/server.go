@@ -37,8 +37,9 @@ type Config struct {
 	ContainerCLI string
 	Slots        []Slot
 	PinImage     string
-	// ModelRelayPort enables only a fixed IPv4 guest-to-gateway TCP exception
-	// per slot. Zero keeps the anchor deny-only until the mTLS broker and lease are ready.
+	// ModelRelayPort enables only a fixed IPv4 TCP exception from each slot's
+	// subnet to the first slot's gateway (the one relay address). Zero keeps
+	// the anchor deny-only until the mTLS broker and lease are ready.
 	ModelRelayPort  int
 	MainRulesSHA256 string
 }
@@ -165,14 +166,21 @@ func (s *Server) attested() ([]string, error) {
 	return bridges, nil
 }
 
+// relayAddress is the one Mac address every slot's guests may reach on the
+// model relay port: the first slot's gateway. Gitmoot advertises a single
+// credential gateway URL whose certificate names one IP, so guests on other
+// slots reach it through their own gateway and the Mac delivers it locally.
+func (s *Server) relayAddress() string {
+	return s.config.Slots[0].Gateway.String()
+}
+
 // policy is the anchor text loaded for bridges, one per slot in slot order.
 func (s *Server) policy(bridges []string) string {
 	var rules strings.Builder
 	for i, bridge := range bridges {
 		if s.config.ModelRelayPort != 0 {
-			slot := s.config.Slots[i]
-			rules.WriteString("pass in quick on " + bridge + " inet proto tcp from " + slot.IPv4.String() +
-				" to " + slot.Gateway.String() + " port " + strconv.Itoa(s.config.ModelRelayPort) + "\n")
+			rules.WriteString("pass in quick on " + bridge + " inet proto tcp from " + s.config.Slots[i].IPv4.String() +
+				" to " + s.relayAddress() + " port " + strconv.Itoa(s.config.ModelRelayPort) + "\n")
 		}
 		rules.WriteString("block in quick on " + bridge + " inet from any to any\n" +
 			"block in quick on " + bridge + " inet6 from any to any\n")
@@ -182,12 +190,22 @@ func (s *Server) policy(bridges []string) string {
 
 // canonicalPolicy is pfctl's exact readback of policy(bridges).
 func (s *Server) canonicalPolicy(bridges []string) string {
+	return s.readback(bridges, s.config.ModelRelayPort)
+}
+
+// denyOnlyPolicy is pfctl's exact readback of what this helper loads for
+// bridges with the model relay off. Arm replaces it, so enabling the relay
+// after install needs no manual flush.
+func (s *Server) denyOnlyPolicy(bridges []string) string {
+	return s.readback(bridges, 0)
+}
+
+func (s *Server) readback(bridges []string, relayPort int) string {
 	lines := make([]string, 0, 3*len(bridges))
 	for i, bridge := range bridges {
-		if s.config.ModelRelayPort != 0 {
-			slot := s.config.Slots[i]
-			lines = append(lines, "pass in quick on "+bridge+" inet proto tcp from "+slot.IPv4.String()+
-				" to "+slot.Gateway.String()+" port = "+strconv.Itoa(s.config.ModelRelayPort)+" flags S/SA keep state")
+		if relayPort != 0 {
+			lines = append(lines, "pass in quick on "+bridge+" inet proto tcp from "+s.config.Slots[i].IPv4.String()+
+				" to "+s.relayAddress()+" port = "+strconv.Itoa(relayPort)+" flags S/SA keep state")
 		}
 		lines = append(lines, "block drop in quick on "+bridge+" inet all", "block drop in quick on "+bridge+" inet6 all")
 	}
@@ -310,7 +328,10 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if rules == s.canonicalPolicy(bridges) {
 		return s.clearBridgeStates(ctx, bridges)
 	}
-	if rules != "" {
+	// The exact deny-only policy for these same bridges is what this helper
+	// loads with the relay off; the load below replaces it in one pfctl
+	// transaction, so the bridges are never unguarded. Anything else stays.
+	if rules != "" && rules != s.denyOnlyPolicy(bridges) {
 		return "", fmt.Errorf("refusing to replace an unexpected firewall policy")
 	}
 	file, err := os.CreateTemp(filepath.Dir(s.config.SocketPath), "policy-*.pf")
