@@ -503,24 +503,34 @@ func safeGuestPath(path string) bool {
 	return true
 }
 
-// guestArgv resolves a bare command name (no "/") against the request's own
-// PATH, as E2B's envd does. container exec resolves it against the image's
-// PATH instead, so Gitmoot's runtime, started as "omp" with
-// PATH=/home/user/.gitmoot/runtime/bin:..., was not found (sandboxd#10).
-// /usr/bin/env performs the lookup with the PATH passed by --env. A request
-// without PATH keeps the image's resolution unchanged.
+// guestArgv applies the request's environment through /usr/bin/env
+// assignments, as E2B's envd applies it over the image's. container exec
+// --env does not: it appends a second entry after the image's own, and
+// getenv/execvp read the first, so every variable the image also sets (PATH,
+// HOME, GOCACHE, ...) kept the image's value. That is why Gitmoot's runtime,
+// started as bare "omp" with its upload directory first on PATH, was not
+// found even through env (measured on the Mac, sandboxd#10). An assignment
+// given to env replaces the variable, so a bare name also resolves on the
+// request PATH. Requests without variables run unchanged.
 func guestArgv(args []string, env map[string]string) ([]string, error) {
-	name := args[0]
-	if strings.Contains(name, "/") {
+	if len(env) == 0 {
 		return args, nil
 	}
-	if _, ok := env["PATH"]; !ok {
-		return args, nil
+	// env would parse a command containing "=" as another assignment, and a
+	// leading "-" as an option.
+	if strings.Contains(args[0], "=") || strings.HasPrefix(args[0], "-") {
+		return nil, fmt.Errorf("unsafe guest command name %q", args[0])
 	}
-	if strings.Contains(name, "=") || strings.HasPrefix(name, "-") {
-		return nil, fmt.Errorf("unsafe bare guest command name %q", name)
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
 	}
-	return append([]string{"/usr/bin/env", "--"}, args...), nil
+	sort.Strings(keys)
+	argv := []string{"/usr/bin/env", "--"}
+	for _, key := range keys {
+		argv = append(argv, key+"="+env[key])
+	}
+	return append(argv, args...), nil
 }
 
 // copyInScript writes stdin to "$1" as the guest user, creating missing parent
@@ -626,16 +636,10 @@ func (d *AppleDriver) Run(ctx context.Context, id string, command Command, stdou
 		}
 		args = append(args, "--workdir", command.Dir)
 	}
-	keys := make([]string, 0, len(command.Env))
 	for key, value := range command.Env {
 		if !envName.MatchString(key) || strings.ContainsRune(value, 0) {
 			return 0, fmt.Errorf("unsafe guest environment variable %q", key)
 		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, "--env", key+"="+command.Env[key])
 	}
 	args = append(args, id)
 	guest, err := guestArgv(command.Args, command.Env)

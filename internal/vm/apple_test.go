@@ -186,7 +186,7 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		"--read-only --mount type=volume,source=sandboxd-new,target=/home/user",
 		"--tmpfs /tmp:size=512M,mode=1777", "--uid 1000 --gid 1000",
 		"exec --user 0:0 sandboxd-new /bin/chown 1000:1000 /home/user",
-		"exec --user 1000:1000 --workdir /tmp --env X=value sandboxd-new /bin/false -n",
+		"exec --user 1000:1000 --workdir /tmp sandboxd-new /usr/bin/env -- X=value /bin/false -n",
 		"stats --format json --no-stream sandboxd-new",
 		"exec --interactive --user 1000:1000 sandboxd-new /bin/sh -c " + copyInScript + " sh /tmp/upload",
 		"volume delete sandboxd-new",
@@ -241,40 +241,36 @@ func TestCopyInScriptCreatesMissingParentDirectories(t *testing.T) {
 	}
 }
 
-// A bare command name must be found on the request's PATH, as E2B's envd
-// does: Gitmoot starts its runtime as "omp" with its upload directory first
-// on PATH (sandboxd#10). This runs the produced argv for real, with only that
-// PATH, and checks the uploaded program ran.
-func TestBareCommandResolvesAgainstTheRequestPATH(t *testing.T) {
+// The request's variables must win over the image's, as with E2B's envd.
+// container exec --env only appends a second entry that the image's own
+// shadows (measured on the Mac), so this runs the produced argv with only the
+// IMAGE's environment and checks the request's PATH and HOME took effect:
+// Gitmoot starts its runtime as bare "omp" with its upload dir first on PATH.
+func TestRequestEnvironmentOverridesTheImage(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "runtime", "bin")
 	if err := os.MkdirAll(bin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(bin, "omp"), []byte("#!/bin/sh\necho uploaded-omp \"$@\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(bin, "omp"), []byte("#!/bin/sh\necho \"uploaded-omp $* home=$HOME\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	env := map[string]string{"PATH": bin + ":/usr/bin:/bin"}
+	env := map[string]string{"PATH": bin + ":/usr/bin:/bin", "HOME": "/home/request"}
 	argv, err := guestArgv([]string{"omp", "--version"}, env)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Env = []string{"PATH=" + env["PATH"]}
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/image-home"} // the image's
 	out, err := cmd.CombinedOutput()
-	if err != nil || strings.TrimSpace(string(out)) != "uploaded-omp --version" {
-		t.Fatalf("bare name not resolved on the request PATH: %q %v (argv %q)", out, err, argv)
+	if err != nil || strings.TrimSpace(string(out)) != "uploaded-omp --version home=/home/request" {
+		t.Fatalf("request environment did not override the image: %q %v (argv %q)", out, err, argv)
 	}
-	for _, unchanged := range [][]string{{"/bin/false", "-n"}} {
-		if got, _ := guestArgv(unchanged, env); strings.Join(got, " ") != strings.Join(unchanged, " ") {
-			t.Fatalf("absolute command rewritten: %q", got)
-		}
+	if got, _ := guestArgv([]string{"/bin/false", "-n"}, nil); strings.Join(got, " ") != "/bin/false -n" {
+		t.Fatalf("request without variables rewritten: %q", got)
 	}
-	if got, _ := guestArgv([]string{"omp"}, map[string]string{"X": "1"}); strings.Join(got, " ") != "omp" {
-		t.Fatalf("command without request PATH rewritten: %q", got)
-	}
-	for _, bad := range []string{"A=B", "-i"} {
+	for _, bad := range []string{"A=B", "-i", "/opt/x=y"} {
 		if _, err := guestArgv([]string{bad}, env); err == nil {
-			t.Fatalf("accepted bare name %q that env would treat as an option or assignment", bad)
+			t.Fatalf("accepted command %q that env would misparse", bad)
 		}
 	}
 }
