@@ -1,0 +1,39 @@
+%% Source for docs/images/architecture-{light,dark}.svg. Regenerate with:
+%%   npx -p @mermaid-js/mermaid-cli mmdc -i docs/images/architecture.mmd -c docs/images/mermaid-config.json \
+%%     -b transparent -t default -o docs/images/architecture-light.svg
+%%   (same with -t dark -o docs/images/architecture-dark.svg)
+flowchart TB
+    client["E2B-style client (Gitmoot)"] -->|HTTPS| proxy["Private HTTPS<br/>Tailscale Serve or SSH tunnel"]
+
+    subgraph mac["Apple-silicon Mac"]
+        direction TB
+        subgraph daemon["sandboxd (worker account, 127.0.0.1:43180)"]
+            direction LR
+            control["Control API<br/>X-API-Key"]
+            guest["Guest data plane<br/>/files, process start<br/>per-VM access token"]
+            driver["Apple VM driver"]
+            ledger[("SQLite ledger")]
+        end
+        helper["sandboxd-pf-helper<br/>root launchd service"]
+        vms["Linux ARM64 VMs<br/>one VM per sandbox<br/>one host-only network per slot"]
+        relay["sandboxd model relay<br/>optional, port 43181"] --> upstream["Operator upstream<br/>(loopback)"]
+    end
+
+    proxy --> control
+    proxy --> guest
+    control --> ledger
+    control --> driver
+    guest -->|container exec| driver
+    driver -->|create, exec, delete| vms
+    driver -.->|check, arm, disarm| helper
+    helper -.->|PF deny rules| vms
+    vms -.->|only when enabled| relay
+
+    classDef ext fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+    classDef core fill:#ecfdf5,stroke:#10b981,color:#064e3b
+    classDef sec fill:#fff7ed,stroke:#f97316,color:#7c2d12
+    classDef vm fill:#f1f5f9,stroke:#64748b,color:#0f172a
+    class client,proxy,upstream ext
+    class control,guest,ledger,driver,relay core
+    class helper sec
+    class vms vm
