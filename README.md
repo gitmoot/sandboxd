@@ -34,40 +34,14 @@ each VM behind a PF firewall, and a SQLite ledger tracks every VM it creates.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    client["E2B-style client<br/>(Gitmoot)"]
-    proxy["Private HTTPS<br/>Tailscale Serve or SSH tunnel"]
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+    <img alt="sandboxd architecture: a client reaches the control API and guest data plane over private HTTPS; sandboxd records sandboxes in a SQLite ledger and drives Apple container VMs, one per sandbox on its own host-only network; a root PF helper firewalls the VMs; an optional model relay forwards guest model traffic to an operator upstream." src="docs/images/architecture-light.svg" width="560">
+  </picture>
+</p>
 
-    subgraph mac["Apple-silicon Mac"]
-        subgraph daemon["sandboxd · worker account · 127.0.0.1:43180"]
-            control["Control API<br/>X-API-Key"]
-            guest["Guest data plane (envd subset)<br/>/files · /process.Process/Start<br/>per-VM X-Access-Token"]
-            ledger[("SQLite ledger")]
-            driver["Apple VM driver"]
-            relay["Model relay (optional)<br/>first slot gateway:43181"]
-        end
-        helper["sandboxd-pf-helper<br/>root · launchd"]
-        subgraph vms["Apple container VMs · one host-only network per slot"]
-            vm1["VM in slot 1"]
-            vmn["VM in slot N"]
-        end
-        upstream["Operator upstream<br/>loopback port"]
-    end
-
-    client -->|"HTTPS"| proxy
-    proxy --> control
-    proxy --> guest
-    control --> ledger
-    control --> driver
-    guest -->|"container exec"| driver
-    driver -->|"create, exec, delete"| vm1
-    driver --> vmn
-    driver -.->|"Unix socket: check, arm, disarm"| helper
-    helper -.->|"PF deny rules per slot bridge"| vms
-    vm1 -.->|"TCP, only when enabled"| relay
-    relay --> upstream
-```
+<sub>Diagram source: <a href="docs/images/architecture.mmd"><code>docs/images/architecture.mmd</code></a>.</sub>
 
 - **Control plane**: create, get, list, extend and delete sandboxes, plus
   metrics. Each request needs `X-API-Key`. The ledger reserves capacity and a
