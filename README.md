@@ -101,7 +101,7 @@ description. Summary:
 | Guest | Run command, `POST /process.Process/Start` | 🟡 | Connect JSON stream; no stdin; output capped at 64 MiB |
 | Guest | Other process RPCs (input, signals, list, reconnect) | ❌ | |
 | Routing | Wildcard host `49983-<id>.<domain>` | ✅ | Needs private wildcard DNS and TLS |
-| Routing | Single gateway host with `E2b-Sandbox-Id` / `E2b-Sandbox-Port` | ✅ | The stock SDK does not send these headers |
+| Routing | Single gateway host with `E2b-Sandbox-Id` / `E2b-Sandbox-Port` | ✅ | The stock SDK sends these headers; point it at the gateway with `E2B_SANDBOX_URL` |
 | Lifecycle | Pause and resume, snapshots | ❌ | |
 | Templates | Template builds | ❌ | One image, allowlisted with `--image` |
 | Network | Guest inbound ports, public guest hosts | ❌ | Not supported, by design |
@@ -110,9 +110,11 @@ description. Summary:
 **Why the stock SDK doesn't work yet.** An unmodified E2B Python SDK (2.52.0)
 fails at its first call: `Sandbox.create` sends `POST /v2/sandboxes`, and
 sandboxd returns 404. If that path existed, create would still need `secure:
-true` and Gitmoot's owner metadata. The SDK also addresses the guest at
-`https://49983-<id>.<domain>`, while a single-host deployment (such as
-Tailscale Serve) routes guests by headers that the SDK does not send.
+true` and Gitmoot's owner metadata, and the SDK could not parse some response
+fields (for example `envdVersion: "sandboxd-1"` is not a version string).
+Guest routing is not the obstacle: the SDK already sends the
+`E2b-Sandbox-Id` / `E2b-Sandbox-Port` headers and honours `E2B_SANDBOX_URL`,
+so a single-host deployment such as Tailscale Serve fits.
 
 ## Requirements
 

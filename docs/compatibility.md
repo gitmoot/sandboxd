@@ -1,6 +1,6 @@
 # Gitmoot E2B subset
 
-Client revision: `gitmoot/gitmoot@10f31189f6f23119f03aab697bce00d4d59e3291`, package `internal/execbackend/e2b`. This is a **subset**, not an E2B SDK implementation. The client fixture tests at that revision are the reference for malformed responses, redirects, truncated streams, and ambiguous failures. The opt-in `TestSandboxdPinnedClientConformance` in that same package exercises the actual client against sandboxd and a real VM; it passed on Apple container 1.4.1 over a private SSH tunnel on 2026-09-24, using a temporary key. On 2026-09-30 it passed again through the private Tailscale Serve HTTPS gateway with header routing ([#6]).
+Client revision: `gitmoot/gitmoot@a61e1435e7625bf062e05eed21337765833eade6` (the build running in production since 2026-10-01; the earlier pin `10f31189` was a commit that was never pushed), package `internal/execbackend/e2b`. This is a **subset**, not an E2B SDK implementation. The client fixture tests at that revision are the reference for malformed responses, redirects, truncated streams, and ambiguous failures. The opt-in `TestSandboxdPinnedClientConformance` (`sandboxd_conformance_test.go`) in that same package exercises the actual client against sandboxd and a real VM; it passed on Apple container 1.4.1 over a private SSH tunnel on 2026-09-24, using a temporary key. On 2026-09-30 it passed again through the private Tailscale Serve HTTPS gateway with header routing ([#6]).
 
 | Plane | Supported operation | Authentication and result |
 | --- | --- | --- |
