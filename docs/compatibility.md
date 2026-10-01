@@ -1,6 +1,6 @@
 # Gitmoot E2B subset
 
-Client revision: `gitmoot/gitmoot@10f31189f6f23119f03aab697bce00d4d59e3291`, package `internal/execbackend/e2b`. This is a **subset**, not an E2B SDK implementation. The client fixture tests at that revision are the reference for malformed responses, redirects, truncated streams, and ambiguous failures. The opt-in `TestSandboxdPinnedClientConformance` in that same package exercises the actual client against sandboxd and a real VM; it passed on Apple container 1.4.1 over a private SSH tunnel on 2026-09-24. The Mac service used a temporary key and was stopped afterward; production routing was not changed.
+Client revision: `gitmoot/gitmoot@10f31189f6f23119f03aab697bce00d4d59e3291`, package `internal/execbackend/e2b`. This is a **subset**, not an E2B SDK implementation. The client fixture tests at that revision are the reference for malformed responses, redirects, truncated streams, and ambiguous failures. The opt-in `TestSandboxdPinnedClientConformance` in that same package exercises the actual client against sandboxd and a real VM; it passed on Apple container 1.4.1 over a private SSH tunnel on 2026-09-24, using a temporary key. On 2026-09-30 it passed again through the private Tailscale Serve HTTPS gateway with header routing ([#6]).
 
 | Plane | Supported operation | Authentication and result |
 | --- | --- | --- |
@@ -50,18 +50,20 @@ Run that command from the pinned Gitmoot checkout. Without these variables the o
 Set `SANDBOXD_CONFORMANCE_OMP_FILE` to a verified Linux ARM64 OMP executable
 to also upload it and run `omp --version` inside the VM. On the Mac Studio,
 the pinned v17.3.5 asset executed successfully; that checks architecture and
-upload, not model access or a full PR review.
+upload, not model access or a full PR review. Both were proven later: scoped
+model access from guests ([#8]) and a full production review ([#10]).
 
-Security gate: Apple `hostOnly` is **not** a host firewall. A guest reached Mac
-wildcard listeners over IPv4, IPv6 ULA, and IPv6 link-local. Mac IPv4 and IPv6
-forwarding were enabled; a controlled literal-IP egress timeout did not prove
-Internet isolation. One-port PF probes counted blocked guest packets on the
-ephemeral Mac bridge (`bridge102`), but the broad deny-all canary expired without
-a valid counter read. No production PF policy or private HTTPS endpoint was
-deployed. Do not run untrusted PR code or production routing on that evidence.
+Security gate: Apple `hostOnly` is **not** a host firewall. Without PF, a
+guest reached Mac wildcard listeners over IPv4, IPv6 ULA, and IPv6
+link-local, and Mac IPv4 and IPv6 forwarding are enabled. sandboxd therefore
+runs no guest work unless the root PF helper below has armed every slot. With
+the helper armed on the Mac, three fresh guests could not reach Mac services
+(IPv4 and IPv6), the LAN, the tailnet, or the internet ([#3], [#8]).
 
-The selected root-owned PF helper (`cmd/sandboxd-pf-helper`) has passed a
-bounded deny-only Mac canary, but is **not approved for production traffic**.
+The root-owned PF helper (`cmd/sandboxd-pf-helper`) runs as a launchd system
+service on the production Mac and is approved for Gitmoot's opt-in Mac
+provider. Gitmoot routes a job there only when it asks for
+`--exec-provider mac`; cloud E2B stays the default ([#9], [#10]).
 `sandboxd-pf-helper install` makes it a launchd system service (see
 [Operating the PF helper](#operating-the-pf-helper)). Its root-owned launchd
 configuration must fix the dedicated worker UID/GID and HOME, worker ID,
@@ -149,12 +151,12 @@ pre-slot build keeps its rows; while any of them is not `gone`, admission is
 refused (their guests' networks are unknown) until reconciliation proves
 them gone.
 
-The helper deliberately leaves the anchor in place on crash. The supervised
-deny-only Mac canary blocked previously successful guest IPv4, IPv6 ULA, and
-link-local connections while unrelated Mac/tailnet test traffic worked; the
-trusted pin was removed and the owned anchor read back empty. Live rule
-counters, helper failure while armed, reboot recovery, and any model pass
-rule remain unverified. Do not admit untrusted work.
+The helper deliberately leaves the anchor in place on crash. On the Mac, the
+armed deny-only anchor blocked previously successful guest IPv4, IPv6 ULA,
+and link-local connections while unrelated Mac and tailnet traffic kept
+working, and per-slot networks blocked guest-to-guest traffic ([#3], [#8]).
+Still unverified: live PF rule counters, helper failure while armed, and
+recovery after a Mac reboot ([#7]).
 
 The optional fixed model relay transports TLS bytes without terminating TLS
 or handling credentials. Gitmoot advertises **one** credential gateway URL
@@ -162,11 +164,12 @@ whose server certificate carries one IP SAN, and Apple `container` 1.4.1 has
 no `--add-host` for per-guest names, so every slot uses the same relay
 address: the **first** slot's gateway, e.g. `https://192.168.128.1:43181`.
 A guest on another slot reaches it through its own default gateway and the
-Mac delivers it locally; this cross-slot path has not been measured on the
-Mac yet. Gitmoot's mTLS broker listens on its own `127.0.0.1:8443`; a
-supervised SSH reverse forward from that broker to the Mac binds only Mac
+Mac delivers it locally; on the Mac, guests in all three slots reached the
+relay at the same time ([#8]). Gitmoot's mTLS broker listens on its own
+`127.0.0.1:8443`; a supervised SSH reverse forward from that broker to the
+Mac (in production, a service on the Gitmoot host) binds only Mac
 `127.0.0.1:43184`:
-`ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 jerry@<Mac-tailnet-IP>`.
+`ssh -N -o ExitOnForwardFailure=yes -R 127.0.0.1:43184:127.0.0.1:8443 <user>@<mac-host>`.
 The default PF anchor blocks the relay along with all other Mac services. An
 optional root-configured `--model-relay-port=43181` generates, for every
 slot, only a TCP pass from that slot's IPv4 subnet to the first slot's
@@ -202,11 +205,16 @@ block drop in quick on bridge103 inet6 all
 
 Guest-to-guest isolation is unchanged: the only address a guest may reach
 is the Mac's own relay address; other slots' gateways and guests stay
-denied. **No model pass rule has been loaded on the Mac.** Do not set this
-flag or enable model access until Gitmoot's mTLS broker and scoped lease are
-provisioned and the pass counter, cross-slot delivery, certificate
-rejection, lease expiry, and unrelated-client denial are proved on the Mac.
-Then launch sandboxd with
+denied. On the production Mac this pass rule is loaded (helper v0.1.2,
+installed with `--model-relay-port 43181`) and proven: guests in all three
+slots, running at the same time, got a real model answer through Gitmoot's
+mTLS credential gateway, with no provider key in the gateway or any guest;
+a request without the client certificate failed TLS, and a wrong capability
+or a revoked lease got `401` ([#8]). Production reviews use this path
+([#10]). Reading the live pass counter is still outstanding; it is
+diagnostic and does not gate the relay. On any other Mac, set this flag only
+once Gitmoot's mTLS broker and scoped lease are provisioned, and repeat those
+checks there. Then launch sandboxd with
 `--model-relay-listen 192.168.128.1:43181 --model-relay-target 127.0.0.1:43184`;
 sandboxd refuses a listen IP other than the first `--slot` gateway. The
 relay admits only source addresses in the configured slot IPv4 subnets
@@ -214,8 +222,7 @@ relay admits only source addresses in the configured slot IPv4 subnets
 one loopback port; Gitmoot's mTLS certificate and short-lived lease still
 authorize each model request. Source admission is not a firewall for other
 Mac services. Recheck the actual network subnets after any Apple network
-recreation. A dummy broker round-trip passed, but no production PF rule,
-real model lease, or production relay was enabled.
+recreation.
 
 ## Review image module cache
 
@@ -370,4 +377,11 @@ sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \
 Stopping the helper does not by itself remove its PF anchor; inspect it with
 `sudo pfctl -a com.apple/gitmoot-sandboxd -sr`.
 
-Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result.
+Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result; both were proven separately on the Mac ([#6], [#8], [#10]).
+
+[#3]: https://github.com/gitmoot/sandboxd/issues/3
+[#6]: https://github.com/gitmoot/sandboxd/issues/6
+[#7]: https://github.com/gitmoot/sandboxd/issues/7
+[#8]: https://github.com/gitmoot/sandboxd/issues/8
+[#9]: https://github.com/gitmoot/sandboxd/issues/9
+[#10]: https://github.com/gitmoot/sandboxd/issues/10
