@@ -23,4 +23,5 @@ pass in quick on bridge104 inet from 192.168.131.0/24 to any
 block in quick on bridge104 inet from any to any
 block in quick on bridge104 inet6 from any to any
 block in quick inet from any to <sandboxd_guests>
+pass in quick on ! lo0 inet proto udp from any port 67 to any port 68
 block in quick on ! lo0 inet from any to ! <sandboxd_host>

@@ -188,7 +188,13 @@ func pfctlLoad(policy string, optimized bool) (filter, nat string, tables map[st
 		line = strings.Replace(line, "block in quick", "block drop in quick", 1)
 		line = strings.Replace(line, " from any to any", " all", 1)
 		if strings.HasPrefix(line, "pass in quick") {
-			line = strings.Replace(line, " port ", " port = ", 1) + " flags S/SA keep state"
+			// pfctl clears the default TCP flags on non-TCP rules.
+			line = strings.ReplaceAll(line, " port ", " port = ")
+			if strings.Contains(line, " proto udp ") {
+				line += " keep state"
+			} else {
+				line += " flags S/SA keep state"
+			}
 		}
 		if optimized && strings.HasSuffix(line, " inet6 all") {
 			inet6 = append(inet6, line)

@@ -62,7 +62,7 @@ func newTwoSlotHost(t *testing.T, relayPort int) *twoSlotHost {
 		s:      s,
 		fakePF: newFakePF().attach(s),
 		bridges: map[string][]net.Addr{
-			"bridge110": slot1Addrs, "bridge111": slot2Addrs, "bridge100": slotAddrs("192.168.64.1", "fd9a::1"),
+			"bridge110": slot1Addrs, "bridge111": slot2Addrs,
 			"lo0":   {ipNet("127.0.0.1/8"), ipNet("::1/128"), ipNet("fe80::1/64")},
 			"en0":   {ipNet("192.168.1.20/24"), ipNet("2001:db8:1::20/64"), ipNet("fe80::1c2a:5ff:fe3b:1/64")},
 			"utun3": {ipNet("100.111.92.43/32"), ipNet("fd7a:115c:a1e0::4e01:5c2b/128")},
@@ -215,7 +215,7 @@ func TestEgressTablesAreExactAndHostTableFollowsTheMac(t *testing.T) {
 	// IPv6 is dropped whole).
 	for _, addr := range []string{"127.0.0.1/32", "::1/128", "192.168.1.20/32", "2001:db8:1::20/128",
 		"100.111.92.43/32", "fd7a:115c:a1e0::4e01:5c2b/128", "192.168.130.1/32", "192.168.131.1/32",
-		"192.168.64.1/32", "fd1e:68b8:2ef4:5d01::1/128"} {
+		"fd1e:68b8:2ef4:5d01::1/128"} {
 		if !hostTableHas(addr) {
 			t.Errorf("host table lacks Mac address %s: %v", addr, h.tables[hostTable])
 		}
@@ -425,8 +425,10 @@ func TestArmReplacesOnlyThisHelpersAnchors(t *testing.T) {
 	} {
 		h := newTwoSlotHost(t, 43181)
 		h.setLoaded(loaded[0], loaded[1])
-		if _, err := h.s.check(ctx); err == nil {
-			t.Errorf("%s: check accepted it as the configured policy", name)
+		// Check reconciles this helper's other forwarding shape in place;
+		// everything else it refuses until arm replaces it.
+		if _, err := h.s.check(ctx); (err == nil) != (name == "egress without the forwarding guard") {
+			t.Errorf("%s: check returned %v", name, err)
 		}
 		if got, err := h.s.arm(ctx); err != nil || got != "bridge110,bridge111" {
 			t.Errorf("%s: did not replace it: %q %v", name, got, err)
@@ -583,12 +585,13 @@ func TestDisarmRestoresIPForwarding(t *testing.T) {
 		if _, err := h.s.check(ctx); err != nil {
 			t.Fatalf("before=%v: check refused the recorded shape: %v", before, err)
 		}
+		// The other forwarding shape of this helper's anchor is reconciled
+		// back to the recorded one by check itself.
 		armed := h.filter
 		h.filter = h.s.policyFor([]string{"bridge110", "bridge111"}, "en0", 0, nil, before).Filter
-		if _, err := h.s.check(ctx); err == nil {
-			t.Fatalf("before=%v: check accepted the other forwarding shape", before)
+		if _, err := h.s.check(ctx); err != nil || h.filter != armed {
+			t.Fatalf("before=%v: check did not restore the recorded forwarding shape: %v\n%s", before, err, h.filter)
 		}
-		h.filter = armed
 		if before && h.forwardingWrites != 0 {
 			t.Fatalf("before=%v: arm rewrote a forwarding that was already on", before)
 		}
@@ -652,7 +655,7 @@ func TestDisarmLeavesForwardingThatWasOnBeforeArm(t *testing.T) {
 func TestBackgroundRefreshKeepsTheMacReachable(t *testing.T) {
 	ctx := context.Background()
 	h := newTwoSlotHost(t, 0)
-	h.s.refreshHostTable(ctx) // no anchor: nothing to do
+	h.s.refresh(ctx) // no anchor: nothing to do
 	if len(h.tables) != 0 {
 		t.Fatal("refresh created a host table without an anchor")
 	}
@@ -660,7 +663,7 @@ func TestBackgroundRefreshKeepsTheMacReachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.bridges["en0"] = []net.Addr{ipNet("192.168.7.40/24")}
-	h.s.refreshHostTable(ctx)
+	h.s.refresh(ctx)
 	for _, addr := range []string{"192.168.7.40/32", "192.168.7.255/32"} {
 		if !slices.Contains(h.tables[hostTable], netip.MustParsePrefix(addr)) {
 			t.Errorf("refresh did not admit the Mac's new destination %s", addr)
@@ -668,5 +671,114 @@ func TestBackgroundRefreshKeepsTheMacReachable(t *testing.T) {
 	}
 	if slices.Contains(h.tables[hostTable], netip.MustParsePrefix("192.168.1.20/32")) {
 		t.Error("refresh kept the Mac's old address")
+	}
+}
+
+const guardRule = "block drop in quick on ! lo0 inet from any to ! <sandboxd_host>"
+
+func (h *twoSlotHost) guarded() bool { return strings.Contains(h.filter, guardRule) }
+
+func (h *twoSlotHost) drain() {
+	h.pins = map[string]bool{}
+	delete(h.bridges, "bridge110")
+	delete(h.bridges, "bridge111")
+}
+
+// A record of 1 goes stale when the operator stops routing while armed:
+// once the helper has to turn forwarding on, it owns it, guards it and
+// restores it, both on the next arm and at the next refresh.
+func TestHelperOwnsForwardingItHadToTurnOn(t *testing.T) {
+	ctx := context.Background()
+	for _, via := range []string{"arm", "refresh", "check"} {
+		h := newTwoSlotHost(t, 0)
+		h.forwarding = true // e.g. a Tailscale exit node
+		if _, err := h.s.arm(ctx); err != nil || h.guarded() {
+			t.Fatalf("%s: armed with a guard over the operator's routing: %v", via, err)
+		}
+		h.forwarding = false // the operator stops routing
+		switch via {
+		case "arm":
+			_, err := h.s.arm(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+		case "refresh":
+			h.s.refresh(ctx)
+		case "check":
+			if _, err := h.s.check(ctx); err != nil {
+				t.Fatalf("check refused while taking over forwarding: %v", err)
+			}
+		}
+		if before, err := h.s.forwardingBefore(); err != nil || before != "0" || !h.forwarding || !h.guarded() {
+			t.Fatalf("%s: did not take over forwarding: record %q forwarding=%v guard=%v %v", via, before, h.forwarding, h.guarded(), err)
+		}
+		if _, err := h.s.check(ctx); err != nil {
+			t.Fatalf("%s: %v", via, err)
+		}
+		h.drain()
+		if err := h.s.disarm(ctx); err != nil || h.forwarding {
+			t.Fatalf("%s: disarm did not restore forwarding the helper turned on: %v", via, err)
+		}
+	}
+}
+
+// Another forwarding user that starts after the first arm keeps working:
+// the guard drops at the next check or refresh, comes back when it leaves,
+// and disarm leaves forwarding on while it runs.
+func TestAnotherForwardingUserKeepsForwarding(t *testing.T) {
+	ctx := context.Background()
+	users := map[string]func(h *twoSlotHost, on bool){
+		"vmnet NAT bridge": func(h *twoSlotHost, on bool) {
+			if on {
+				h.bridges["bridge100"] = slotAddrs("192.168.64.1", "fd9a::1")
+			} else {
+				delete(h.bridges, "bridge100")
+			}
+		},
+		"PF NAT outside the anchor": func(h *twoSlotHost, on bool) {
+			h.mainNAT = testMainNAT
+			if on {
+				h.mainNAT += "nat on en0 inet from 192.168.2.0/24 to any -> (en0) round-robin\n"
+			}
+		},
+	}
+	for name, use := range users {
+		h := newTwoSlotHost(t, 0)
+		if _, err := h.s.arm(ctx); err != nil || !h.guarded() {
+			t.Fatalf("%s: helper-owned forwarding is not guarded: %v", name, err)
+		}
+		use(h, true)
+		// Check reconciles itself, so sandboxd never sees a gap.
+		if _, err := h.s.check(ctx); err != nil || h.guarded() {
+			t.Fatalf("%s: guard not dropped for another forwarding user: %v", name, err)
+		}
+		use(h, false)
+		h.s.refresh(ctx)
+		if !h.guarded() {
+			t.Fatalf("%s: guard not restored once the other user left", name)
+		}
+		use(h, true)
+		h.s.refresh(ctx)
+		if h.guarded() {
+			t.Fatalf("%s: refresh kept the guard over another forwarding user", name)
+		}
+		// Arm also decides with the other user present.
+		if _, err := h.s.arm(ctx); err != nil || h.guarded() {
+			t.Fatalf("%s: re-arm guarded another forwarding user: %v", name, err)
+		}
+		h.drain()
+		writes := h.forwardingWrites
+		if err := h.s.disarm(ctx); err != nil || !h.forwarding || h.forwardingWrites != writes {
+			t.Fatalf("%s: disarm turned off forwarding another service uses: %v", name, err)
+		}
+		if _, err := os.Stat(h.s.forwardingState()); !os.IsNotExist(err) {
+			t.Fatalf("%s: forwarding record left behind: %v", name, err)
+		}
+	}
+	// A bridge without IPv4 (a host-only network not in use) is not a user.
+	h := newTwoSlotHost(t, 0)
+	h.bridges["bridge100"] = []net.Addr{ipNet("fd9a::1/64")}
+	if _, err := h.s.arm(ctx); err != nil || !h.guarded() {
+		t.Fatalf("an IPv6-only bridge dropped the guard: %v", err)
 	}
 }

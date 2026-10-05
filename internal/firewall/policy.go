@@ -105,8 +105,12 @@ func render(in policyInput) pfPolicy {
 	load = append(load, "block in quick inet from any to <"+guestsTable+">")
 	filter = append(filter, "block drop in quick inet from any to <"+guestsTable+">")
 	if in.GuardForwarding {
-		load = append(load, "block in quick on ! lo0 inet from any to ! <"+hostTable+">")
-		filter = append(filter, "block drop in quick on ! lo0 inet from any to ! <"+hostTable+">")
+		// DHCP replies go to the address being offered, which the host
+		// table cannot hold yet (RFC 2131 unicast OFFER/ACK).
+		load = append(load, "pass in quick on ! lo0 inet proto udp from any port 67 to any port 68",
+			"block in quick on ! lo0 inet from any to ! <"+hostTable+">")
+		filter = append(filter, "pass in quick on ! lo0 inet proto udp from any port = 67 to any port = 68 keep state",
+			"block drop in quick on ! lo0 inet from any to ! <"+hostTable+">")
 	}
 	return pfPolicy{Load: strings.Join(load, "\n") + "\n", Filter: strings.Join(filter, "\n"), NAT: strings.Join(nat, "\n")}
 }

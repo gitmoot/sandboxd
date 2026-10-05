@@ -18,6 +18,7 @@ pass in quick on bridge104 inet from 192.168.131.0/24 to any flags S/SA keep sta
 block drop in quick on bridge104 inet all
 block drop in quick on bridge104 inet6 all
 block drop in quick inet from any to <sandboxd_guests>
+pass in quick on ! lo0 inet proto udp from any port = 67 to any port = 68 keep state
 block drop in quick on ! lo0 inet from any to ! <sandboxd_host>
 # pfctl -a com.apple/gitmoot-sandboxd -sn
 nat on en0 inet from 192.168.128.0/24 to any -> (en0) round-robin

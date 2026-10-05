@@ -95,9 +95,12 @@ func TestThreeSlotEgressRulesetGolden(t *testing.T) {
 // verdict is the anchor's decision for an IPv4 packet (not TCP to the relay)
 // arriving on iface: "block", "pass" or "" when no rule matches and the
 // Mac's main ruleset (pass by default) decides. It understands exactly the
-// rule shapes render prints.
+// rule shapes render prints. src or dst may carry ":port" for UDP.
 func verdict(t *testing.T, filter string, tables map[string][]netip.Prefix, iface, src, dst string) string {
 	t.Helper()
+	src, srcPort, _ := strings.Cut(src, ":")
+	dst, dstPort, _ := strings.Cut(dst, ":")
+	dhcpReply := srcPort == "67" && dstPort == "68"
 	from, to := netip.MustParseAddr(src), netip.MustParseAddr(dst)
 	inTable := func(name string, addr netip.Addr) bool {
 		return slices.ContainsFunc(tables[name], func(p netip.Prefix) bool { return p.Contains(addr) })
@@ -106,6 +109,12 @@ func verdict(t *testing.T, filter string, tables map[string][]netip.Prefix, ifac
 		action, rest, _ := strings.Cut(line, " in quick ")
 		if strings.Contains(rest, " proto tcp ") || strings.HasSuffix(rest, " inet6 all") {
 			continue
+		}
+		if before, ok := strings.CutSuffix(rest, " inet proto udp from any port = 67 to any port = 68 keep state"); ok {
+			if !dhcpReply {
+				continue
+			}
+			rest = before + " inet all"
 		}
 		if on, ok := strings.CutPrefix(rest, "on "); ok {
 			name, after, _ := strings.Cut(on, " ")
@@ -185,6 +194,21 @@ func TestForwardingGuardFollowsTheRecordedForwarding(t *testing.T) {
 				t.Errorf("guard=%v: %s %s -> %s = %q, want %q", guard, c.iface, c.src, c.dst, got, c.want)
 			}
 		}
+		// A DHCP reply to an address the Mac does not have yet passes under
+		// the guard; other traffic to that address is not forwarded.
+		dhcp, other := "pass", "block"
+		if !guard {
+			dhcp, other = "", ""
+		}
+		if got := verdict(t, p.Filter, tables, "en0", "192.168.1.1:67", "192.168.1.77:68"); got != dhcp {
+			t.Errorf("guard=%v: DHCP reply = %q, want %q", guard, got, dhcp)
+		}
+		if got := verdict(t, p.Filter, tables, "en0", "192.168.1.1:68", "192.168.1.77:67"); got != other {
+			t.Errorf("guard=%v: non-reply UDP = %q, want %q", guard, got, other)
+		}
+		if got := verdict(t, p.Filter, tables, "bridge103", "192.168.130.5:67", "192.168.1.77:68"); got != "block" {
+			t.Errorf("guard=%v: a guest's DHCP-shaped packet to the LAN = %q", guard, got)
+		}
 	}
 }
 
@@ -245,7 +269,7 @@ func TestEveryDeniedRangeAndHostAddressIsInTheAnchor(t *testing.T) {
 			}
 		}
 	}
-	if lines[len(lines)-2] != "block drop in quick inet from any to <"+guestsTable+">" {
+	if lines[len(lines)-3] != "block drop in quick inet from any to <"+guestsTable+">" {
 		t.Errorf("guest subnets are reachable from other interfaces:\n%s", p.Filter)
 	}
 	// Forwarding serves only guests: on every interface but loopback (slot
@@ -254,8 +278,12 @@ func TestEveryDeniedRangeAndHostAddressIsInTheAnchor(t *testing.T) {
 	if lines[len(lines)-1] != "block drop in quick on ! lo0 inet from any to ! <"+hostTable+">" {
 		t.Errorf("forwarded LAN traffic is not blocked:\n%s", p.Filter)
 	}
+	// DHCP replies to an address not configured yet pass before the guard.
+	if lines[len(lines)-2] != "pass in quick on ! lo0 inet proto udp from any port = 67 to any port = 68 keep state" {
+		t.Errorf("DHCP replies are not admitted before the forwarding guard:\n%s", p.Filter)
+	}
 	for _, bridge := range threeBridges {
-		if last := slices.Index(lines, "block drop in quick on "+bridge+" inet6 all"); last > len(lines)-3 {
+		if last := slices.Index(lines, "block drop in quick on "+bridge+" inet6 all"); last < 0 || last > len(lines)-4 {
 			t.Errorf("%s rules do not all precede the other-interface rules", bridge)
 		}
 	}

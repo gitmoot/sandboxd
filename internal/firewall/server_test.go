@@ -200,7 +200,7 @@ func TestModelRelayPolicyOnlyPassesPinnedGateway(t *testing.T) {
 		t.Fatalf("failed to arm narrowly scoped model policy: %q %v", got, err)
 	}
 	const relay = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 8443\n"
-	if len(pf.loadedText) != 1 || !strings.Contains(pf.loadedText[0], relay) || strings.Count(pf.loadedText[0], " port ") != 1 {
+	if len(pf.loadedText) != 1 || !strings.Contains(pf.loadedText[0], relay) || strings.Count(pf.loadedText[0], " proto tcp ") != 1 {
 		t.Fatalf("model exception is not confined to the fixed guest gateway:\n%s", pf.loadedText)
 	}
 	// The relay pass comes before the host deny: every other Mac port stays denied.

@@ -411,11 +411,13 @@ holds, in this order:
   `<sandboxd_host>`; pass from the slot's own subnet to anything else; block
   all other IPv4 and all IPv6;
 - then, for every other interface: block anything for a guest subnet, and,
-  only if forwarding was off before the first arm (below),
+  only while the helper guards forwarding (below), pass DHCP replies
+  (`udp` from port 67 to port 68, sent to an address the Mac does not have
+  yet) and then
   `block in quick on ! lo0 inet from any to ! <sandboxd_host>`. Slot bridge
   packets never get this far, so then the only IPv4 the Mac forwards is
   guest NAT egress: a LAN, VPN or Tailscale host that uses the Mac as its
-  gateway is not routed anywhere.
+  gateway is not routed anywhere, except for UDP from port 67 to port 68.
 
 So a guest never reaches private networks, the Mac (every port except the
 relay's, including its resolver) or another guest, in either direction.
@@ -423,24 +425,40 @@ Guests use the public resolvers `1.1.1.1` and `8.8.8.8` (`container create
 --dns`). The check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock
 macOS has it), exact filter and NAT readback, and exact deny and guest tables.
 
-**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. Before
-loading the anchor, the first arm records the current value in
-`/var/run/sandboxd-pf/ip-forwarding-before-arm` (beside the socket; macOS
-clears it at boot, when the sysctl resets too); later arms and helper
-restarts keep that record, and the expected anchor and its check follow it:
+**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. The helper
+keeps a record in `/var/run/sandboxd-pf/ip-forwarding-before-arm` (beside
+the socket; macOS clears it at boot, when the sysctl resets too):
 
-- **Off before** (`0`): the helper turns forwarding on and adds the
-  catch-all above, so it creates no routing reach beyond guest NAT.
-- **On before** (`1`): the operator routes on purpose, for example a
-  Tailscale exit node or subnet router, OrbStack or Docker's NAT network
-  (`bridge100`), or Internet Sharing. The anchor has no catch-all, so that
-  routing works exactly as before; every guest rule and the block of other
-  interfaces reaching guest subnets stay.
+- **`1`, the operator's forwarding:** forwarding was on at the first arm, for
+  example on a Tailscale exit node or subnet router, or with OrbStack or
+  Internet Sharing. The anchor has no catch-all, so that routing works
+  exactly as before; every guest rule and the block of other interfaces
+  reaching guest subnets stay. An exit-node or OrbStack Mac keeps working.
+- **`0`, the helper's forwarding:** forwarding was off when the helper
+  needed it, at the first arm or later (the operator stopped routing while
+  sandboxd ran; the next arm, check or refresh finds it off). From then on the
+  helper owns it: it records `0`, loads the catch-all, turns forwarding on and
+  restores it at disarm.
 
-Disarm (sandboxd's clean shutdown, after its guests are gone) turns
-forwarding off again only if the record says `0`, then removes the record;
-forwarding that was on stays on. IPv6 forwarding is never touched. The host
-table is refreshed in both cases, since guests are denied its addresses.
+While the helper owns forwarding, every arm, every check and the helper's
+own refresh (every 5 s while the anchor is loaded) look for another
+forwarding user: an up `bridge*` interface with an IPv4 address that is not a
+slot bridge (a vmnet shared/NAT network: Apple `container`'s nat network,
+UTM, Lima, OrbStack), or a translation rule in `pfctl -sn` outside an anchor.
+While one exists the catch-all is dropped, and it comes back when the user
+goes; the helper logs each change. Check reloads the anchor in place, so
+sandboxd sees no gap. Disarm (sandboxd's clean shutdown, after its guests are
+gone) turns forwarding off only if the record says `0` and no other user is
+found, logging when it leaves it on, then removes the record. IPv6
+forwarding is never touched.
+
+Limits: a service that forwards without a vmnet bridge or a main-ruleset
+translation rule (for example NAT inside its own PF anchor, or a VPN client
+relying on plain routing) is not detected. If it starts after the helper
+took forwarding, the catch-all drops its forwarded traffic, and disarm turns
+forwarding off. Turn forwarding on before starting `sandboxd` (record `1`) to
+keep such routing. The DHCP pass allows any UDP packet from port 67 to port
+68 through the Mac.
 
 `internal/firewall/testdata/egress-3slot-forwarding-{off,on}.*` are the
 generated rulesets for the three-slot Mac. A per-slot deny-all mode exists in
