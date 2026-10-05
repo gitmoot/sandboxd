@@ -50,6 +50,9 @@ type Config struct {
 	// gitmoot-strict template requiring Arch. A worker is never scheduled a
 	// template it declares for another architecture.
 	Templates map[string]Template
+	// ReadyTimeout bounds a new e2b sandbox's template start and ready
+	// commands; 0 means DefaultReadyTimeout.
+	ReadyTimeout time.Duration
 	// TokenSecret derives e2b-profile envd tokens (HMAC-SHA256 over the
 	// sandbox ID), so connect can return the same token again while the
 	// ledger keeps only its hash. Required with any e2b template.
@@ -91,7 +94,7 @@ type Service struct {
 // HTTP requests. driver may be nil for a gateway that runs no local VMs.
 func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Service, error) {
 	if cfg.APIKey == "" || cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
-		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
+		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 || cfg.ReadyTimeout < 0 {
 		return nil, errors.New("invalid sandbox control configuration")
 	}
 	if driver == nil && len(cfg.Workers) == 0 {

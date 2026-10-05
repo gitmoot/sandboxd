@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
@@ -192,5 +193,38 @@ func TestE2BTemplateStartReadyAndPorts(t *testing.T) {
 	}
 	if found, ok := s.SignedSandbox(func(token string) bool { return token == created.EnvdAccessToken }); !ok || found != id {
 		t.Fatalf("SignedSandbox = %q, %v", found, ok)
+	}
+}
+
+// Config.ReadyTimeout (-template-ready-timeout) bounds the ready command
+// polling: a template that never becomes ready fails the create with 503 and
+// its sandbox is destroyed.
+func TestE2BTemplateReadyTimeout(t *testing.T) {
+	templates := map[string]Template{"ci": {Image: "linux-arm64", Profile: ProfileE2B, EnvdVersion: "0.9.0",
+		Ports: []int{49999}, ReadyCmd: "ready-check"}}
+	driver := &fakeDriver{instances: map[string]vm.Instance{}}
+	cfg := mixedConfig(templates, 3)
+	cfg.ReadyTimeout = 600 * time.Millisecond
+	s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, cfg)
+	testEnvd.mu.Lock()
+	testEnvd.readyFails = 1 << 20
+	testEnvd.mu.Unlock()
+	defer func() {
+		testEnvd.mu.Lock()
+		testEnvd.readyFails = 0
+		testEnvd.mu.Unlock()
+	}()
+	started := time.Now()
+	got := request(t, s, http.MethodPost, "/v2/sandboxes", map[string]any{"templateID": "ci"})
+	if got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("create: %d %s", got.Code, got.Body)
+	}
+	if took := time.Since(started); took < cfg.ReadyTimeout || took > 10*time.Second {
+		t.Fatalf("create gave up after %s with a %s ready timeout", took, cfg.ReadyTimeout)
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if len(driver.destroyed) != 1 {
+		t.Fatalf("destroyed %q, want the one sandbox", driver.destroyed)
 	}
 }

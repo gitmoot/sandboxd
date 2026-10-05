@@ -66,6 +66,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 	domain := flags.String("domain", "", "sandbox DNS domain reported to clients")
 	gatewayHost := flags.String("gateway-host", "127.0.0.1", "host name for header-routed guest traffic")
 	portHosts := flags.Bool("port-hosts", false, "also route exposed guest ports by wildcard host <port>-<id>.<domain> (needs wildcard DNS and TLS for *.<domain> in front of sandboxd); without it guest ports are reached only via -gateway-host and routing headers")
+	portStreams := flags.Int("port-max-streams", envd.DefaultMaxPortStreams, "maximum concurrent guest port requests (WebSocket and other upgraded streams included) per e2b sandbox; more are refused with 429")
+	readyTimeout := flags.Duration("template-ready-timeout", control.DefaultReadyTimeout, "how long create waits for an e2b template's start and ready commands before it destroys the sandbox and answers 503")
 	maxVMs := flags.Int("max-vms", 4, "maximum concurrent guests")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-sandbox lifetime")
 	cpus := flags.Int("cpus", 2, "CPU count reported for each guest")
@@ -87,6 +89,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	if *maxVMs < 1 || *maxVMs > 64 {
 		return errors.New("max-vms must be between 1 and 64")
+	}
+	if *portStreams < 1 || *readyTimeout <= 0 {
+		return errors.New("port-max-streams must be at least 1 and template-ready-timeout positive")
 	}
 	apiKey, err := readKey(*keyFile)
 	if err != nil {
@@ -123,7 +128,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	service, err := control.Open(ctx, *database, driver, control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: devImage, Domain: *domain, WorkerID: "sandboxd-devvm",
-		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slots,
+		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Slots: slots,
 		DriverName: "devvm", Templates: registered.Templates, TokenSecret: tokenSecret,
 	})
 	if err != nil {
@@ -135,7 +140,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: envd.Routes(guest, portProxy(service, *domain, *gatewayHost, *portHosts), service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	server := &http.Server{Handler: envd.Routes(guest, portProxy(service, *domain, *gatewayHost, *portHosts, *portStreams), service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	log.Printf("sandboxd-dev listening on http://%s (devvm driver, NO isolation, state %s)", listener.Addr(), root)
@@ -189,9 +194,10 @@ func readKey(path string) (string, error) {
 	return key, nil
 }
 
-// portProxy is envd.NewProxy with host-based guest port routing set.
-func portProxy(sandboxes envd.E2BSandboxes, domain, gatewayHost string, portHosts bool) *envd.Proxy {
+// portProxy is envd.NewProxy with host-based guest port routing and the
+// per-sandbox stream cap set.
+func portProxy(sandboxes envd.E2BSandboxes, domain, gatewayHost string, portHosts bool, maxStreams int) *envd.Proxy {
 	proxy := envd.NewProxy(sandboxes, domain, gatewayHost)
-	proxy.PortHosts = portHosts
+	proxy.PortHosts, proxy.MaxPortStreams = portHosts, maxStreams
 	return proxy
 }

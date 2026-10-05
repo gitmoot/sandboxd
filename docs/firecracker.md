@@ -218,7 +218,7 @@ messages go to `/var/log/sandboxd-start.log`, Jupyter's stderr to
 sandboxd starts it through the template's start and ready commands: after
 envd's `/init` it runs the start command once as root through envd
 (`/bin/bash -l -c <start-cmd>`), does not wait for it, then runs the ready
-command until it exits 0 (at most 3 minutes, or the create fails). The
+command until it exits 0 (at most `-template-ready-timeout`, default 3m, or the create fails). The
 registration:
 
 ```sh

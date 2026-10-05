@@ -117,8 +117,8 @@ func (s *Service) DialPort(ctx context.Context, id string, port int) (net.Conn, 
 	return m.api.DialPort(ctx, id, port)
 }
 
-// templateReadyTimeout bounds a template's ready command polling.
-const templateReadyTimeout = 3 * time.Minute
+// DefaultReadyTimeout is Config.ReadyTimeout when unset.
+const DefaultReadyTimeout = 3 * time.Minute
 
 // startTemplate runs a new e2b sandbox's template start command in the
 // background and then its ready command until it exits 0, both as root
@@ -131,7 +131,11 @@ func (s *Service) startTemplate(ctx context.Context, id string, template Templat
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
 	token := s.envdToken(id)
-	ctx, cancel := context.WithTimeout(ctx, templateReadyTimeout)
+	timeout := s.cfg.ReadyTimeout
+	if timeout <= 0 {
+		timeout = DefaultReadyTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if template.StartCmd != "" {
 		if _, err := envd.RunAsRoot(ctx, client, id, token, template.StartCmd, false); err != nil {
