@@ -22,6 +22,10 @@ import (
 	"github.com/gitmoot/sandboxd/internal/worker"
 )
 
+// version is the release tag, set at build time by the release workflow
+// (-ldflags "-X main.version=vX.Y.Z"). A local build says "dev".
+var version = "dev"
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -71,8 +75,13 @@ func run(ctx context.Context, args []string) (runErr error) {
 		"with an image this host also serves it (a -worker-key-file worker declares only id and image)")
 	tokenSecretFile := flags.String("token-secret-file", "", "0600 file of at least 32 bytes deriving e2b-profile envd tokens; required with any e2b template")
 	workerKeyFile := flags.String("worker-key-file", "", "serve only the enrolled-worker API on -listen, authenticated by this 0600 per-worker key file, instead of the control and guest APIs")
+	showVersion := flags.Bool("version", false, "print the release version and exit")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *showVersion {
+		fmt.Println("sandboxd", version)
+		return nil
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments")

@@ -43,10 +43,16 @@ const (
 	stateDir = "/mnt"
 )
 
+// version is the release tag, set at build time by the release workflow
+// (-ldflags "-X main.version=vX.Y.Z"). A local build says "dev".
+var version = "dev"
+
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("sandboxd-agent: ")
 	switch {
+	case len(os.Args) == 2 && os.Args[1] == "version":
+		fmt.Println("sandboxd-guest-agent", version)
 	case len(os.Args) == 3 && os.Args[1] == "write":
 		if err := guestagent.RunWriteHelper(os.Args[2], os.Stdin); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -59,7 +65,7 @@ func main() {
 	case os.Getpid() == 1:
 		initGuest()
 	default:
-		log.Fatal("must run as PID 1, or with 'serve', 'serve-envd' or 'write <path>'")
+		log.Fatal("must run as PID 1, or with 'serve', 'serve-envd', 'write <path>' or 'version'")
 	}
 }
 
