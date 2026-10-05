@@ -163,6 +163,22 @@ deletes them afterwards unless `--workdir` is given.
 
 This proves the wire contract only. Isolation is proven on a real worker.
 
+**Code-interpreter in CI (M3 decision).** The gate does not boot the
+`code-interpreter-v1` image. That image is 3.6 GiB (Jupyter plus Python, R,
+Java, Node and bash kernels) and needs a Firecracker worker with KVM, which
+GitHub runners do not have. The dev driver cannot serve it either: its
+guests have no in-guest server on port 49999. The gate therefore keeps
+running the stock code-interpreter suites against the base `e2b` template
+and pins their outcomes (the `run_code` tests are recorded failures there).
+The acceptance evidence for `code-interpreter-v1` is a run of the same stock
+suites against a real Firecracker worker, repeated whenever the image, the
+guest agent or the port proxy changes. On 2026-10-05 (image
+`code-interpreter-amd64-a5e50c1be0ff`, `-memory-mib 2048`) it gave Python
+163 passed / 0 failed and JS 82 passed / 0 failed. A python-only dev-driver
+template is feasible: its server and kernel venv measured 429 MB and
+installed in 38 s. It would cover only the python kernel and has not been
+added.
+
 ### Network slots: one host-only network per concurrent guest
 
 Two guests on the same Apple host-only network can reach each other: PF on

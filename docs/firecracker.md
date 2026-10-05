@@ -226,8 +226,9 @@ registration:
 ```
 
 Measured on this host's Firecracker worker (2 vCPUs, `-memory-mib 2048`,
-image `code-interpreter-amd64-487b6992d8d3`, stock `e2b` and
-`e2b_code_interpreter` Python SDKs):
+images `code-interpreter-amd64-487b6992d8d3` and `-a5e50c1be0ff` (the latter
+with the guest agent that closes a port stream as soon as the guest port
+closes), stock `e2b` and `e2b_code_interpreter` SDKs):
 
 - Create to ready (boot, envd init, start, ready): 5.1–6.9 s.
 - All five kernels execute through `/execute`, including create-time
@@ -238,7 +239,12 @@ image `code-interpreter-amd64-487b6992d8d3`, stock `e2b` and
   about 1.2 GiB for user code.
 - `kill -9` of the code-interpreter server: healthy and executing again
   within 4 s, measured inside the guest; of Jupyter Server: within 6 s (new
-  kernels; the old ones are gone, as under systemd).
+  kernels; the old ones are gone, as under systemd). Through sandboxd's port
+  proxy, `run_code` works again 3.0 s after the server is killed and 5.1 s
+  after Jupyter is (image `-a5e50c1be0ff`; before it, a stale pooled stream
+  made the first call hang for 20 s).
+- Stock upstream suites against this worker (image `-a5e50c1be0ff`):
+  code-interpreter Python 163 passed, 0 failed; JS 82 passed, 0 failed.
 
 Upstream's tests kill with `kill -9 $(pgrep -f 'jupyter server')` and
 `kill -9 $(pgrep -f 'uvicorn main:app')`. The supervisor's own command lines
