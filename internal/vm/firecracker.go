@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/guestagent"
 )
 
@@ -49,21 +50,6 @@ const (
 	fcMinMemoryMiB = 128
 	fcMaxMemoryMiB = 256 << 10
 )
-
-// fcDenyIPv4 and fcDenyIPv6 are never reachable from a guest: private,
-// carrier-grade NAT, link-local, loopback and non-unicast ranges, plus the
-// one well-known cloud metadata service on a public address (Azure
-// WireServer). Host addresses on every interface are denied separately (fib
-// daddr type local). Other providers' public metadata endpoints must be added
-// per deployment (docs/firecracker.md).
-var fcDenyIPv4 = []string{
-	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "168.63.129.16/32", "169.254.0.0/16",
-	"172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3",
-}
-
-var fcDenyIPv6 = []string{
-	"::/127", "::ffff:0.0.0.0/96", "64:ff9b::/96", "fc00::/7", "fe80::/10", "ff00::/8",
-}
 
 var fcSlotName = regexp.MustCompile(`^sbx[0-9]{1,3}$`)
 
@@ -224,21 +210,24 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 			images[image] = struct{}{}
 		}
 	}
-	deny4, deny6 := slices.Clone(fcDenyIPv4), slices.Clone(fcDenyIPv6)
-	for _, prefix := range cfg.DenyCIDRs {
-		if !prefix.IsValid() || prefix != prefix.Masked() {
-			return nil, fmt.Errorf("invalid Firecracker deny CIDR %q", prefix)
-		}
-		if prefix.Addr().Is4() {
-			deny4 = append(deny4, prefix.String())
-		} else {
-			deny6 = append(deny6, prefix.String())
-		}
+	// Host addresses on every interface are denied separately (fib daddr
+	// type local).
+	deny4, deny6, err := egress.Deny(cfg.DenyCIDRs)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Firecracker %w", err)
 	}
 	cfg.Images = slices.Clone(cfg.Images)
 	cfg.Slots = slices.Clone(cfg.Slots)
 	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
-	return &FirecrackerDriver{cfg: cfg, images: images, deny4: deny4, deny6: deny6, host: host}, nil
+	return &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host}, nil
+}
+
+func prefixStrings(prefixes []netip.Prefix) []string {
+	out := make([]string, len(prefixes))
+	for i, prefix := range prefixes {
+		out[i] = prefix.String()
+	}
+	return out
 }
 
 func (d *FirecrackerDriver) runDir() string   { return filepath.Join(d.cfg.Root, "run") }

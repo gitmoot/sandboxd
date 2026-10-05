@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/firewall"
 	"github.com/gitmoot/sandboxd/internal/helpersvc"
 )
@@ -46,7 +47,9 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		flags.StringVar(&opts.PinImage, "pin-image", helpersvc.DefaultPinImage, "trusted digest-pinned bridge VM image")
 		flags.StringVar(&opts.ContainerCLI, "container-cli", helpersvc.DefaultContainerCLI, "root-owned Apple container CLI")
 		flags.StringVar(&opts.MainRulesSHA256, "main-rules-sha256", "", "SHA-256 of the reviewed pfctl -sr output (default: of the current output)")
-		flags.IntVar(&opts.ModelRelayPort, "model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero retains deny-only PF")
+		flags.IntVar(&opts.ModelRelayPort, "model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero means no relay exception")
+		flags.Var((*egress.PrefixFlags)(&opts.DenyCIDRs), "deny-cidr", denyCIDRUsage)
+		flags.StringVar(&opts.EgressInterface, "egress-interface", "", egressInterfaceUsage)
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -80,7 +83,10 @@ func serve(ctx context.Context, args []string) error {
 	flags.Var(&slots, "slot", "repeatable owned Apple host-only network slot: name=<network>,ipv4=<subnet>,gw=<gateway>,ipv6=<ula-prefix>")
 	pinImage := flags.String("pin-image", "", "trusted digest-pinned bridge VM image")
 	mainHash := flags.String("main-rules-sha256", "", "SHA-256 of the reviewed pfctl -sr output")
-	modelRelayPort := flags.Int("model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero retains deny-only PF")
+	modelRelayPort := flags.Int("model-relay-port", 0, "fixed model relay TCP port on the first slot's gateway, open to every slot; zero means no relay exception")
+	var deny egress.PrefixFlags
+	flags.Var(&deny, "deny-cidr", denyCIDRUsage)
+	egressInterface := flags.String("egress-interface", "", egressInterfaceUsage)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -91,7 +97,7 @@ func serve(ctx context.Context, args []string) error {
 		SocketPath: *socket, WorkerUID: *uid, WorkerGID: *gid,
 		WorkerHome: *home, WorkerID: *workerID, ContainerCLI: *cli,
 		Slots: slots, PinImage: *pinImage, MainRulesSHA256: *mainHash,
-		ModelRelayPort: *modelRelayPort,
+		ModelRelayPort: *modelRelayPort, DenyCIDRs: deny, EgressInterface: *egressInterface,
 	})
 	if err != nil {
 		return err
@@ -101,6 +107,12 @@ func serve(ctx context.Context, args []string) error {
 	}
 	return server.Serve(ctx)
 }
+
+const (
+	denyCIDRUsage = "repeatable extra guest egress deny prefix, added to the shared private and special ranges, e.g. a cloud provider's public metadata endpoint"
+
+	egressInterfaceUsage = "interface guest internet traffic is NATed out of (default: the Mac's default route interface when sandboxd arms)"
+)
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

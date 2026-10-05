@@ -51,8 +51,9 @@ each VM behind a PF firewall, and a SQLite ledger tracks every VM it creates.
   through `container exec`; there is no agent inside the guest. Each call
   needs the VM's own `envdAccessToken`.
 - **PF helper**: a root launchd service that checks the slot networks and
-  loads deny rules for every guest bridge. sandboxd stops guest work if that
-  check fails.
+  loads the guest egress rules for every guest bridge: internet through NAT,
+  never private networks, the Mac or other guests. sandboxd stops guest work
+  if that check fails.
 - **Model relay**: off by default. When enabled, it forwards guest TCP
   connections on one fixed port to a loopback endpoint chosen by the operator.
 
@@ -247,10 +248,16 @@ for the full provider setup.
   run as uid 1000.
 - **One host-only network per slot.** Two guests never share a network, so
   they cannot reach each other.
-- **PF firewall on every guest bridge.** The root `sandboxd-pf-helper` blocks
-  guest traffic to Mac services, the LAN, the tailnet and the internet, over
-  IPv4 and IPv6. sandboxd refuses to admit guests until the rules are
-  loaded, and stops guest work if a later check fails.
+- **PF firewall on every guest bridge.** Guests reach the public internet
+  over IPv4, NATed out of the Mac's egress interface, like E2B. The root
+  `sandboxd-pf-helper` blocks private and special ranges (RFC 1918, CGNAT and
+  Tailscale `100.64/10`, link-local, loopback, multicast, Azure WireServer;
+  the same list as the Linux worker), every address of the Mac itself (LAN,
+  Tailscale, loopback, bridges) except the model relay port, other guests in
+  both directions, and all guest IPv6. Guests use public DNS resolvers.
+  sandboxd refuses to admit guests until the rules are loaded, and stops
+  guest work if a later check fails. Guest egress ships in the helper release,
+  installed with `sudo sandboxd-helper-update`.
 - **Two credentials.** `X-API-Key` for the control API, and a per-VM
   `envdAccessToken` for that VM's data plane only.
 - **Scoped model access, off by default.** The optional relay opens one TCP

@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
-	"net/netip"
-	"strings"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
@@ -24,11 +22,11 @@ type firecrackerFlags struct {
 	uidBase, homeDiskMiB, diskFloorMiB *int
 	bootTimeout                        *time.Duration
 	consoleLog                         *bool
-	deny                               *prefixFlags
+	deny                               *egress.PrefixFlags
 }
 
 func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
-	deny := &prefixFlags{}
+	deny := &egress.PrefixFlags{}
 	flags.Var(deny, "fc-deny-cidr", "firecracker: repeatable extra guest egress deny prefix, e.g. a cloud provider's public metadata endpoint")
 	return firecrackerFlags{
 		root:         flags.String("fc-root", "/var/lib/sandboxd-fc", "firecracker: install and state directory; jails and records live under it"),
@@ -42,27 +40,4 @@ func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 		consoleLog:   flags.Bool("fc-console-log", false, "firecracker: keep each guest's serial console in its jail for debugging"),
 		deny:         deny,
 	}
-}
-
-// prefixFlags is a repeatable network prefix flag.
-type prefixFlags []netip.Prefix
-
-func (p *prefixFlags) String() string {
-	values := make([]string, len(*p))
-	for i, prefix := range *p {
-		values[i] = prefix.String()
-	}
-	return strings.Join(values, ",")
-}
-
-func (p *prefixFlags) Set(value string) error {
-	prefix, err := netip.ParsePrefix(value)
-	if err != nil {
-		return err
-	}
-	if prefix != prefix.Masked() {
-		return fmt.Errorf("%s is not a network prefix (want %s)", value, prefix.Masked())
-	}
-	*p = append(*p, prefix)
-	return nil
 }

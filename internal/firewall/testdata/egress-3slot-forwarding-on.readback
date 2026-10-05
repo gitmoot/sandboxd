@@ -1,0 +1,24 @@
+# pfctl -a com.apple/gitmoot-sandboxd -sr
+pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge102 inet from any to <sandboxd_deny>
+block drop in quick on bridge102 inet from any to <sandboxd_host>
+pass in quick on bridge102 inet from 192.168.128.0/24 to any flags S/SA keep state
+block drop in quick on bridge102 inet all
+block drop in quick on bridge102 inet6 all
+pass in quick on bridge103 inet proto tcp from 192.168.130.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge103 inet from any to <sandboxd_deny>
+block drop in quick on bridge103 inet from any to <sandboxd_host>
+pass in quick on bridge103 inet from 192.168.130.0/24 to any flags S/SA keep state
+block drop in quick on bridge103 inet all
+block drop in quick on bridge103 inet6 all
+pass in quick on bridge104 inet proto tcp from 192.168.131.0/24 to 192.168.128.1 port = 43181 flags S/SA keep state
+block drop in quick on bridge104 inet from any to <sandboxd_deny>
+block drop in quick on bridge104 inet from any to <sandboxd_host>
+pass in quick on bridge104 inet from 192.168.131.0/24 to any flags S/SA keep state
+block drop in quick on bridge104 inet all
+block drop in quick on bridge104 inet6 all
+block drop in quick inet from any to <sandboxd_guests>
+# pfctl -a com.apple/gitmoot-sandboxd -sn
+nat on en0 inet from 192.168.128.0/24 to any -> (en0) round-robin
+nat on en0 inet from 192.168.130.0/24 to any -> (en0) round-robin
+nat on en0 inet from 192.168.131.0/24 to any -> (en0) round-robin

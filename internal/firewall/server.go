@@ -8,16 +8,20 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"github.com/gitmoot/sandboxd/internal/egress"
 )
 
 const anchor = "com.apple/gitmoot-sandboxd"
@@ -42,15 +46,26 @@ type Config struct {
 	// the anchor deny-only until the mTLS broker and lease are ready.
 	ModelRelayPort  int
 	MainRulesSHA256 string
+	// DenyCIDRs extends the shared guest deny list (internal/egress), for
+	// example with a provider's metadata endpoint on a public address.
+	DenyCIDRs []netip.Prefix
+	// EgressInterface is the interface guest traffic is NATed out of; empty
+	// means the Mac's default route interface when sandboxd arms.
+	EgressInterface string
 }
 
 type Server struct {
 	config     Config
 	mainHash   [sha256.Size]byte
+	deny       []netip.Prefix
 	interfaces func() ([]net.Interface, error)
 	addrs      func(net.Interface) ([]net.Addr, error)
 	pf         func(context.Context, ...string) ([]byte, error)
 	container  func(context.Context, ...string) ([]byte, error)
+	// run executes a fixed system tool (route, sysctl).
+	run func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// mu serializes requests with the background host table refresh.
+	mu sync.Mutex
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -73,27 +88,36 @@ func NewServer(cfg Config) (*Server, error) {
 	if err != nil || len(rawHash) != sha256.Size {
 		return nil, fmt.Errorf("root-configured PF main rules SHA-256 is required")
 	}
+	deny4, deny6, err := egress.Deny(cfg.DenyCIDRs)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.EgressInterface != "" && !validEgress(cfg.EgressInterface) {
+		return nil, fmt.Errorf("egress interface %q must be a Mac interface name other than a bridge or loopback", cfg.EgressInterface)
+	}
 	cfg.Slots = append([]Slot(nil), cfg.Slots...)
-	s := &Server{config: cfg, interfaces: net.Interfaces,
+	cfg.DenyCIDRs = append([]netip.Prefix(nil), cfg.DenyCIDRs...)
+	s := &Server{config: cfg, deny: append(deny4, deny6...), interfaces: net.Interfaces,
 		addrs: func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }}
 	copy(s.mainHash[:], rawHash)
-	s.pf = s.runPF
+	s.pf = func(ctx context.Context, args ...string) ([]byte, error) { return runTool(ctx, "/sbin/pfctl", args...) }
 	s.container = s.runContainer
+	s.run = runTool
 	return s, nil
 }
 
-func (s *Server) runPF(ctx context.Context, args ...string) ([]byte, error) {
+func runTool(ctx context.Context, name string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/sbin/pfctl", args...)
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	out, err := cmd.Output()
 	if err != nil {
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
-			return nil, fmt.Errorf("pfctl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(exit.Stderr)))
+			return nil, fmt.Errorf("%s %s: %w: %s", filepath.Base(name), strings.Join(args, " "), err, strings.TrimSpace(string(exit.Stderr)))
 		}
-		return nil, fmt.Errorf("pfctl %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s %s: %w", filepath.Base(name), strings.Join(args, " "), err)
 	}
 	return out, nil
 }
@@ -170,69 +194,202 @@ func (s *Server) attested() ([]string, error) {
 // model relay port: the first slot's gateway. Gitmoot advertises a single
 // credential gateway URL whose certificate names one IP, so guests on other
 // slots reach it through their own gateway and the Mac delivers it locally.
-func (s *Server) relayAddress() string {
-	return s.config.Slots[0].Gateway.String()
+func (s *Server) relayAddress() netip.Addr {
+	return s.config.Slots[0].Gateway
 }
 
-// policy is the anchor text loaded for bridges, one per slot in slot order.
-func (s *Server) policy(bridges []string) string {
-	var rules strings.Builder
+func (s *Server) subnets() []netip.Prefix {
+	subnets := make([]netip.Prefix, len(s.config.Slots))
+	for i, slot := range s.config.Slots {
+		subnets[i] = slot.IPv4
+	}
+	return subnets
+}
+
+// policyFor is the anchor for bridges, one per slot in slot order. Every
+// slot has internet egress; render's per-slot deny-all mode is not wired to
+// sandboxes yet. host only fills the loaded host table: the readback does
+// not depend on it. guard adds the forwarding guard (guardForwarding).
+func (s *Server) policyFor(bridges []string, egress string, relayPort int, host []netip.Prefix, guard bool) pfPolicy {
+	slots := make([]slotRules, len(bridges))
 	for i, bridge := range bridges {
-		if s.config.ModelRelayPort != 0 {
-			rules.WriteString("pass in quick on " + bridge + " inet proto tcp from " + s.config.Slots[i].IPv4.String() +
-				" to " + s.relayAddress() + " port " + strconv.Itoa(s.config.ModelRelayPort) + "\n")
+		slots[i] = slotRules{Bridge: bridge, Subnet: s.config.Slots[i].IPv4, Internet: true}
+	}
+	return render(policyInput{Slots: slots, RelayAddr: s.relayAddress(), RelayPort: relayPort,
+		Egress: egress, Deny: s.deny, Host: host, GuardForwarding: guard})
+}
+
+// known reports whether the loaded anchor is, for bridges, one this helper
+// loads (any egress interface) or the deny-all anchor of helpers before
+// guest egress, with the relay off or on the configured port. Arm replaces
+// such an anchor in one pfctl transaction, so the bridges are never
+// unguarded; disarm clears it. Anything else stays.
+func (s *Server) known(bridges []string, filter, nat string) bool {
+	egress, ok := natEgress(nat)
+	if !ok {
+		return false
+	}
+	for _, port := range []int{0, s.config.ModelRelayPort} {
+		if nat == "" && filter == legacyFilter(bridges, s.relayAddress(), s.subnets(), port) {
+			return true
 		}
-		rules.WriteString("block in quick on " + bridge + " inet from any to any\n" +
-			"block in quick on " + bridge + " inet6 from any to any\n")
-	}
-	return rules.String()
-}
-
-// canonicalPolicy is pfctl's exact readback of policy(bridges).
-func (s *Server) canonicalPolicy(bridges []string) string {
-	return s.readback(bridges, s.config.ModelRelayPort)
-}
-
-// denyOnlyPolicy is pfctl's exact readback of what this helper loads for
-// bridges with the model relay off. Arm replaces it, so enabling the relay
-// after install needs no manual flush.
-func (s *Server) denyOnlyPolicy(bridges []string) string {
-	return s.readback(bridges, 0)
-}
-
-func (s *Server) readback(bridges []string, relayPort int) string {
-	lines := make([]string, 0, 3*len(bridges))
-	for i, bridge := range bridges {
-		if relayPort != 0 {
-			lines = append(lines, "pass in quick on "+bridge+" inet proto tcp from "+s.config.Slots[i].IPv4.String()+
-				" to "+s.relayAddress()+" port = "+strconv.Itoa(relayPort)+" flags S/SA keep state")
+		if egress != "" {
+			for _, guard := range []bool{true, false} {
+				if p := s.policyFor(bridges, egress, port, nil, guard); filter == p.Filter && nat == p.NAT {
+					return true
+				}
+			}
 		}
-		lines = append(lines, "block drop in quick on "+bridge+" inet all", "block drop in quick on "+bridge+" inet6 all")
 	}
-	return strings.Join(lines, "\n")
+	return false
 }
 
-// loadedBridges recovers the per-slot bridges named by an anchor in this
-// helper's shape. Callers still require an exact canonical match.
-func (s *Server) loadedBridges(rules string) ([]string, bool) {
-	perSlot := 2
-	if s.config.ModelRelayPort != 0 {
-		perSlot = 3
+// egressInterface is the interface guest traffic is NATed out of: the
+// configured one, or the Mac's default route interface at arm time.
+func (s *Server) egressInterface(ctx context.Context) (string, error) {
+	if s.config.EgressInterface != "" {
+		return s.config.EgressInterface, nil
 	}
-	lines := strings.Split(rules, "\n")
-	if len(lines) != perSlot*len(s.config.Slots) {
-		return nil, false
+	out, err := s.run(ctx, "/sbin/route", "-n", "get", "default")
+	if err != nil {
+		return "", fmt.Errorf("find the Mac's default route for guest NAT (or set --egress-interface): %w", err)
 	}
-	bridges := make([]string, len(s.config.Slots))
-	for i := range bridges {
-		bridge, prefixed := strings.CutPrefix(lines[(i+1)*perSlot-2], "block drop in quick on ")
-		bridge, suffixed := strings.CutSuffix(bridge, " inet all")
-		if !prefixed || !suffixed || !bridgeName.MatchString(bridge) {
-			return nil, false
+	for _, line := range strings.Split(string(out), "\n") {
+		if name, ok := strings.CutPrefix(strings.TrimSpace(line), "interface:"); ok {
+			name = strings.TrimSpace(name)
+			if !validEgress(name) {
+				return "", fmt.Errorf("the Mac's default route uses %q, not a NAT interface; set --egress-interface", name)
+			}
+			return name, nil
 		}
-		bridges[i] = bridge
 	}
-	return bridges, true
+	return "", fmt.Errorf("the Mac has no default route interface for guest NAT; set --egress-interface")
+}
+
+// hostAddrs is every IPv4 and IPv6 destination the Mac itself receives on:
+// each address on every interface (LAN, Tailscale, bridges, loopback,
+// public) as a single-address prefix, each IPv4 subnet's broadcast address,
+// 255.255.255.255 and IPv4 multicast. Guests are denied all of it; on every
+// other interface IPv4 may reach only it, so forwarding serves only guests.
+// IPv6 link-local addresses are scoped and left out: guest IPv6 is dropped
+// whole and the helper never enables IPv6 forwarding.
+func (s *Server) hostAddrs() ([]netip.Prefix, error) {
+	interfaces, err := s.interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("enumerate Mac interfaces: %w", err)
+	}
+	addrs := []netip.Prefix{netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("255.255.255.255/32")}
+	add := func(prefix netip.Prefix) {
+		if !slices.Contains(addrs, prefix) {
+			addrs = append(addrs, prefix)
+		}
+	}
+	for _, iface := range interfaces {
+		ifaceAddrs, err := s.addrs(iface)
+		if err != nil {
+			return nil, fmt.Errorf("read %s addresses: %w", iface.Name, err)
+		}
+		for _, addr := range ifaceAddrs {
+			prefix, err := netip.ParsePrefix(addr.String())
+			if err != nil {
+				continue
+			}
+			ip := prefix.Addr().Unmap()
+			if ip.Is6() && ip.IsLinkLocalUnicast() {
+				continue
+			}
+			add(netip.PrefixFrom(ip, ip.BitLen()))
+			if ip.Is4() && prefix.Bits() < 31 {
+				broadcast := prefix.Masked().Addr().As4()
+				for i := prefix.Bits(); i < 32; i++ {
+					broadcast[i/8] |= 0x80 >> (i % 8)
+				}
+				add(netip.PrefixFrom(netip.AddrFrom4(broadcast), 32))
+			}
+		}
+	}
+	slices.SortFunc(addrs, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return a.Bits() - b.Bits()
+	})
+	return addrs, nil
+}
+
+func (s *Server) table(ctx context.Context, name string) ([]netip.Prefix, error) {
+	out, err := s.pf(ctx, "-a", anchor, "-t", name, "-T", "show")
+	if err != nil {
+		return nil, err
+	}
+	prefixes, ok := parseTable(string(out))
+	if !ok {
+		return nil, fmt.Errorf("unreadable PF table %s: %q", name, truncate(string(out), 200))
+	}
+	return prefixes, nil
+}
+
+// constTablesExact reports whether the deny and guest tables hold exactly
+// the configured prefixes.
+func (s *Server) constTablesExact(ctx context.Context) (bool, error) {
+	for _, t := range []struct {
+		name string
+		want []netip.Prefix
+	}{{denyTable, s.deny}, {guestsTable, s.subnets()}} {
+		got, err := s.table(ctx, t.name)
+		if err != nil {
+			return false, err
+		}
+		if !samePrefixes(got, t.want) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// verifyTables requires the exact deny and guest tables and brings the host
+// table up to date: a new Mac address (DHCP, Tailscale) is denied to guests
+// within one check.
+func (s *Server) verifyTables(ctx context.Context) error {
+	exact, err := s.constTablesExact(ctx)
+	if err != nil {
+		return err
+	}
+	if !exact {
+		return fmt.Errorf("PF tables %s and %s do not hold exactly the configured prefixes", denyTable, guestsTable)
+	}
+	return s.syncHostTable(ctx)
+}
+
+// syncHostTable replaces the host table when the Mac's addresses changed.
+// The anchor's last rule only lets IPv4 in for the addresses in it, so a
+// stale table would also refuse the Mac's own new address.
+func (s *Server) syncHostTable(ctx context.Context) error {
+	want, err := s.hostAddrs()
+	if err != nil {
+		return err
+	}
+	got, err := s.table(ctx, hostTable)
+	if err != nil {
+		return err
+	}
+	if samePrefixes(got, want) {
+		return nil
+	}
+	args := []string{"-a", anchor, "-t", hostTable, "-T", "replace"}
+	for _, prefix := range want {
+		args = append(args, prefixText(prefix))
+	}
+	if _, err := s.pf(ctx, args...); err != nil {
+		return err
+	}
+	if got, err = s.table(ctx, hostTable); err != nil {
+		return err
+	}
+	if !samePrefixes(got, want) {
+		return fmt.Errorf("PF table %s does not hold the Mac's addresses after replace", hostTable)
+	}
+	return nil
 }
 
 func (s *Server) pfReady(ctx context.Context, bridges []string) error {
@@ -260,6 +417,13 @@ func (s *Server) pfReady(ctx context.Context, bridges []string) error {
 	if sha256.Sum256(main) != s.mainHash {
 		return fmt.Errorf("Mac PF main rules changed from the reviewed baseline")
 	}
+	nat, err := s.pf(ctx, "-sn")
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(nat), `nat-anchor "com.apple/*"`) {
+		return fmt.Errorf("Mac PF main rules do not call the helper's NAT anchor")
+	}
 	for _, bridge := range bridges {
 		iface, err := s.pf(ctx, "-s", "Interfaces", "-v", "-i", bridge)
 		if err != nil {
@@ -272,17 +436,22 @@ func (s *Server) pfReady(ctx context.Context, bridges []string) error {
 	return nil
 }
 
-func (s *Server) rules(ctx context.Context) (string, error) {
-	out, err := s.pf(ctx, "-a", anchor, "-sr")
-	if err != nil {
-		// macOS reports an anchor that has never been loaded as DIOCGETRULES.
-		// This is not accepted by Check; Arm may create it from root-owned rules.
-		if strings.Contains(err.Error(), "DIOCGETRULES: Invalid argument") {
-			return "", nil
+// loaded is the anchor's filter (-sr) and NAT (-sn) rules.
+func (s *Server) loaded(ctx context.Context) (filter, nat string, err error) {
+	var out [2]string
+	for i, show := range []string{"-sr", "-sn"} {
+		text, err := s.pf(ctx, "-a", anchor, show)
+		if err != nil {
+			// macOS reports an anchor that has never been loaded as DIOCGETRULES.
+			// This is not accepted by Check; Arm may create it from root-owned rules.
+			if strings.Contains(err.Error(), "DIOCGETRULES: Invalid argument") {
+				continue
+			}
+			return "", "", err
 		}
-		return "", err
+		out[i] = strings.TrimSpace(string(text))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out[0], out[1], nil
 }
 
 // check attests every slot and returns their bridges, comma-separated in slot order.
@@ -294,15 +463,27 @@ func (s *Server) check(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.pfReady(ctx, bridges); err != nil {
+	// reconcile runs pfReady first and turns off forwarding the helper owns
+	// if PF stopped enforcing the anchor.
+	if err := s.reconcile(ctx, bridges); err != nil {
 		return "", err
 	}
-	rules, err := s.rules(ctx)
+	filter, nat, err := s.loaded(ctx)
 	if err != nil {
 		return "", err
 	}
-	if rules != s.canonicalPolicy(bridges) {
-		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s; pfctl reports %q", strings.Join(bridges, ","), truncate(rules, 600))
+	guard, _, err := s.wantGuard(ctx)
+	if err != nil {
+		return "", err
+	}
+	egress, ok := natEgress(nat)
+	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, guard)
+	if !ok || filter != want.Filter || nat != want.NAT {
+		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s; pfctl reports %q and NAT %q",
+			strings.Join(bridges, ","), truncate(filter, 600), truncate(nat, 300))
+	}
+	if err := s.verifyTables(ctx); err != nil {
+		return "", err
 	}
 	return strings.Join(bridges, ","), nil
 }
@@ -321,49 +502,382 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err := s.pfReady(ctx, bridges); err != nil {
 		return "", err
 	}
-	rules, err := s.rules(ctx)
+	egress, err := s.egressInterface(ctx)
 	if err != nil {
 		return "", err
 	}
-	if rules == s.canonicalPolicy(bridges) {
-		return s.clearBridgeStates(ctx, bridges)
+	host, err := s.hostAddrs()
+	if err != nil {
+		return "", err
 	}
-	// The exact deny-only policy for these same bridges is what this helper
-	// loads with the relay off; the load below replaces it in one pfctl
-	// transaction, so the bridges are never unguarded. Anything else stays.
-	if rules != "" && rules != s.denyOnlyPolicy(bridges) {
+	if err := s.recordForwarding(ctx); err != nil {
+		return "", err
+	}
+	guard, reason, err := s.wantGuard(ctx)
+	if err != nil {
+		return "", err
+	}
+	if reason != "" {
+		log.Printf("no IPv4 forwarding guard: %s", reason)
+	}
+	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, host, guard)
+	filter, nat, err := s.loaded(ctx)
+	if err != nil {
+		return "", err
+	}
+	if filter == want.Filter && nat == want.NAT {
+		// The same rules with other deny prefixes (a changed --deny-cidr)
+		// are reloaded below.
+		if exact, err := s.constTablesExact(ctx); err == nil && exact {
+			return s.route(ctx, bridges)
+		}
+	}
+	if (filter != "" || nat != "") && !s.known(bridges, filter, nat) {
 		return "", fmt.Errorf("refusing to replace an unexpected firewall policy")
 	}
+	if err := s.load(ctx, want.Load); err != nil {
+		return "", err
+	}
+	return s.route(ctx, bridges)
+}
+
+// load replaces the anchor with text in one pfctl transaction.
+func (s *Server) load(ctx context.Context, text string) error {
 	file, err := os.CreateTemp(filepath.Dir(s.config.SocketPath), "policy-*.pf")
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer os.Remove(file.Name())
 	if err := file.Chmod(0o600); err != nil {
 		file.Close()
-		return "", err
+		return err
 	}
-	if _, err := io.WriteString(file, s.policy(bridges)); err != nil {
+	if _, err := io.WriteString(file, text); err != nil {
 		file.Close()
-		return "", err
+		return err
 	}
 	if err := file.Sync(); err != nil {
 		file.Close()
-		return "", err
+		return err
 	}
 	if err := file.Close(); err != nil {
-		return "", err
+		return err
 	}
 	// -o none: pfctl's default "basic" optimizer reorders rules on load, so
 	// with several slots the readback no longer matched the policy text and
 	// check refused it (seen on the Mac Studio with 3 slots, 2026-09-30).
 	if _, err := s.pf(ctx, "-a", anchor, "-o", "none", "-nf", file.Name()); err != nil {
+		return err
+	}
+	_, err = s.pf(ctx, "-a", anchor, "-o", "none", "-f", file.Name())
+	return err
+}
+
+// forwardingSysctl must be on for guest NAT, as Apple's own vmnet NAT
+// networks need.
+const forwardingSysctl = "net.inet.ip.forwarding"
+
+// forwardingState records the value forwarding had before this helper first
+// armed, so disarm restores it and the anchor knows whether to guard it. It
+// lives beside the socket under /var/run, which macOS clears at boot just
+// as it resets the sysctl.
+func (s *Server) forwardingState() string {
+	return filepath.Join(filepath.Dir(s.config.SocketPath), "ip-forwarding-before-arm")
+}
+
+// forwardingBefore is the recorded value, "0" or "1".
+func (s *Server) forwardingBefore() (string, error) {
+	data, err := os.ReadFile(s.forwardingState())
+	if err != nil {
 		return "", err
 	}
-	if _, err := s.pf(ctx, "-a", anchor, "-o", "none", "-f", file.Name()); err != nil {
+	before := strings.TrimSpace(string(data))
+	if before != "0" && before != "1" {
+		return "", fmt.Errorf("unreadable IPv4 forwarding state in %s", s.forwardingState())
+	}
+	return before, nil
+}
+
+func (s *Server) currentForwarding(ctx context.Context) (string, error) {
+	out, err := s.run(ctx, "/usr/sbin/sysctl", "-n", forwardingSysctl)
+	if err != nil {
+		return "", fmt.Errorf("read IPv4 forwarding: %w", err)
+	}
+	current := strings.TrimSpace(string(out))
+	if current != "0" && current != "1" {
+		return "", fmt.Errorf("unexpected %s value %q", forwardingSysctl, current)
+	}
+	return current, nil
+}
+
+// own records that the helper owns forwarding: it was off when guests
+// needed it, so the helper turns it on, guards it and restores it.
+func (s *Server) own() error {
+	if err := writeState(s.forwardingState(), "0\n"); err != nil {
+		return fmt.Errorf("record IPv4 forwarding before arm: %w", err)
+	}
+	return nil
+}
+
+// recordForwarding records forwarding's current value unless an earlier arm
+// (before a helper restart, too) already did. Forwarding that is off now is
+// the helper's from now on, even over an older record of 1.
+func (s *Server) recordForwarding(ctx context.Context) error {
+	current, err := s.currentForwarding(ctx)
+	if err != nil {
+		return err
+	}
+	if current == "0" {
+		return s.own()
+	}
+	if _, err := s.forwardingBefore(); errors.Is(err, os.ErrNotExist) {
+		if err := writeState(s.forwardingState(), "1\n"); err != nil {
+			return fmt.Errorf("record IPv4 forwarding before arm: %w", err)
+		}
+	}
+	return nil
+}
+
+// wantGuard reports whether the anchor must keep non-guest traffic from
+// being forwarded: only while the helper owns forwarding (record 0) and
+// there is no evidence of another forwarder. Forwarding the operator had on
+// (a Tailscale exit node, OrbStack) is left as it was, and so is a
+// forwarder that starts later (reason says which).
+func (s *Server) wantGuard(ctx context.Context) (guard bool, reason string, err error) {
+	before, err := s.forwardingBefore()
+	if err != nil {
+		return false, "", fmt.Errorf("no usable record of IPv4 forwarding before arm: %w", err)
+	}
+	if before == "1" {
+		return false, "", nil
+	}
+	reason = s.foreignForwarding(ctx)
+	return reason == "", reason, nil
+}
+
+// foreignForwarding names evidence of another IPv4 forwarder, or "": a NAT,
+// redirect or binat rule outside this helper's anchor, in the main ruleset
+// or in any anchor it calls, such as Apple's Internet Sharing and vmnet
+// shared (NAT) networks under com.apple. A bridge with an address proves
+// nothing (vmnet host-only networks have one too). When in doubt there is
+// no evidence: a needless guard costs another forwarder availability, a
+// missing guard makes the Mac a router. Unreadable anchors are logged.
+func (s *Server) foreignForwarding(ctx context.Context) string {
+	main, err := s.pf(ctx, "-sn")
+	if err != nil {
+		log.Printf("read PF NAT rules to look for other forwarders: %v", err)
+		return ""
+	}
+	var anchors []string
+	if reason := translation(string(main), "the main ruleset", &anchors); reason != "" {
+		return reason
+	}
+	var names []string
+	for _, name := range anchors {
+		base, wildcard := strings.CutSuffix(name, "/*")
+		if base != anchor && !slices.Contains(names, base) {
+			names = append(names, base)
+		}
+		if !wildcard {
+			continue
+		}
+		out, err := s.pf(ctx, "-a", base, "-v", "-s", "Anchors")
+		if err != nil {
+			log.Printf("list PF anchors under %s to look for other forwarders: %v", base, err)
+			continue
+		}
+		for _, line := range strings.Split(string(out), "\n") {
+			if child := strings.TrimSpace(line); child != "" && child != anchor && !slices.Contains(names, child) {
+				names = append(names, child)
+			}
+		}
+	}
+	for _, name := range names {
+		out, err := s.pf(ctx, "-a", name, "-sn")
+		if err != nil {
+			continue // an anchor with no NAT rules reports an error on macOS
+		}
+		if reason := translation(string(out), "anchor "+name, nil); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// translation names the first translation rule in pfctl -sn output, or "";
+// anchor calls go to anchors when it is not nil.
+func translation(out, where string, anchors *[]string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		kind, rest, _ := strings.Cut(line, " ")
+		switch kind {
+		case "nat-anchor", "rdr-anchor", "binat-anchor":
+			if name, _, ok := strings.Cut(strings.TrimPrefix(rest, `"`), `"`); ok && anchors != nil && !slices.Contains(*anchors, name) {
+				*anchors = append(*anchors, name)
+			}
+		case "nat", "rdr", "binat":
+			return "a PF translation rule in " + where + " (" + truncate(line, 120) + ")"
+		}
+	}
+	return ""
+}
+
+// enforcing requires PF to evaluate this helper's anchor for bridges: PF
+// enabled with the reviewed main ruleset calling it, and the anchor's
+// filter and NAT reading back as one of the shapes this helper loads.
+// Forwarding is turned on only while it holds.
+func (s *Server) enforcing(ctx context.Context, bridges []string) error {
+	if err := s.pfReady(ctx, bridges); err != nil {
+		return err
+	}
+	filter, nat, err := s.loaded(ctx)
+	if err != nil {
+		return err
+	}
+	if egress, ok := natEgress(nat); ok && egress != "" {
+		for _, guard := range []bool{true, false} {
+			if p := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, guard); filter == p.Filter && nat == p.NAT {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("the guest egress anchor is not loaded for %s", strings.Join(bridges, ","))
+}
+
+// stopUnenforced turns off forwarding the helper owns when PF no longer
+// enforces the anchor, so guests are never routed unfiltered. It returns
+// the enforcement error, or nil.
+func (s *Server) stopUnenforced(ctx context.Context, bridges []string) error {
+	unenforced := s.enforcing(ctx, bridges)
+	if unenforced == nil {
+		return nil
+	}
+	if before, err := s.forwardingBefore(); err == nil && before == "0" {
+		if current, err := s.currentForwarding(ctx); err == nil && current == "1" {
+			log.Printf("SECURITY: PF no longer enforces the guest egress anchor (%v); turning off IPv4 forwarding the helper turned on", unenforced)
+			if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
+				log.Printf("SECURITY: could not turn off IPv4 forwarding: %v", err)
+				return errors.Join(unenforced, err)
+			}
+		}
+	}
+	return unenforced
+}
+
+// enableForwarding turns forwarding on if it is off, only while PF enforces
+// the anchor for bridges.
+func (s *Server) enableForwarding(ctx context.Context, bridges []string) error {
+	current, err := s.currentForwarding(ctx)
+	if err != nil {
+		return err
+	}
+	if current == "1" {
+		return nil
+	}
+	if err := s.enforcing(ctx, bridges); err != nil {
+		return fmt.Errorf("not enabling IPv4 forwarding: %w", err)
+	}
+	if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=1"); err != nil {
+		return fmt.Errorf("enable IPv4 forwarding for guest NAT: %w", err)
+	}
+	return nil
+}
+
+// route turns on IPv4 forwarding once the anchor is loaded, then clears the
+// bridges' states and checks.
+func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
+	if err := s.enableForwarding(ctx, bridges); err != nil {
 		return "", err
 	}
 	return s.clearBridgeStates(ctx, bridges)
+}
+
+// reconcile keeps a loaded anchor of this helper's in step with forwarding
+// as it is now; arm decides first, then every check and the helper's own
+// refresh. If PF stops enforcing the anchor, forwarding the helper owns is
+// turned off and nothing else changes. Forwarding found off is the helper's
+// from then on: it is turned back on once the guard is loaded. Evidence of
+// another forwarder drops the guard and its leaving brings it back.
+func (s *Server) reconcile(ctx context.Context, bridges []string) error {
+	if err := s.stopUnenforced(ctx, bridges); err != nil {
+		return err
+	}
+	filter, nat, err := s.loaded(ctx)
+	if err != nil {
+		return err
+	}
+	egress, _ := natEgress(nat)
+	loadedGuard := filter == s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, true).Filter
+	current, err := s.currentForwarding(ctx)
+	if err != nil {
+		return err
+	}
+	if current == "0" {
+		if err := s.own(); err != nil {
+			return err
+		}
+	}
+	guard, reason, err := s.wantGuard(ctx)
+	if err != nil {
+		return err
+	}
+	if guard != loadedGuard {
+		host, err := s.hostAddrs()
+		if err != nil {
+			return err
+		}
+		if guard {
+			log.Printf("loading the IPv4 forwarding guard: the helper owns forwarding and no other forwarder is evident")
+		} else {
+			log.Printf("dropping the IPv4 forwarding guard: %s", reason)
+		}
+		if err := s.load(ctx, s.policyFor(bridges, egress, s.config.ModelRelayPort, host, guard).Load); err != nil {
+			return err
+		}
+	}
+	return s.enableForwarding(ctx, bridges)
+}
+
+// restoreForwarding turns forwarding off again if the helper owns it and
+// there is no evidence of another forwarder; if someone else had it on or
+// evidently uses it, it stays on.
+func (s *Server) restoreForwarding(ctx context.Context) error {
+	before, err := s.forwardingBefore()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if before == "0" {
+		if reason := s.foreignForwarding(ctx); reason != "" {
+			log.Printf("leaving IPv4 forwarding on: %s", reason)
+		} else if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
+			return fmt.Errorf("restore IPv4 forwarding: %w", err)
+		}
+	}
+	return os.Remove(s.forwardingState())
+}
+
+// writeState writes a root-only file by rename, so a crash never leaves it
+// partly written.
+func writeState(path, text string) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".state-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := io.WriteString(file, text); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
 }
 
 // Arm clears only states on the attested slot bridges. An old state can
@@ -390,25 +904,31 @@ func (s *Server) disarm(ctx context.Context) error {
 			return fmt.Errorf("refusing to clear PF while the bridge for sandbox network %s is present", s.config.Slots[i].Network)
 		}
 	}
-	rules, err := s.rules(ctx)
+	filter, nat, err := s.loaded(ctx)
 	if err != nil {
 		return err
 	}
-	if rules == "" {
-		return nil
+	if filter == "" && nat == "" {
+		return s.restoreForwarding(ctx)
 	}
-	loaded, ok := s.loadedBridges(rules)
-	if !ok || rules != s.canonicalPolicy(loaded) {
+	loaded, ok := filterBridges(filter, len(s.config.Slots))
+	if !ok || !s.known(loaded, filter, nat) {
 		return fmt.Errorf("refusing to clear an unexpected PF anchor")
 	}
-	if _, err := s.pf(ctx, "-a", anchor, "-F", "rules"); err != nil {
+	// Drained guests need no forwarding; turn it back off while the anchor
+	// still guards every interface.
+	if err := s.restoreForwarding(ctx); err != nil {
 		return err
 	}
-	remaining, err := s.rules(ctx)
-	if err != nil {
+	for _, what := range []string{"rules", "nat", "Tables"} {
+		if _, err := s.pf(ctx, "-a", anchor, "-F", what); err != nil {
+			return err
+		}
+	}
+	if filter, nat, err = s.loaded(ctx); err != nil {
 		return err
 	}
-	if remaining != "" {
+	if filter != "" || nat != "" {
 		return fmt.Errorf("firewall anchor is not empty after cleanup")
 	}
 	return nil
@@ -495,6 +1015,22 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		listener.Close()
 	}()
+	go func() {
+		// The Mac's addresses can change while sandboxd is down; keep the
+		// loaded host table current so the Mac stays reachable on them.
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				s.refresh(ctx)
+				s.mu.Unlock()
+			}
+		}
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -503,7 +1039,28 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			return err
 		}
+		s.mu.Lock()
 		s.handle(conn)
+		s.mu.Unlock()
+	}
+}
+
+// refresh runs while the anchor is loaded, also when sandboxd is down: it
+// reconciles forwarding and the guard while every slot bridge is up, and
+// keeps the host table current.
+func (s *Server) refresh(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	if _, err := s.table(ctx, hostTable); err != nil {
+		return
+	}
+	if bridges, err := s.discover(); err == nil && !slices.Contains(bridges, "") {
+		if err := s.reconcile(ctx, bridges); err != nil {
+			log.Printf("reconcile IPv4 forwarding: %v", err)
+		}
+	}
+	if err := s.syncHostTable(ctx); err != nil {
+		log.Printf("refresh PF table %s: %v", hostTable, err)
 	}
 }
 

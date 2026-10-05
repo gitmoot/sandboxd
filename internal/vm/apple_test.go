@@ -184,7 +184,7 @@ func TestAppleCreateExecAndBoundedCopy(t *testing.T) {
 		"network list --format json", "--network sandboxd-internal",
 		"--platform linux/arm64", "--cpus 2 --memory 512M",
 		"--read-only --mount type=volume,source=sandboxd-new,target=/home/user",
-		"--tmpfs /tmp:size=512M,mode=1777", "--uid 1000 --gid 1000",
+		"--tmpfs /tmp:size=512M,mode=1777", "--dns 1.1.1.1 --dns 8.8.8.8 --uid 1000 --gid 1000",
 		"exec --user 0:0 sandboxd-new /bin/chown 1000:1000 /home/user",
 		"exec --user 1000:1000 --workdir /tmp sandboxd-new /usr/bin/env -- X=value /bin/false -n",
 		"stats --format json --no-stream sandboxd-new",

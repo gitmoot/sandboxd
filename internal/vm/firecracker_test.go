@@ -22,6 +22,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/guestagent"
 )
 
@@ -667,6 +668,20 @@ func TestFirecrackerUsageFromCgroup(t *testing.T) {
 	}
 	if usage.MemoryUsedBytes != 300<<20 || usage.MemoryLimitBytes != 640<<20 || usage.CPUUsedPct <= 0 || usage.CPUUsedPct > 50 {
 		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+// The Firecracker tables deny exactly internal/egress's list, the one the
+// Mac PF helper loads (internal/firewall checks its side).
+func TestFirecrackerDeniesTheSharedEgressList(t *testing.T) {
+	extra := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("2001:db8::/32")}
+	d, _, _ := newTestFirecracker(t, func(c *FirecrackerConfig) { c.DenyCIDRs = extra })
+	deny4, deny6, err := egress.Deny(extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(d.deny4, prefixStrings(deny4)) || !slices.Equal(d.deny6, prefixStrings(deny6)) {
+		t.Fatalf("Firecracker deny sets %v %v are not internal/egress's", d.deny4, d.deny6)
 	}
 }
 

@@ -386,6 +386,105 @@ from a `vX.Y.Z` tag on `main`. Each release page lists the SHA-256 of
 `sandboxd-<tag>-darwin-arm64.tar.gz`, which holds `sandboxd` and
 `sandboxd-pf-helper`.
 
+### Guest egress
+
+Guests reach the public internet over IPv4, like E2B; the Linux worker does
+the same (docs/firecracker.md). The helper's anchor `com.apple/gitmoot-sandboxd`
+holds, in this order:
+
+- three tables: `<sandboxd_deny>` (const), the shared Go list in
+  `internal/egress` that the Firecracker driver also uses: `0/8, 10/8,
+  100.64/10` (CGNAT and Tailscale), `127/8, 168.63.129.16/32` (Azure
+  WireServer), `169.254/16, 172.16/12, 192.168/16, 224/3, ::/127,
+  ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8`, plus every
+  `--deny-cidr`; `<sandboxd_host>`, every destination the Mac itself
+  receives on: each address on every interface (LAN, Tailscale, loopback,
+  bridges, any public address), each IPv4 subnet's broadcast,
+  `255.255.255.255` and `224/4`. Each check and, while the anchor is loaded,
+  the helper itself every 5 s bring it up to date; `<sandboxd_guests>`
+  (const), the slot subnets;
+- one `nat on <egress> inet from <slot subnet> to any -> (<egress>)` per slot.
+  `<egress>` is `--egress-interface`, or the Mac's default route interface
+  when sandboxd arms (restart sandboxd after the default route moves);
+- per slot bridge: the model relay pass (if enabled) to the first slot's
+  gateway on its one port; block to `<sandboxd_deny>`; block to
+  `<sandboxd_host>`; pass from the slot's own subnet to anything else; block
+  all other IPv4 and all IPv6;
+- then, for every other interface: block anything for a guest subnet, and,
+  only while the helper guards forwarding (below), pass DHCP replies
+  (`udp` from port 67 to port 68, sent to an address the Mac does not have
+  yet) and then
+  `block in quick on ! lo0 inet from any to ! <sandboxd_host>`. Slot bridge
+  packets never get this far, so then the only IPv4 the Mac forwards is
+  guest NAT egress: a LAN, VPN or Tailscale host that uses the Mac as its
+  gateway is not routed anywhere, except for UDP from port 67 to port 68.
+
+So a guest never reaches private networks, the Mac (every port except the
+relay's, including its resolver) or another guest, in either direction.
+Guests use the public resolvers `1.1.1.1` and `8.8.8.8` (`container create
+--dns`). The check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock
+macOS has it), exact filter and NAT readback, and exact deny and guest tables.
+
+**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. The helper
+keeps a record in `/var/run/sandboxd-pf/ip-forwarding-before-arm` (beside
+the socket; macOS clears it at boot, when the sysctl resets too):
+
+- **`1`, the operator's forwarding:** forwarding was on at the first arm, for
+  example on a Tailscale exit node or subnet router, or with OrbStack or
+  Internet Sharing. The anchor has no catch-all, so that routing works
+  exactly as before; every guest rule and the block of other interfaces
+  reaching guest subnets stay. An exit-node or OrbStack Mac keeps working.
+- **`0`, the helper's forwarding:** forwarding was off when the helper
+  needed it, at the first arm or later (the operator stopped routing while
+  sandboxd ran; the next arm, check or refresh finds it off). From then on the
+  helper owns it: it records `0`, loads the catch-all, turns forwarding on and
+  restores it at disarm.
+
+While the helper owns forwarding, every arm, every check and the helper's
+own refresh (every 5 s while the anchor is loaded) look for evidence of
+another forwarder: a `nat`, `rdr` or `binat` rule in `pfctl -sn` outside
+the helper's anchor, in the main ruleset or in any anchor it calls, including
+every anchor under `com.apple` (`pfctl -a com.apple -v -s Anchors`, then
+`pfctl -a <anchor> -sn`), where Internet Sharing and vmnet shared (NAT)
+networks put their NAT. A bridge with an IPv4 address is not evidence:
+vmnet host-only networks have one too and forward nothing. With evidence
+the catch-all is dropped, and it comes back when the evidence goes; the
+helper logs each change. Check reloads the anchor in place, so sandboxd sees
+no gap. Disarm (sandboxd's clean shutdown, after its guests are gone) turns
+forwarding off if the record says `0` and there is no evidence, logs when it
+leaves it on, then removes the record. When in doubt (an anchor that cannot
+be read) the helper finds no evidence and keeps the guard: a needless guard
+only costs another forwarder availability, while a missing guard would make
+the Mac an unguarded router. IPv6 forwarding is never touched.
+
+Forwarding follows PF enforcement. The helper turns forwarding on only while
+PF is enabled, the reviewed main ruleset calls `com.apple/*` for filter and
+NAT, and the anchor's filter and NAT read back as one of its own shapes. If
+that stops holding (`pfctl -d`, a replaced main ruleset, a flushed anchor)
+while the helper owns forwarding, the next check or refresh turns forwarding
+off and logs a `SECURITY:` line; check also fails, so sandboxd stops guest
+work. Forwarding the operator had on (record `1`) is never turned off.
+
+Limits: a forwarder that leaves no translation rule (a VPN client relying on
+plain routing, a routing-only setup) is not detected. If it starts after the
+helper took forwarding, the catch-all drops its forwarded traffic, and disarm
+turns forwarding off. Turn forwarding on before starting `sandboxd` (record
+`1`) to keep such routing. The DHCP pass allows any UDP packet from port 67
+to port 68 through the Mac. The refresh reconciles only while every slot
+bridge is up; without them no guest can run.
+
+`internal/firewall/testdata/egress-3slot-forwarding-{off,on}.*` are the
+generated rulesets for the three-slot Mac. A per-slot deny-all mode exists in
+the generator for `allow_internet_access:false` (M4) but is not reachable
+from the API yet.
+
+Guest egress needs a new helper release: the owner installs it with
+`sudo sandboxd-helper-update`, then restarts `sandboxd`. Its first arm
+replaces the old deny-all anchor in one `pfctl` load. To add a deny prefix
+(e.g. a provider's metadata endpoint on a public address) or pin the NAT
+interface, rerun `install` with `--deny-cidr <prefix>` or
+`--egress-interface <if>`.
+
 ### First install
 
 Create the slot networks first (above). Open the release page in your own
@@ -409,7 +508,8 @@ the worker. It then:
   main ruleset. Compare the printed hash with the reviewed one, or pass
   `--main-rules-sha256 <hash>`; other flags: `--worker-id` (default
   `mac-local`), `--pin-image` (default the reviewed Alpine digest),
-  `--container-cli`, `--model-relay-port` (default `0`, deny-only);
+  `--container-cli`, `--model-relay-port` (default `0`, no relay exception),
+  `--deny-cidr` (repeatable) and `--egress-interface` (see Guest egress);
 - stops a helper started by hand from a Terminal
   (`/usr/local/libexec/sandboxd-pf-helper-<commit>`); that Terminal can be
   closed afterwards;
@@ -488,7 +588,11 @@ Stop it until the next boot with
 again with
 `sudo launchctl bootstrap system /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist`.
 Stop `sandboxd` first: without the helper its gate fails and it stops guests.
-To uninstall, stop it, then:
+A clean `sandboxd` stop disarms, which removes the anchor and restores IPv4
+forwarding (above); if `sudo pfctl -a com.apple/gitmoot-sandboxd -sr` still
+shows rules, `cat /var/run/sandboxd-pf/ip-forwarding-before-arm` and, if it
+says `0`, run `sudo sysctl -w net.inet.ip.forwarding=0` after flushing the
+anchor. To uninstall, stop it, then:
 
 ```sh
 sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \
