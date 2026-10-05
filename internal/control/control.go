@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"runtime"
@@ -43,10 +44,16 @@ type Config struct {
 	Arch string
 	// DriverName labels the local driver in capacity reports; "" means "local".
 	DriverName string
-	// Templates maps each additional servable template ID to the guest
-	// architecture it requires. The local TemplateID requires Arch. A worker
-	// is never scheduled a template it declares for another architecture.
-	Templates map[string]string
+	// Templates are the further operator-registered templates by ID: the
+	// architecture each requires, its profile and aliases, and the image the
+	// local worker serves it from, if any. The local TemplateID is a
+	// gitmoot-strict template requiring Arch. A worker is never scheduled a
+	// template it declares for another architecture.
+	Templates map[string]Template
+	// TokenSecret derives e2b-profile envd tokens (HMAC-SHA256 over the
+	// sandbox ID), so connect can return the same token again while the
+	// ledger keeps only its hash. Required with any e2b template.
+	TokenSecret []byte
 	// Workers are enrolled remote workers, in scheduling-preference order
 	// after the local worker.
 	Workers []Remote
@@ -64,7 +71,8 @@ type Service struct {
 	mu        sync.Mutex
 	ledger    *store.Store
 	cfg       Config
-	templates map[string]string // template ID -> required guest architecture
+	templates *registry
+	tokenKey  []byte
 	workers   []*member
 	byID      map[string]*member
 	// localMember is the gateway's own driver, nil for a gateway without one.
@@ -89,13 +97,8 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	if driver == nil && len(cfg.Workers) == 0 {
 		return nil, errors.New("sandbox control needs a local driver or an enrolled worker")
 	}
-	templates := make(map[string]string, len(cfg.Templates)+1)
-	for template, arch := range cfg.Templates {
-		if strings.TrimSpace(template) == "" || !validArch(arch) {
-			return nil, fmt.Errorf("template %q must name an arm64 or amd64 architecture", template)
-		}
-		templates[template] = arch
-	}
+	extra := maps.Clone(cfg.Templates)
+	primaryID, primaryImage, localArch := "", "", ""
 	var members []*member
 	if driver != nil {
 		if cfg.Arch == "" {
@@ -113,17 +116,33 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 				return nil, errors.New("sandbox network slots must be distinct and non-empty")
 			}
 		}
+		// The local template may also be registered (for its architecture
+		// only); it is always the gitmoot-strict primary.
+		if template, ok := extra[cfg.TemplateID]; ok {
+			if template.Arch != "" && template.Arch != cfg.Arch {
+				return nil, fmt.Errorf("template %q is registered for %s but the local worker runs %s", cfg.TemplateID, template.Arch, cfg.Arch)
+			}
+			if template.Image != "" && template.Image != cfg.Image || template.Profile != "" && template.Profile != ProfileStrict ||
+				len(template.Aliases) != 0 || template.EnvdVersion != "" {
+				return nil, fmt.Errorf("template %q is the local gitmoot-strict template; register only its architecture", cfg.TemplateID)
+			}
+			delete(extra, cfg.TemplateID)
+		}
+		primaryID, primaryImage, localArch = cfg.TemplateID, cfg.Image, cfg.Arch
 		decl := worker.Declaration{ID: cfg.WorkerID, Arch: cfg.Arch, Driver: cfg.DriverName,
-			Templates: map[string]string{cfg.TemplateID: cfg.Image}, CPUs: cfg.CPUs, MemoryMiB: cfg.MemoryMiB,
+			Templates: Declared(cfg.TemplateID, cfg.Image, extra), CPUs: cfg.CPUs, MemoryMiB: cfg.MemoryMiB,
 			MaxVMs: cfg.MaxVMs, Slots: slices.Clone(cfg.Slots)}
 		if err := decl.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid sandbox control configuration: %w", err)
 		}
-		if arch, ok := templates[cfg.TemplateID]; ok && arch != cfg.Arch {
-			return nil, fmt.Errorf("template %q is registered for %s but the local worker runs %s", cfg.TemplateID, arch, cfg.Arch)
-		}
-		templates[cfg.TemplateID] = cfg.Arch
 		members = append(members, newMember(cfg.WorkerID, worker.Local(driver, decl), true))
+	}
+	templates, err := newRegistry(primaryID, primaryImage, localArch, extra)
+	if err != nil {
+		return nil, err
+	}
+	if templates.e2b && len(cfg.TokenSecret) < 32 {
+		return nil, errNoTokenSecret
 	}
 	for _, remote := range cfg.Workers {
 		if remote.Member == nil || !validWorkerID(remote.ID) {
@@ -140,7 +159,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{ledger: ledger, cfg: cfg, templates: templates, workers: members, byID: make(map[string]*member, len(members)),
+	s := &Service{ledger: ledger, cfg: cfg, templates: templates, tokenKey: slices.Clone(cfg.TokenSecret), workers: members, byID: make(map[string]*member, len(members)),
 		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
 	for _, m := range members {
 		s.byID[m.id] = m
@@ -149,7 +168,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		}
 	}
 	s.cfg.APIKey = "" // never retain a second plaintext copy of the control key
-	s.cfg.Workers = nil
+	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret = nil, nil, nil
 	go s.sweep()
 	return s, nil
 }
@@ -287,7 +306,7 @@ func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serve) }
 func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 	keys := r.Header.Values("X-API-Key")
 	if len(keys) != 1 || subtle.ConstantTimeCompare(s.apiHash[:], hashKey(keys[0])) != 1 {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		s.fail(w, s.templates.sharedProfile(), http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	path := r.URL.Path
@@ -309,13 +328,28 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Without an e2b template the v2 create and connect routes do not exist,
+	// exactly as before profiles: every such request is the plain route miss.
+	if path == "/v2/sandboxes" && r.Method == http.MethodPost && s.templates.e2b {
+		s.createV2(w, r)
+		return
+	}
+	if rest, ok := strings.CutPrefix(path, "/v2/sandboxes/"); ok && s.templates.e2b {
+		id, action, _ := strings.Cut(rest, "/")
+		if validID(id) && action == "connect" && r.Method == http.MethodPost {
+			s.connect(w, r, id)
+			return
+		}
+		s.notFound(w, r)
+		return
+	}
 	if !strings.HasPrefix(path, "/sandboxes/") {
-		http.NotFound(w, r)
+		s.notFound(w, r)
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/sandboxes/"), "/")
 	if len(parts) < 1 || !validID(parts[0]) {
-		http.NotFound(w, r)
+		s.notFound(w, r)
 		return
 	}
 	id := parts[0]
@@ -338,7 +372,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		s.metrics(w, r, id)
 		return
 	}
-	http.NotFound(w, r)
+	s.notFound(w, r)
+}
+
+// notFound answers an unrouted path or malformed sandbox ID: the SDKs parse
+// the JSON error and treat a 404 kill as "already gone".
+func (s *Service) notFound(w http.ResponseWriter, r *http.Request) {
+	if s.templates.sharedProfile() != ProfileE2B {
+		http.NotFound(w, r)
+		return
+	}
+	s.fail(w, ProfileE2B, http.StatusNotFound, "not found")
 }
 
 func hashKey(key string) []byte {
@@ -401,8 +445,12 @@ func (s *Service) ttl(seconds int64) (time.Duration, bool) {
 }
 
 // sandbox is the complete list schema required by the pinned Gitmoot client.
+// ClientID, which the SDKs require, is set on e2b-profile sandboxes and, once
+// an e2b template is registered, on every listed one; gitmoot-strict
+// per-sandbox responses never change.
 type sandbox struct {
 	ID          string            `json:"sandboxID"`
+	ClientID    string            `json:"clientID,omitempty"`
 	TemplateID  string            `json:"templateID"`
 	StartedAt   time.Time         `json:"startedAt"`
 	EndAt       time.Time         `json:"endAt"`
@@ -422,9 +470,35 @@ func (s *Service) describe(row store.Row) sandbox {
 	if cpus == 0 || memory == 0 { // recorded before rows carried their VM shape
 		cpus, memory = s.cfg.CPUs, s.cfg.MemoryMiB
 	}
-	return sandbox{ID: row.ID, TemplateID: row.TemplateID, StartedAt: row.Started, EndAt: row.Ends,
+	described := sandbox{ID: row.ID, TemplateID: row.TemplateID, StartedAt: row.Started, EndAt: row.Ends,
 		CPUCount: cpus, MemoryMB: memory, DiskSizeMB: 10 * 1024,
-		State: "running", EnvdVersion: "sandboxd-1", Metadata: metadata, Domain: s.cfg.Domain}
+		State: "running", EnvdVersion: strictEnvdVersion, Metadata: metadata, Domain: s.cfg.Domain}
+	if template, ok := s.registered(row); ok && template.Profile == ProfileE2B {
+		described.EnvdVersion, described.ClientID = template.EnvdVersion, clientID
+	}
+	return described
+}
+
+// clientID is constant: E2B reports the serving node here, and sandboxd
+// never discloses worker identity to clients.
+const clientID = "sandboxd"
+
+// registered returns the template a row was admitted under while it is still
+// registered with the same profile.
+func (s *Service) registered(row store.Row) (*entry, bool) {
+	template, ok := s.templates.byID[row.TemplateID]
+	if !ok || template.Profile != rowProfile(row.Profile) {
+		return nil, false
+	}
+	return template, true
+}
+
+// servable reports whether row's enrolled worker still serves its template
+// from the row's image, and the template is still registered with the row's
+// profile. Callers hold s.mu.
+func (s *Service) servable(row store.Row, m *member) bool {
+	_, registered := s.registered(row)
+	return registered && m != nil && m.serves[row.TemplateID] == row.Image
 }
 
 func jsonResponse(w http.ResponseWriter, status int, value any) {
@@ -451,7 +525,8 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsupported sandbox request", http.StatusBadRequest)
 		return
 	}
-	if _, known := s.templates[request.TemplateID]; !known {
+	template, known := s.templates.lookup(request.TemplateID)
+	if !known || template.Profile != ProfileStrict {
 		http.Error(w, "unsupported sandbox request", http.StatusBadRequest)
 		return
 	}
@@ -460,10 +535,8 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid sandbox timeout", http.StatusBadRequest)
 		return
 	}
-	job := strings.TrimSpace(request.Metadata["job_id"])
-	attempt, attemptErr := strconv.ParseInt(request.Metadata["attempt"], 10, 64)
-	generation, generationErr := strconv.ParseInt(request.Metadata["lifecycle_generation"], 10, 64)
-	if job == "" || len(job) > 256 || attemptErr != nil || attempt < 1 || generationErr != nil || generation < 0 {
+	owner, ok := parseOwner(request.Metadata)
+	if !ok {
 		http.Error(w, "invalid sandbox owner metadata", http.StatusBadRequest)
 		return
 	}
@@ -484,32 +557,63 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	}
 	hash := sha256.Sum256([]byte(token))
 	started := time.Now().UTC()
-	row := store.Row{ID: "sandboxd-" + idBytes, TokenHash: hash[:], Metadata: string(metadata), JobID: job,
-		TemplateID: request.TemplateID, Attempt: attempt, Generation: generation, Fence: request.Metadata["daemon_fencing_token"],
-		Started: started, Ends: started.Add(ttl)}
-
-	reconcileCtx, cancel := context.WithTimeout(r.Context(), workerTimeout)
-	s.reconcileAll(reconcileCtx)
-	cancel()
-	s.mu.Lock()
-	m, spec, err := s.admit(r.Context(), &row)
-	if err != nil {
-		s.mu.Unlock()
+	row := store.Row{ID: "sandboxd-" + idBytes, TokenHash: hash[:], Metadata: string(metadata), JobID: owner.job,
+		TemplateID: template.ID, Profile: string(ProfileStrict), Attempt: owner.attempt, Generation: owner.generation,
+		Fence: request.Metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
+	if err := s.launch(r.Context(), &row); err != nil {
 		var refusal *refusal
-		switch {
-		case errors.As(err, &refusal):
+		if errors.As(err, &refusal) {
 			apiError(w, refusal.status, refusal.message)
-		default:
-			// Includes store.ErrLegacySlot: a live pre-slot row blocks admission
-			// until reconciliation proves it gone.
+		} else {
 			unavailable(w)
 		}
 		return
 	}
+	response := struct {
+		sandbox
+		EnvdAccessToken string `json:"envdAccessToken"`
+	}{sandbox: s.describe(row), EnvdAccessToken: token}
+	jsonResponse(w, http.StatusCreated, response)
+}
+
+// owner is the Gitmoot job fence carried in sandbox metadata.
+type owner struct {
+	job                 string
+	attempt, generation int64
+}
+
+func parseOwner(metadata map[string]string) (owner, bool) {
+	job := strings.TrimSpace(metadata["job_id"])
+	attempt, attemptErr := strconv.ParseInt(metadata["attempt"], 10, 64)
+	generation, generationErr := strconv.ParseInt(metadata["lifecycle_generation"], 10, 64)
+	if job == "" || len(job) > 256 || attemptErr != nil || attempt < 1 || generationErr != nil || generation < 0 {
+		return owner{}, false
+	}
+	return owner{job: job, attempt: attempt, generation: generation}, true
+}
+
+// errLaunch is a failed or unproven VM start; its reservation stays held
+// until reconciliation proves the VM absent.
+var errLaunch = errors.New("sandbox VM start failed or unproven")
+
+// launch schedules row onto a worker, starts its VM and marks it running.
+// It returns a *refusal for a request no worker can take, or another error
+// for an unavailable state (store.ErrLegacySlot included: a live pre-slot
+// row blocks admission until reconciliation proves it gone).
+func (s *Service) launch(ctx context.Context, row *store.Row) error {
+	reconcileCtx, cancel := context.WithTimeout(ctx, workerTimeout)
+	s.reconcileAll(reconcileCtx)
+	cancel()
+	s.mu.Lock()
+	m, spec, err := s.admit(ctx, row)
+	if err != nil {
+		s.mu.Unlock()
+		return err
+	}
 	s.markBusy(row.ID)
 	s.mu.Unlock()
 
-	createCtx, cancel := context.WithTimeout(r.Context(), workerSlowTimeout)
+	createCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
 	instance, err := m.api.CreateUntil(createCtx, spec, row.Ends)
 	cancel()
 	if errors.Is(err, worker.ErrStaleLease) {
@@ -526,38 +630,44 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
 		_ = s.ledger.SetState(context.Background(), row.ID, "unknown")
-		unavailable(w)
-		return
+		return errLaunch
 	}
 	if err := s.ledger.SetState(context.Background(), row.ID, "running"); err != nil {
-		unavailable(w)
-		return
+		return err
 	}
 	row.State = "running"
-	response := struct {
-		sandbox
-		EnvdAccessToken string `json:"envdAccessToken"`
-	}{sandbox: s.describe(row), EnvdAccessToken: token}
-	jsonResponse(w, http.StatusCreated, response)
+	return nil
 }
 
+// list serves one inventory view across profiles. A gitmoot-strict row keeps
+// the completeness rule: if its online worker cannot describe it, the
+// response it would belong to is a 503, never a short success. An e2b-profile
+// row never makes a list fail; one that is not running or no longer servable
+// is simply not listed.
 func (s *Service) list(w http.ResponseWriter, r *http.Request) {
+	shared := s.templates.sharedProfile()
+	query := r.URL.Query()
 	limit := 100
-	if values, ok := r.URL.Query()["limit"]; ok {
+	if values, ok := query["limit"]; ok {
 		if len(values) != 1 {
-			http.Error(w, "invalid page limit", http.StatusBadRequest)
+			s.fail(w, shared, http.StatusBadRequest, "invalid page limit")
 			return
 		}
 		parsed, err := strconv.Atoi(values[0])
 		if err != nil || parsed < 1 || parsed > 100 {
-			http.Error(w, "invalid page limit", http.StatusBadRequest)
+			s.fail(w, shared, http.StatusBadRequest, "invalid page limit")
 			return
 		}
 		limit = parsed
 	}
-	token := r.URL.Query().Get("nextToken")
-	if _, ok := r.URL.Query()["nextToken"]; ok && !validID(token) {
-		http.Error(w, "invalid next token", http.StatusBadRequest)
+	token := query.Get("nextToken")
+	if _, ok := query["nextToken"]; ok && !validID(token) {
+		s.fail(w, shared, http.StatusBadRequest, "invalid next token")
+		return
+	}
+	filter, err := parseListFilter(query, s.templates)
+	if err != nil {
+		s.fail(w, shared, http.StatusBadRequest, err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), workerTimeout)
@@ -573,43 +683,62 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	}
 	// With no worker observed there is no inventory at all, only guesses.
 	if len(offline) == len(s.workers) {
-		unavailable(w)
+		s.fail(w, shared, http.StatusServiceUnavailable, "sandbox state unavailable")
 		return
 	}
 	rows, err := s.ledger.Active(r.Context())
 	if err != nil {
-		unavailable(w)
+		s.fail(w, shared, http.StatusServiceUnavailable, "sandbox state unavailable")
 		return
 	}
 	// A worker that is no longer enrolled is reported like an offline one.
 	offline = append(offline, s.unenrolled(rows)...)
 	result := make([]sandbox, 0, len(rows))
 	for _, row := range rows {
-		if s.busy[row.ID] != nil {
+		if s.busy[row.ID] != nil || !filter.matches(row) {
 			continue // Create or Destroy in flight: not yet, or no longer, a sandbox.
 		}
+		strict := rowProfile(row.Profile) == ProfileStrict
 		m := s.byID[row.WorkerID]
 		if m == nil || !m.online {
 			// The worker's last known running sandboxes stay listed: an offline
 			// or removed worker neither strands nor silently drops them. The
 			// header below says this part of the inventory is unconfirmed.
-			if row.State == "running" {
+			if _, registered := s.registered(row); row.State == "running" && (strict || registered) {
 				result = append(result, s.describe(row))
 			}
 			continue
 		}
-		if row.State != "running" || m.serves[row.TemplateID] != row.Image {
-			unavailable(w)
-			return
+		if row.State != "running" || !s.servable(row, m) {
+			if strict {
+				s.fail(w, shared, http.StatusServiceUnavailable, "sandbox state unavailable")
+				return
+			}
+			continue
 		}
 		result = append(result, s.describe(row))
 	}
-	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	if s.templates.e2b {
+		// SDK list parsing requires clientID on every item.
+		for i := range result {
+			result[i].ClientID = clientID
+		}
+	}
+	before, byID := s.listOrder(filter.order)
+	sort.Slice(result, func(i, j int) bool { return before(result[i], result[j]) })
 	if len(offline) > 0 {
 		w.Header().Set("X-Sandboxd-Offline-Workers", strings.Join(offline, ","))
 	}
 	w.Header().Set("X-Total-Running", strconv.Itoa(len(result)))
-	start := sort.Search(len(result), func(i int) bool { return result[i].ID > token })
+	start := 0
+	if token != "" {
+		cursor, err := s.cursor(r.Context(), token, byID, result)
+		if err != nil {
+			s.fail(w, shared, http.StatusBadRequest, "invalid next token")
+			return
+		}
+		start = sort.Search(len(result), func(i int) bool { return before(cursor, result[i]) })
+	}
 	page := result[start:]
 	if len(page) > limit {
 		page = page[:limit]
@@ -645,7 +774,7 @@ func (s *Service) live(ctx context.Context, id string) (store.Row, *member, erro
 	if released(row) {
 		return store.Row{}, nil, sql.ErrNoRows
 	}
-	if row.State != "running" || s.busy[id] != nil || m.serves[row.TemplateID] != row.Image {
+	if row.State != "running" || s.busy[id] != nil || !s.servable(row, m) {
 		return store.Row{}, nil, errors.New("sandbox not running")
 	}
 	if row, m, err = s.owned(ctx, id); err != nil {
@@ -668,7 +797,7 @@ func statusFor(err error) int {
 func (s *Service) get(w http.ResponseWriter, r *http.Request, id string) {
 	row, _, err := s.live(r.Context(), id)
 	if err != nil {
-		http.Error(w, "sandbox unavailable", statusFor(err))
+		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
 		return
 	}
 	jsonResponse(w, http.StatusOK, s.describe(row))
@@ -677,42 +806,63 @@ func (s *Service) get(w http.ResponseWriter, r *http.Request, id string) {
 func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 	var request timeoutRequest
 	if !readJSON(w, r, &request) {
-		http.Error(w, "invalid timeout", http.StatusBadRequest)
+		s.fail(w, s.profileOf(r.Context(), id), http.StatusBadRequest, "invalid timeout")
 		return
 	}
 	ttl, ok := s.ttl(request.Timeout)
 	if !ok {
-		http.Error(w, "invalid timeout", http.StatusBadRequest)
+		s.fail(w, s.profileOf(r.Context(), id), http.StatusBadRequest, "invalid timeout")
 		return
 	}
-	_, m, err := s.live(r.Context(), id)
+	row, m, err := s.live(r.Context(), id)
 	if err != nil {
-		http.Error(w, "sandbox unavailable", statusFor(err))
+		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
 		return
 	}
-	ends := time.Now().UTC().Add(ttl)
-	// The worker enforces end times on its own; it must learn the new one
-	// before the ledger promises it. m.expiry keeps a concurrent
-	// reconciliation from re-sending the older end time; it is held only for
-	// this one bounded call, never across the worker's reconciliation.
-	ctx, cancel := context.WithTimeout(r.Context(), workerTimeout)
-	defer cancel()
-	if err := m.expiry.lock(ctx); err != nil {
-		unavailable(w)
-		return
-	}
-	defer m.expiry.unlock()
-	if err := m.api.Expire(ctx, id, ends); err != nil {
-		unavailable(w)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.ledger.Extend(r.Context(), id, ends); err != nil {
-		unavailable(w)
+	if err := s.extend(r.Context(), id, m, time.Now().UTC().Add(ttl), false); err != nil {
+		s.fail(w, rowProfile(row.Profile), http.StatusServiceUnavailable, "sandbox state unavailable")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// extend sets a live sandbox's end time. The worker enforces end times on its
+// own; it must learn the new one before the ledger promises it. m.expiry keeps
+// a concurrent reconciliation from re-sending the older end time; it is held
+// only for this one bounded call, never across the worker's reconciliation.
+//
+// With onlyLater (connect), the end time only ever moves later: every end
+// time update for m's sandboxes holds m.expiry, so the ledger's end time read
+// under it is current, and neither the worker nor the ledger is sent an
+// earlier one by a caller that read the row before a concurrent extension.
+// Without it (set_timeout) the end time is set as asked, as on E2B.
+func (s *Service) extend(ctx context.Context, id string, m *member, ends time.Time, onlyLater bool) error {
+	callCtx, cancel := context.WithTimeout(ctx, workerTimeout)
+	defer cancel()
+	if err := m.expiry.lock(callCtx); err != nil {
+		return err
+	}
+	defer m.expiry.unlock()
+	if onlyLater {
+		s.mu.Lock()
+		row, err := s.ledger.Get(ctx, id)
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !ends.After(row.Ends) {
+			return nil
+		}
+	}
+	if err := m.api.Expire(callCtx, id, ends); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if onlyLater {
+		return s.ledger.ExtendAtLeast(ctx, id, ends)
+	}
+	return s.ledger.Extend(ctx, id, ends)
 }
 
 // delete confirms teardown through the sandbox's own worker. An offline
@@ -723,12 +873,21 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 	m := s.byID[row.WorkerID]
 	s.mu.Unlock()
 	if err != nil {
-		http.Error(w, "sandbox unavailable", statusFor(err))
+		s.fail(w, s.templates.sharedProfile(), statusFor(err), "sandbox unavailable")
 		return
 	}
+	profile := rowProfile(row.Profile)
 	if released(row) {
+		if profile == ProfileE2B {
+			// E2B reports an already-killed sandbox as not found.
+			s.fail(w, profile, http.StatusNotFound, "sandbox not found")
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
+	}
+	unavailable := func(w http.ResponseWriter) {
+		s.fail(w, profile, http.StatusServiceUnavailable, "sandbox state unavailable")
 	}
 	if m == nil {
 		unavailable(w)
@@ -796,7 +955,11 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 func (s *Service) metrics(w http.ResponseWriter, r *http.Request, id string) {
 	row, m, err := s.live(r.Context(), id)
 	if err != nil {
-		http.Error(w, "sandbox unavailable", statusFor(err))
+		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
+		return
+	}
+	if rowProfile(row.Profile) == ProfileE2B {
+		s.metricsE2B(w, r, row, m)
 		return
 	}
 	usageCtx, cancel := context.WithTimeout(r.Context(), workerTimeout)

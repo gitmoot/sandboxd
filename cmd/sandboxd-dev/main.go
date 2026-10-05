@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -44,7 +45,10 @@ func run(ctx context.Context, args []string) (runErr error) {
 	database := flags.String("db", "", "SQLite ledger path")
 	keyFile := flags.String("api-key-file", "", "0600 file containing the test API key")
 	stateDir := flags.String("state-dir", "", "absent or empty directory for guest process trees")
-	template := flags.String("template", "base", "accepted template identifier")
+	template := flags.String("template", "review-arm64", "primary gitmoot-strict template identifier")
+	registered := control.TemplateFlags{FixedImage: devImage}
+	flags.Var(&registered, "register-template", "repeatable template: id=<id>,profile=gitmoot-strict|e2b[,alias=<name>]...[,envd-version=X.Y.Z]; the image is always the dev image")
+	tokenSecretFile := flags.String("token-secret-file", "", "0600 file deriving e2b envd tokens; default: a random secret for this process")
 	domain := flags.String("domain", "", "sandbox DNS domain reported to clients")
 	gatewayHost := flags.String("gateway-host", "127.0.0.1", "host name for header-routed guest traffic")
 	maxVMs := flags.Int("max-vms", 4, "maximum concurrent guests")
@@ -71,6 +75,14 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
+	tokenSecret := make([]byte, 32)
+	if *tokenSecretFile != "" {
+		if tokenSecret, err = control.ReadTokenSecret(*tokenSecretFile); err != nil {
+			return err
+		}
+	} else if _, err := rand.Read(tokenSecret); err != nil {
+		return err
+	}
 	root, err := filepath.Abs(*stateDir)
 	if err != nil {
 		return err
@@ -91,7 +103,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	service, err := control.Open(ctx, *database, driver, control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: devImage, Domain: *domain, WorkerID: "sandboxd-devvm",
 		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slots,
-		DriverName: "devvm",
+		DriverName: "devvm", Templates: registered.Templates, TokenSecret: tokenSecret,
 	})
 	if err != nil {
 		return err

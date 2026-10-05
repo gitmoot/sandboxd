@@ -68,7 +68,7 @@ func TestWorkerDeclaresItsRealDriverAndArchitecture(t *testing.T) {
 		{"firecracker", "amd64", "/var/lib/sandboxd-fc/images/review-amd64.ext4"},
 		{"apple", "arm64", "linux-arm64"},
 	} {
-		decl := workerDeclaration(tc.driver, "worker-1", "review", tc.image, 2, 1024, 1, []string{"sbx0"})
+		decl := workerDeclaration(tc.driver, "worker-1", map[string]string{"review": tc.image}, 2, 1024, 1, []string{"sbx0"})
 		if decl.Arch != tc.arch || decl.Driver != tc.driver || decl.Templates["review"] != tc.image || decl.Validate() != nil {
 			t.Fatalf("%s worker declared %+v (%v)", tc.driver, decl, decl.Validate())
 		}
@@ -92,8 +92,8 @@ func TestRequiredFlagsPerModeAndDriver(t *testing.T) {
 		// An apple worker still needs its PF helper and bridge pin.
 		{[]string{"-image", "linux-arm64", "-template", "t", "-worker-id", "mac-1", "-worker-key-file", key}, "plus pin-image and pf-socket for the apple driver"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-template", "t", "-worker-key-file", key}, "worker-id are required"},
-		{append([]string{"-enroll", "id=x,url=https://h,key-file=" + key}, fcWorker...), "cannot enroll workers"},
-		{[]string{"-driver", "none", "-worker-key-file", key}, "cannot enroll workers"},
+		{append([]string{"-enroll", "id=x,url=https://h,key-file=" + key}, fcWorker...), "takes no -enroll, -template-arch or -token-secret-file"},
+		{[]string{"-driver", "none", "-worker-key-file", key}, "takes no -enroll, -template-arch or -token-secret-file"},
 		// A gateway still needs its database, API key, domain and gateway host.
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-template", "t", "-worker-id", "linux-1"}, "also needs db, api-key-file, domain and gateway-host"},
 		// A gateway with no local VMs needs workers to schedule onto.

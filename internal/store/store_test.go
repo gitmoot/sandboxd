@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -128,5 +129,37 @@ func TestLegacyLedgerPreservesUnknownWorkerAndCapacity(t *testing.T) {
 		Started: time.Now(), Ends: time.Now().Add(time.Minute)}
 	if _, err := ledger.Reserve(ctx, newRow, 2, []string{"slot-1", "slot-2"}); !errors.Is(err, ErrLegacySlot) {
 		t.Fatalf("migration released an unconfirmed old VM: %v", err)
+	}
+}
+
+func TestExtendAtLeastNeverShortens(t *testing.T) {
+	ledger, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ledger.Close()
+	now := time.Now().UTC()
+	row := Row{ID: "sandboxd-" + strings.Repeat("c", 32), TokenHash: make([]byte, 32), Metadata: "{}", TemplateID: "t", Image: "i",
+		WorkerID: "w", Started: now, Ends: now.Add(time.Minute)}
+	if _, err := ledger.Reserve(context.Background(), row, 1, []string{"slot"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.SetState(context.Background(), row.ID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	later, earlier := now.Add(time.Hour), now.Add(30*time.Minute)
+	for _, end := range []time.Time{later, earlier} {
+		if err := ledger.ExtendAtLeast(context.Background(), row.ID, end); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, err := ledger.Get(context.Background(), row.ID); err != nil || !got.Ends.Equal(later) {
+		t.Fatalf("ends %v %v, want %v", got.Ends, err, later)
+	}
+	if err := ledger.Extend(context.Background(), row.ID, earlier); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ledger.Get(context.Background(), row.ID); err != nil || !got.Ends.Equal(earlier) {
+		t.Fatalf("explicit Extend: ends %v %v, want %v", got.Ends, err, earlier)
 	}
 }

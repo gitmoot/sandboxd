@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -361,20 +362,62 @@ func (d *Driver) Usage(ctx context.Context, id string) (vm.Usage, error) {
 		ticks = second.ticks - first.ticks
 	}
 	elapsed := time.Since(started).Seconds()
+	diskUsed, err := allocatedBytes(g.home)
+	if err != nil {
+		return vm.Usage{}, err
+	}
+	var volume syscall.Statfs_t
+	if err := syscall.Statfs(g.home, &volume); err != nil {
+		return vm.Usage{}, err
+	}
 	return vm.Usage{
 		CPUUsedPct:       float64(ticks) / userHZ / elapsed * 100,
 		MemoryUsedBytes:  second.rssBytes,
 		MemoryLimitBytes: uint64(g.memoryMiB) << 20,
+		Detailed:         true,
+		MemoryCacheBytes: second.fileBytes,
+		DiskUsedBytes:    diskUsed,
+		DiskTotalBytes:   volume.Blocks * uint64(volume.Bsize),
 	}, nil
+}
+
+// allocatedBytes sums the allocated blocks of everything under root without
+// following symlinks. Entries removed during the walk are skipped.
+func allocatedBytes(root string) (uint64, error) {
+	var total uint64
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Blocks > 0 {
+			total += uint64(stat.Blocks) * 512
+		}
+		return nil
+	})
+	return total, err
 }
 
 type groupSample struct {
 	ticks    uint64
 	rssBytes uint64
+	// fileBytes is resident file-backed memory (statm "shared"), the guest's
+	// share of the page cache.
+	fileBytes uint64
 }
 
-// sampleGroup sums utime+stime and RSS of live processes in process group
-// pgid. Processes that exit between listing and reading are skipped.
+// sampleGroup sums utime+stime, RSS and resident file-backed pages of live
+// processes in process group pgid. Processes that exit between listing and
+// reading are skipped.
 func sampleGroup(pgid int) (groupSample, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -396,6 +439,13 @@ func sampleGroup(pgid int) (groupSample, error) {
 		}
 		sample.ticks += fields.utime + fields.stime
 		sample.rssBytes += fields.rssPages * page
+		if statm, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "statm")); err == nil {
+			if values := strings.Fields(string(statm)); len(values) >= 3 {
+				if shared, err := strconv.ParseUint(values[2], 10, 64); err == nil {
+					sample.fileBytes += shared * page
+				}
+			}
+		}
 	}
 	return sample, nil
 }

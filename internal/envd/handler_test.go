@@ -138,6 +138,28 @@ func TestGuestUploadRequiresCapabilityAndConfinedPath(t *testing.T) {
 	}
 }
 
+func TestGuestHealthReportsOnlyLiveAuthorizedSandboxes(t *testing.T) {
+	h := &Handler{Driver: &guestFixture{}, Authorizer: allowedSandbox{}, GatewayHost: "mac.private.test"}
+	routes := Routes(h, http.NotFoundHandler())
+	health := func(token string) int {
+		r := httptest.NewRequest(http.MethodGet, "http://mac.private.test/health", nil)
+		r.Header.Set("E2b-Sandbox-Id", "sandboxd-a1")
+		r.Header.Set("E2b-Sandbox-Port", "49983")
+		r.Header.Set("X-Access-Token", token)
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		return w.Code
+	}
+	if got := health("job-capability"); got != http.StatusNoContent {
+		t.Fatalf("live sandbox health: %d", got)
+	}
+	// The SDKs read 502 as "not running"; a dead sandbox and a wrong token
+	// are indistinguishable.
+	if got := health("wrong"); got != http.StatusBadGateway {
+		t.Fatalf("unauthorized health: %d", got)
+	}
+}
+
 func TestGuestStartRejectsTruncatedFrame(t *testing.T) {
 	guest := &guestFixture{}
 	h := &Handler{Driver: guest, Authorizer: allowedSandbox{}, GatewayHost: "mac.private.test"}

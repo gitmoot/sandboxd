@@ -24,29 +24,29 @@ sandboxd. ⚪ means a cell has only such tests.
 
 | Area | Operation | Python e2b | JS e2b | Python code-interpreter | JS code-interpreter | Gitmoot client |
 | --- | --- | --- | --- | --- | --- | --- |
-| Control plane | `Sandbox.create` | ❌ 0/16 | ❌ 0/3 | — | — | — |
-| Control plane | `Sandbox.connect` | ❌ 0/10 (+8 offline) | ❌ 0/5 (+1 offline) | — | — | — |
-| Control plane | `Sandbox.kill` | ❌ 0/6 | ❌ 0/3 | — | — | — |
-| Control plane | `Sandbox.get_info` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| Control plane | `Sandbox.list` | ❌ 0/22 | ❌ 0/19 | — | — | — |
-| Control plane | `set_timeout` | ❌ 0/6 | ❌ 0/3 | — | — | — |
-| Control plane | `get_metrics` | ❌ 0/4 | ❌ 0/2 | — | — | — |
-| Control plane | secure envd access token | ❌ 0/4 | ❌ 0/2 (+3 offline) | — | — | — |
+| Control plane | `Sandbox.create` | 🟡 6/16 | 🟡 2/3 | — | — | — |
+| Control plane | `Sandbox.connect` | 🟡 6/10 (+8 offline) | 🟡 4/5 (+1 offline) | — | — | — |
+| Control plane | `Sandbox.kill` | ✅ 6/6 | ✅ 3/3 | — | — | — |
+| Control plane | `Sandbox.get_info` | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| Control plane | `Sandbox.list` | 🟡 16/22 | 🟡 13/19 | — | — | — |
+| Control plane | `set_timeout` | ✅ 6/6 | ✅ 3/3 | — | — | — |
+| Control plane | `get_metrics` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| Control plane | secure envd access token | ✅ 4/4 | ❌ 0/2 (+3 offline) | — | — | — |
 | Control plane | `get_host` / guest ports | ❌ 0/2 | ❌ 0/2 | — | — | — |
 | Control plane | pause, resume, snapshots | ❌ 0/28 | ❌ 0/23 (+8 offline) | — | — | — |
 | Control plane | lifecycle options (autoPause, onTimeout) | — | ❌ 0/12 (+13 offline) | — | — | — |
-| Control plane | `fork` | ❌ 0/8 | ❌ 0/4 | — | — | — |
-| Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | ❌ 0/33 (+27 offline) | — | — | — |
+| Control plane | `fork` | 🟡 2/8 | 🟡 1/4 | — | — | — |
+| Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | 🟡 1/33 (+27 offline) | — | — | — |
 | Control plane | IAM | — | ❌ 0/6 (+11 offline) | — | — | — |
 | Control plane | client config and request plumbing | ❌ 0/2 (+6 offline) | ❌ 0/11 (+58 offline) | — | — | — |
-| Commands | `commands.run` | ❌ 0/13 | ❌ 0/6 (+13 offline) | — | — | — |
-| Commands | `commands.run` envs | ❌ 0/8 | ❌ 0/3 | — | — | — |
-| Commands | `commands.connect` | ❌ 0/4 | ❌ 0/2 | — | — | — |
+| Commands | `commands.run` | ❌ 0/13 | ✅ 6/6 (+13 offline) | — | — | — |
+| Commands | `commands.run` envs | ❌ 0/8 | 🟡 2/3 | — | — | — |
+| Commands | `commands.connect` | ❌ 0/4 | 🟡 1/2 | — | — | — |
 | Commands | `commands.kill` | ❌ 0/4 | ❌ 0/2 | — | — | — |
 | Commands | `commands.list` | ❌ 0/2 | ❌ 0/1 | — | — | — |
 | Commands | `commands.send_stdin` | ❌ 0/12 | ❌ 0/7 | — | — | — |
 | Commands | sandbox killed during a command | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| Files | `files.write` | ❌ 0/20 | ❌ 0/12 | — | — | — |
+| Files | `files.write` | ❌ 0/20 | 🟡 1/12 | — | — | — |
 | Files | `files.read` | ❌ 0/18 | ❌ 0/6 | — | — | — |
 | Files | `files.list` | ❌ 0/10 | ❌ 0/5 | — | — | — |
 | Files | `files.exists` | ❌ 0/2 | ❌ 0/2 | — | — | — |
@@ -57,13 +57,13 @@ sandboxd. ⚪ means a cell has only such tests.
 | Files | `files.watch_dir` | ❌ 0/17 | ❌ 0/7 (+4 offline) | — | — | — |
 | Files | file metadata | ❌ 0/18 | ❌ 0/9 | — | — | — |
 | Files | content encoding (gzip) | ❌ 0/8 | ❌ 0/4 | — | — | — |
-| Files | signed upload/download URLs | ❌ 0/6 | ❌ 0/7 | — | — | — |
+| Files | signed upload/download URLs | ❌ 0/6 | 🟡 1/7 | — | — | — |
 | PTY | `pty.create` | ❌ 0/2 | ❌ 0/1 | — | — | — |
 | PTY | `pty.connect` | ❌ 0/2 | ❌ 0/1 | — | — | — |
 | PTY | `pty.kill` | ❌ 0/4 | ❌ 0/2 | — | — | — |
 | PTY | `pty.resize` | ❌ 0/2 | ❌ 0/1 | — | — | — |
 | PTY | `pty.send_input` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| Templates, volumes, secrets | template build API | ❌ 0/33 (+136 offline) | ❌ 0/56 (+28 offline) | — | — | — |
+| Templates, volumes, secrets | template build API | 🟡 2/33 (+136 offline) | ❌ 0/56 (+28 offline) | — | — | — |
 | Templates, volumes, secrets | volumes | ⚪ (+92 offline, 2 skip) | ❌ 0/52 (+4 offline, 1 skip) | — | — | — |
 | Templates, volumes, secrets | secrets | ⚪ (+30 offline) | ❌ 0/9 (+6 offline) | — | — | — |
 | Code interpreter | `run_code` | — | — | ❌ 0/10 (+5 offline) | ❌ 0/4 | — |
@@ -81,157 +81,59 @@ sandboxd. ⚪ means a cell has only such tests.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 1 pass against sandboxd, 621 pass offline,
-889 expected failures, 3 skipped.
+Totals: 96 pass against sandboxd, 621 pass offline,
+794 expected failures, 3 skipped.
 
 ## Expected failures
 
 Every test below fails today and is recorded as `fail` in `conformance/expected.json`.
 A later milestone turns a cell green by making these pass and recording them.
 
-<details><summary>Control plane: `Sandbox.create` (19)</summary>
+<details><summary>Control plane: `Sandbox.create` (11)</summary>
 
 - Python e2b: `async/sandbox_async/test_create.py::test_auto_pause_filesystem_only_reboots`
 - Python e2b: `async/sandbox_async/test_create.py::test_auto_pause_without_auto_resume_requires_connect`
 - Python e2b: `async/sandbox_async/test_create.py::test_auto_resume_wakes_on_http_request`
-- Python e2b: `async/sandbox_async/test_create.py::test_invalid_on_timeout_type_does_not_crash`
 - Python e2b: `async/sandbox_async/test_create.py::test_keep_memory_none_defaults_to_full_memory`
 - Python e2b: `async/sandbox_async/test_create.py::test_mcp_gateway_start_failure_kills_created_sandbox`
-- Python e2b: `async/sandbox_async/test_create.py::test_metadata`
-- Python e2b: `async/sandbox_async/test_create.py::test_start`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_auto_pause_filesystem_only_reboots`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_auto_pause_without_auto_resume_requires_connect`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_auto_resume_wakes_on_http_request`
-- Python e2b: `sync/sandbox_sync/test_create.py::test_invalid_on_timeout_type_does_not_crash`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_keep_memory_none_defaults_to_full_memory`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_mcp_gateway_start_failure_kills_created_sandbox`
-- Python e2b: `sync/sandbox_sync/test_create.py::test_metadata`
-- Python e2b: `sync/sandbox_sync/test_create.py::test_start`
 - JS e2b: `sandbox/create.test.ts > MCP gateway start failure kills the created sandbox`
-- JS e2b: `sandbox/create.test.ts > create`
-- JS e2b: `sandbox/create.test.ts > metadata`
 
 </details>
 
-<details><summary>Control plane: `Sandbox.connect` (15)</summary>
+<details><summary>Control plane: `Sandbox.connect` (5)</summary>
 
-- Python e2b: `async/sandbox_async/test_connect.py::test_connect`
-- Python e2b: `async/sandbox_async/test_connect.py::test_connect_extends_timeout_on_running_sandbox`
 - Python e2b: `async/sandbox_async/test_connect.py::test_connect_to_paused_sandbox_resumes`
 - Python e2b: `async/sandbox_async/test_connect.py::test_connect_with_secure`
-- Python e2b: `async/sandbox_async/test_connect.py::test_resume_does_not_shorten_timeout_on_running_sandbox`
-- Python e2b: `sync/sandbox_sync/test_connect.py::test_connect`
-- Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_extends_timeout_on_running_sandbox`
 - Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_to_paused_sandbox_resumes`
 - Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_with_secure`
-- Python e2b: `sync/sandbox_sync/test_connect.py::test_resume_does_not_shorten_timeout_on_running_sandbox`
-- JS e2b: `sandbox/connect.test.ts > connect`
-- JS e2b: `sandbox/connect.test.ts > connect does not shorten timeout on running sandbox`
-- JS e2b: `sandbox/connect.test.ts > connect extends timeout on running sandbox`
 - JS e2b: `sandbox/connect.test.ts > connect resumes paused sandbox`
-- JS e2b: `sandbox/connect.test.ts > connect to non-running sandbox`
 
 </details>
 
-<details><summary>Control plane: `Sandbox.kill` (9)</summary>
-
-- Python e2b: `async/api_async/test_sbx_kill.py::test_kill_existing_sandbox`
-- Python e2b: `async/api_async/test_sbx_kill.py::test_kill_non_existing_sandbox`
-- Python e2b: `async/sandbox_async/test_kill.py::test_kill`
-- Python e2b: `sync/api_sync/test_sbx_kill.py::test_kill_existing_sandbox`
-- Python e2b: `sync/api_sync/test_sbx_kill.py::test_kill_non_existing_sandbox`
-- Python e2b: `sync/sandbox_sync/test_kill.py::test_kill`
-- JS e2b: `api/kill.test.ts > kill existing sandbox`
-- JS e2b: `api/kill.test.ts > kill non-existing sandbox`
-- JS e2b: `sandbox/kill.test.ts > kill`
-
-</details>
-
-<details><summary>Control plane: `Sandbox.get_info` (3)</summary>
-
-- Python e2b: `async/api_async/test_sbx_info.py::test_get_info`
-- Python e2b: `sync/api_sync/test_sbx_info.py::test_get_info`
-- JS e2b: `api/info.test.ts > get sandbox info`
-
-</details>
-
-<details><summary>Control plane: `Sandbox.list` (41)</summary>
+<details><summary>Control plane: `Sandbox.list` (12)</summary>
 
 - Python e2b: `async/api_async/test_sbx_list.py::test_list_paused_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_running_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_sandboxes_started_after`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_sandboxes_with_filter`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_sandboxes_with_order`
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_sandboxes_with_template_filter`
-- Python e2b: `async/api_async/test_sbx_list.py::test_paginate_iterator`
 - Python e2b: `async/api_async/test_sbx_list.py::test_paginate_paused_sandboxes`
 - Python e2b: `async/api_async/test_sbx_list.py::test_paginate_running_and_paused_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_paginate_running_sandboxes`
 - Python e2b: `sync/api_sync/test_sbx_list.py::test_list_paused_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_running_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_sandboxes_started_after`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_sandboxes_with_filter`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_sandboxes_with_order`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_sandboxes_with_template_filter`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_iterator`
 - Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_paused_sandboxes`
 - Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_running_and_paused_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_running_sandboxes`
 - JS e2b: `api/list.test.ts > list paused sandboxes`
 - JS e2b: `api/list.test.ts > list paused sandboxes #2`
-- JS e2b: `api/list.test.ts > list running sandboxes`
-- JS e2b: `api/list.test.ts > list running sandboxes #2`
-- JS e2b: `api/list.test.ts > list sandboxes`
-- JS e2b: `api/list.test.ts > list sandboxes #2`
-- JS e2b: `api/list.test.ts > list sandboxes started after`
-- JS e2b: `api/list.test.ts > list sandboxes with filter`
-- JS e2b: `api/list.test.ts > list sandboxes with filter #2`
-- JS e2b: `api/list.test.ts > list sandboxes with order`
-- JS e2b: `api/list.test.ts > list sandboxes with template filter`
-- JS e2b: `api/list.test.ts > paginate iterator`
-- JS e2b: `api/list.test.ts > paginate iterator #2`
 - JS e2b: `api/list.test.ts > paginate paused sandboxes`
 - JS e2b: `api/list.test.ts > paginate paused sandboxes #2`
 - JS e2b: `api/list.test.ts > paginate running and paused sandboxes`
 - JS e2b: `api/list.test.ts > paginate running and paused sandboxes #2`
-- JS e2b: `api/list.test.ts > paginate running sandboxes`
-- JS e2b: `api/list.test.ts > paginate running sandboxes #2`
 
 </details>
 
-<details><summary>Control plane: `set_timeout` (9)</summary>
+<details><summary>Control plane: secure envd access token (2)</summary>
 
-- Python e2b: `async/sandbox_async/test_timeout.py::test_get_timeout`
-- Python e2b: `async/sandbox_async/test_timeout.py::test_shorten_then_lengthen_timeout`
-- Python e2b: `async/sandbox_async/test_timeout.py::test_shorten_timeout`
-- Python e2b: `sync/sandbox_sync/test_timeout.py::test_get_timeout`
-- Python e2b: `sync/sandbox_sync/test_timeout.py::test_shorten_then_lengthen_timeout`
-- Python e2b: `sync/sandbox_sync/test_timeout.py::test_shorten_timeout`
-- JS e2b: `sandbox/timeout.test.ts > get sandbox timeout`
-- JS e2b: `sandbox/timeout.test.ts > shorten then lengthen timeout`
-- JS e2b: `sandbox/timeout.test.ts > shorten timeout`
-
-</details>
-
-<details><summary>Control plane: `get_metrics` (6)</summary>
-
-- Python e2b: `async/sandbox_async/test_metrics.py::test_sbx_metrics`
-- Python e2b: `async/sandbox_async/test_metrics.py::test_sbx_metrics_time_range`
-- Python e2b: `sync/sandbox_sync/test_metrics.py::test_sbx_metrics`
-- Python e2b: `sync/sandbox_sync/test_metrics.py::test_sbx_metrics_time_range`
-- JS e2b: `sandbox/metrics.test.ts > sbx metrics`
-- JS e2b: `sandbox/metrics.test.ts > sbx metrics time range`
-
-</details>
-
-<details><summary>Control plane: secure envd access token (6)</summary>
-
-- Python e2b: `async/sandbox_async/test_secure.py::test_connect_to_secured`
-- Python e2b: `async/sandbox_async/test_secure.py::test_start_secured`
-- Python e2b: `sync/sandbox_sync/test_secure.py::test_connect_to_secured`
-- Python e2b: `sync/sandbox_sync/test_secure.py::test_start_secured`
 - JS e2b: `sandbox/secure.test.ts > secure sandbox > test access file with signing`
 - JS e2b: `sandbox/secure.test.ts > secure sandbox > try to re-connect to sandbox`
 
@@ -319,24 +221,21 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Control plane: `fork` (12)</summary>
+<details><summary>Control plane: `fork` (9)</summary>
 
 - Python e2b: `async/sandbox_async/test_fork.py::test_fork`
 - Python e2b: `async/sandbox_async/test_fork.py::test_fork_by_id`
-- Python e2b: `async/sandbox_async/test_fork.py::test_fork_killed_sandbox`
 - Python e2b: `async/sandbox_async/test_fork.py::test_fork_multiple`
 - Python e2b: `sync/sandbox_sync/test_fork.py::test_fork`
 - Python e2b: `sync/sandbox_sync/test_fork.py::test_fork_by_id`
-- Python e2b: `sync/sandbox_sync/test_fork.py::test_fork_killed_sandbox`
 - Python e2b: `sync/sandbox_sync/test_fork.py::test_fork_multiple`
-- JS e2b: `sandbox/fork.test.ts > fork a killed sandbox fails`
 - JS e2b: `sandbox/fork.test.ts > fork a sandbox`
 - JS e2b: `sandbox/fork.test.ts > fork a sandbox by ID with the static method`
 - JS e2b: `sandbox/fork.test.ts > fork a sandbox multiple times`
 
 </details>
 
-<details><summary>Control plane: network, internet access, egress proxy (61)</summary>
+<details><summary>Control plane: network, internet access, egress proxy (60)</summary>
 
 - Python e2b: `async/sandbox_async/test_internet_access.py::test_internet_access_default`
 - Python e2b: `async/sandbox_async/test_internet_access.py::test_internet_access_disabled`
@@ -379,7 +278,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/egressProxy.test.ts > getInfo reports no egress proxy when the API returns omitted`
 - JS e2b: `sandbox/egressProxy.test.ts > getInfo reports the active egress proxy without the password`
 - JS e2b: `sandbox/egressProxy.test.ts > updateNetwork sets the egress proxy on a running sandbox`
-- JS e2b: `sandbox/internetAccess.test.ts > internet access default > internet access default`
 - JS e2b: `sandbox/internetAccess.test.ts > internet access disabled > internet access disabled`
 - JS e2b: `sandbox/internetAccess.test.ts > internet access enabled > internet access enabled`
 - JS e2b: `sandbox/network.test.ts > allow only 1.1.1.1 > allow specific IP with deny all traffic`
@@ -431,7 +329,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Commands: `commands.run` (19)</summary>
+<details><summary>Commands: `commands.run` (13)</summary>
 
 - Python e2b: `async/sandbox_async/commands/test_run.py::test_run`
 - Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_broken_utf8`
@@ -446,16 +344,10 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_timeout`
 - Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_too_short_timeout`
 - Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_too_short_timeout_iterating`
-- JS e2b: `sandbox/commands/run.test.ts > run`
-- JS e2b: `sandbox/commands/run.test.ts > run with multiline string`
-- JS e2b: `sandbox/commands/run.test.ts > run with special characters`
-- JS e2b: `sandbox/commands/run.test.ts > run with timeout`
-- JS e2b: `sandbox/commands/run.test.ts > run with too short timeout`
-- JS e2b: `sandbox/commands/run.test.ts > run with too short timeout iterating`
 
 </details>
 
-<details><summary>Commands: `commands.run` envs (11)</summary>
+<details><summary>Commands: `commands.run` envs (9)</summary>
 
 - Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_bash_command_scoped_env_vars`
 - Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_command_envs`
@@ -465,19 +357,16 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_command_envs`
 - Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_python_command_scoped_env_vars`
 - Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_sandbox_envs`
-- JS e2b: `sandbox/commands/envVars.test.ts > bash command scoped env vars`
-- JS e2b: `sandbox/commands/envVars.test.ts > python command scoped env vars`
 - JS e2b: `sandbox/commands/envVars.test.ts > sandbox global env vars > sandbox global env vars`
 
 </details>
 
-<details><summary>Commands: `commands.connect` (6)</summary>
+<details><summary>Commands: `commands.connect` (5)</summary>
 
 - Python e2b: `async/sandbox_async/commands/test_cmd_connect.py::test_connect_to_non_existing_process`
 - Python e2b: `async/sandbox_async/commands/test_cmd_connect.py::test_connect_to_process`
 - Python e2b: `sync/sandbox_sync/commands/test_cmd_connect.py::test_connect_to_non_existing_process`
 - Python e2b: `sync/sandbox_sync/commands/test_cmd_connect.py::test_connect_to_process`
-- JS e2b: `sandbox/commands/connect.test.ts > connect to non-existing process`
 - JS e2b: `sandbox/commands/connect.test.ts > connect to process`
 
 </details>
@@ -533,7 +422,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Files: `files.write` (32)</summary>
+<details><summary>Files: `files.write` (31)</summary>
 
 - Python e2b: `async/sandbox_async/files/test_write.py::test_overwrite_file`
 - Python e2b: `async/sandbox_async/files/test_write.py::test_write_binary_file`
@@ -565,7 +454,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/files/write.test.ts > writeFiles creates parent directories`
 - JS e2b: `sandbox/files/write.test.ts > writeFiles overwrites existing files`
 - JS e2b: `sandbox/files/write.test.ts > writeFiles with different data types`
-- JS e2b: `sandbox/files/write.test.ts > writeFiles with empty array`
 - JS e2b: `sandbox/files/write.test.ts > writeFiles with multiple files`
 
 </details>
@@ -762,7 +650,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Files: signed upload/download URLs (13)</summary>
+<details><summary>Files: signed upload/download URLs (12)</summary>
 
 - Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_expired_signing`
 - Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_signing`
@@ -773,7 +661,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with expired signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with valid signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with valid signing as root`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test command run with secured sbx`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with invalid signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing as root user`
@@ -823,7 +710,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Templates, volumes, secrets: template build API (89)</summary>
+<details><summary>Templates, volumes, secrets: template build API (87)</summary>
 
 - Python e2b: `async/template_async/methods/test_make_symlink.py::test_make_symlink`
 - Python e2b: `async/template_async/methods/test_make_symlink.py::test_make_symlink_force`
@@ -837,7 +724,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `async/template_async/test_build.py::test_build_template_with_skip_cache`
 - Python e2b: `async/template_async/test_build.py::test_build_template_with_symlinks`
 - Python e2b: `async/template_async/test_exists.py::test_check_base_template_name_exists`
-- Python e2b: `async/template_async/test_exists.py::test_check_non_existing_name`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_assign_single_tag_to_existing_template`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_build_template_with_tags_assign_and_delete`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_rejects_invalid_tag_format_missing_alias`
@@ -853,7 +739,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `sync/template_sync/test_build.py::test_build_template_with_resolve_symlinks`
 - Python e2b: `sync/template_sync/test_build.py::test_build_template_with_symlinks`
 - Python e2b: `sync/template_sync/test_exists.py::test_check_base_template_name_exists`
-- Python e2b: `sync/template_sync/test_exists.py::test_check_non_existing_name`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_assign_single_tag_to_existing_template`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_build_template_with_tags_assign_and_delete`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_rejects_invalid_tag_format_missing_alias`

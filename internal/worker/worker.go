@@ -235,6 +235,12 @@ type usageJSON struct {
 	CPUUsedPct       float64 `json:"cpuUsedPct"`
 	MemoryUsedBytes  uint64  `json:"memoryUsedBytes"`
 	MemoryLimitBytes uint64  `json:"memoryLimitBytes"`
+	// The detailed fields are absent from older workers, which then report
+	// detailed=false: the gateway never fills them in.
+	Detailed         bool   `json:"detailed,omitempty"`
+	MemoryCacheBytes uint64 `json:"memoryCacheBytes,omitempty"`
+	DiskUsedBytes    uint64 `json:"diskUsedBytes,omitempty"`
+	DiskTotalBytes   uint64 `json:"diskTotalBytes,omitempty"`
 }
 
 const (

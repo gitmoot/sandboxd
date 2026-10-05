@@ -70,7 +70,7 @@ type Handler struct {
 // with api, so every sandboxd binary splits its single listener the same way.
 func Routes(guest, api http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/files" || r.URL.Path == "/process.Process/Start" {
+		if r.URL.Path == "/files" || r.URL.Path == "/process.Process/Start" || r.URL.Path == "/health" {
 			guest.ServeHTTP(w, r)
 			return
 		}
@@ -96,10 +96,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	token := r.Header.Get("X-Access-Token")
 	if token == "" || !h.Authorizer.Authorize(id, token) {
+		if r.URL.Path == "/health" {
+			// E2B's edge answers 502 for a sandbox it cannot reach; the
+			// SDKs' is_running/isRunning read exactly that as "not running".
+			http.Error(w, "sandbox not running", http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	switch r.URL.Path {
+	case "/health":
+		// envd's health check: the sandbox is live and the token valid.
+		w.WriteHeader(http.StatusNoContent)
 	case "/files":
 		h.upload(w, r, id, token)
 	case "/process.Process/Start":

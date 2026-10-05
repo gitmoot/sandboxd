@@ -53,6 +53,14 @@ type Usage struct {
 	CPUUsedPct       float64
 	MemoryUsedBytes  uint64
 	MemoryLimitBytes uint64
+	// Detailed marks a driver that also measured the fields below; drivers
+	// that cannot leave it false rather than report invented values.
+	Detailed bool
+	// MemoryCacheBytes is resident file-backed (page cache) memory.
+	MemoryCacheBytes uint64
+	// DiskUsedBytes and DiskTotalBytes describe the guest's writable
+	// filesystem: allocated bytes and the filesystem's size.
+	DiskUsedBytes, DiskTotalBytes uint64
 }
 
 // ResourceMeter is optional for drivers that can report measured usage.
