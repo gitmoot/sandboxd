@@ -21,29 +21,33 @@ jobs:
           go-version-file: go.mod
       - run: go test ./... -count=1
       - name: Build
+        # Outputs go outside the checkout: a file written into it before the
+        # next go build marks that binary vcs.modified=true (#42).
         run: |
           set -eu
           tag=${GITHUB_REF_NAME}
-          mkdir -p out mac
+          out=$RUNNER_TEMP/out mac=$RUNNER_TEMP/mac
+          mkdir -p "$out" "$mac"
           for cmd in sandboxd sandboxd-pf-helper; do
-            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-X main.version=$tag" -o "mac/$cmd" "./cmd/$cmd"
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-X main.version=$tag" -o "$mac/$cmd" "./cmd/$cmd"
           done
-          chmod 755 mac/sandboxd mac/sandboxd-pf-helper
-          tar --owner=0 --group=0 --numeric-owner -czf "out/sandboxd-$tag-darwin-arm64.tar.gz" -C mac sandboxd sandboxd-pf-helper
-          (cd out && sha256sum * > SHA256SUMS)
-          cat out/SHA256SUMS
+          chmod 755 "$mac/sandboxd" "$mac/sandboxd-pf-helper"
+          tar --owner=0 --group=0 --numeric-owner -czf "$out/sandboxd-$tag-darwin-arm64.tar.gz" -C "$mac" sandboxd sandboxd-pf-helper
+          (cd "$out" && sha256sum * > SHA256SUMS)
+          cat "$out/SHA256SUMS"
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          out=$RUNNER_TEMP/out
           {
             echo "Built by GitHub Actions from commit \`$GITHUB_SHA\` (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
             echo
             echo "Check the SHA-256 below in your own browser before a first install (docs/compatibility.md, Operating the PF helper)."
             echo
             echo '```'
-            cat out/SHA256SUMS
+            cat "$out/SHA256SUMS"
             echo '```'
-          } > notes.md
-          gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" "$out"/* --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" --verify-tag
