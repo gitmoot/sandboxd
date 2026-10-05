@@ -105,6 +105,7 @@ OPERATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Control plane", "`get_metrics`", ("metrics",)),
     ("Control plane", "secure envd access token", ("secure",)),
     ("Control plane", "`get_host` / guest ports", ("host",)),
+    ("Control plane", "sandbox logs (`/v2/sandboxes/{id}/logs`, sandboxd tests)", ("sandboxd/logs",)),
     ("Control plane", "pause, resume, snapshots", ("snapshot", "snapshot_api", "snapshot_filesystem_only", "api/snapshot", "on_resume_request")),
     ("Control plane", "lifecycle options (autoPause, onTimeout)", ("lifecycle_request", "lifecycle_payload")),
     ("Control plane", "`fork`", ("fork",)),
@@ -113,6 +114,7 @@ OPERATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Control plane", "client config and request plumbing", (
         "config_propagation", "api_defaults", "abort_signal", "sync_client_lifecycle", "http_version", "rpc_headers", "urls",
         "api/api_key", "api/handle_api_error", "api/http2", "api/inflight")),
+    ("Control plane", "unsupported features refused with 501 (sandboxd tests)", ("sandboxd/refusals",)),
     ("Commands", "`commands.run`", ("commands/run", "commands/command_handle")),
     ("Commands", "`commands.run` envs", ("commands/env_vars",)),
     ("Commands", "`commands.connect`", ("commands/connect",)),
@@ -163,6 +165,23 @@ OPERATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Gitmoot", "client fixture tests (offline)", ("gitmoot:fixtures",)),
 )
 KEY_TO_OPERATION = {key: operation for _, operation, keys in OPERATIONS for key in keys}
+# Operations sandboxd refuses on purpose (docs/compatibility.md#not-supported):
+# their routes answer 501 with a documented E2B error, so their upstream tests
+# stay red. Rendered as the matrix's notes.
+REFUSED = {
+    "pause, resume, snapshots": "pause, resume and snapshots are deferred with M5 (owner decision D7)",
+    "lifecycle options (autoPause, onTimeout)": "auto-pause and auto-resume are deferred with M5 (D7); the request-shape tests mock E2B's API host and cannot reach sandboxd",
+    "`fork`": "fork needs snapshots (D7)",
+    "network, internet access, egress proxy": "the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted",
+    "IAM": "IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd",
+    "template build API": "templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served",
+    "volumes": "volumes are not supported: nothing outlives a sandbox",
+    "secrets": "secrets are not supported; pass values in `envVars`",
+}
+REFUSED_ALSO = (
+    "`Sandbox.list` (paused sandboxes), `Sandbox.connect` (resuming a paused sandbox) and `Sandbox.create` "
+    "(auto-pause, MCP gateway) have refused tests too: their paused, auto-pause and MCP cases."
+)
 OUTCOMES = ("pass", "fail", "skip")
 
 
@@ -401,6 +420,10 @@ def render_matrix(results: dict[str, dict[str, str]], offline: dict[str, list[st
         "check only client-side behaviour). They are gated like every other test but say nothing about",
         "sandboxd. ⚪ means a cell has only such tests.",
         "",
+        "Rows marked \"sandboxd tests\" run `conformance/sdk/{python,js}`, written for sandboxd against",
+        "the same stock SDKs (copied into each suite's `tests/sandboxd/`): no upstream test covers",
+        "the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.",
+        "",
         "| Area | Operation | " + " | ".join(s.title for s in suites) + " |",
         "| --- | --- | " + " | ".join("---" for _ in suites) + " |",
     ]
@@ -415,10 +438,20 @@ def render_matrix(results: dict[str, dict[str, str]], offline: dict[str, list[st
         f"Totals: {totals['pass'] - totals['offline']} pass against sandboxd, {totals['offline']} pass offline,",
         f"{totals['fail']} expected failures, {totals['skip']} skipped.",
         "",
+        "## Intentional refusals",
+        "",
+        "These operations are refused on purpose: every route answers `501` with a documented E2B",
+        "error (see [compatibility.md](compatibility.md#not-supported)), asserted exactly by the",
+        "\"unsupported features refused\" row. Their upstream tests stay red and are not planned work.",
+        "",
+        *[f"- {operation}: {note}." for operation, note in REFUSED.items()],
+        f"- {REFUSED_ALSO}",
+        "",
         "## Expected failures",
         "",
         "Every test below fails today and is recorded as `fail` in `conformance/expected.json`.",
-        "A later milestone turns a cell green by making these pass and recording them.",
+        "A later milestone turns a cell green by making these pass and recording them, except for",
+        "the intentional refusals above.",
         "",
     ]
     for area, operation, _ in OPERATIONS:
@@ -562,6 +595,12 @@ def prepare(ws: Workspace, suites: list[Suite]) -> None:
             "/packages/code-interpreter-js/", "!/packages/code-interpreter-js/tests/runtimes/",
             "/tsconfig.sdk.json", "/vitest.sdk.config.mts",
         ])
+    if names & {"python-e2b", "js-e2b"}:
+        # sandboxd's own stock-SDK tests, replaced on every run.
+        for language, package in (("python", "python-sdk"), ("js", "js-sdk")):
+            target = ws.sdk / "packages" / package / "tests" / "sandboxd"
+            shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(CONFORMANCE / "sdk" / language, target)
     if "gitmoot" in names:
         log(f"fetching gitmoot@{GITMOOT_COMMIT[:12]}")
         checkout(GITMOOT_REPO, GITMOOT_COMMIT, ws.gitmoot, None)
@@ -765,12 +804,12 @@ def run_suite(ws: Workspace, suite: Suite, offline: bool = False) -> dict[str, s
     label = suite.name + ("-offline" if offline else "")
     with (offline_server if offline else dev_server)(ws, label) as server:
         if suite.name == "python-e2b":
-            return run_pytest(ws, label, ws.sdk / "packages" / "python-sdk", ["tests/sync", "tests/async"], server)
+            return run_pytest(ws, label, ws.sdk / "packages" / "python-sdk", ["tests/sync", "tests/async", "tests/sandboxd"], server)
         if suite.name == "python-code-interpreter":
             return run_pytest(ws, label, ws.sdk / "packages" / "code-interpreter-python", ["tests"], server)
         if suite.name == "js-e2b":
             package = ws.sdk / "packages" / "js-sdk"
-            files = js_targets(package, ["sandbox", "api", "volume", "secret", "template"], ["tests/template/utils/", "tests/sandbox/git/"])
+            files = js_targets(package, ["sandbox", "api", "volume", "secret", "template", "sandboxd"], ["tests/template/utils/", "tests/sandbox/git/"])
             return run_vitest(ws, label, package, ["--project", "unit", "--project", "template", *files], server)
         if suite.name == "js-code-interpreter":
             package = ws.ci_js / "packages" / "code-interpreter-js"

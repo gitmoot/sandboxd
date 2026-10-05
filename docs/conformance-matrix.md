@@ -22,6 +22,10 @@ against a null server answering every request with 404 (upstream tests that mock
 check only client-side behaviour). They are gated like every other test but say nothing about
 sandboxd. ⚪ means a cell has only such tests.
 
+Rows marked "sandboxd tests" run `conformance/sdk/{python,js}`, written for sandboxd against
+the same stock SDKs (copied into each suite's `tests/sandboxd/`): no upstream test covers
+the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
+
 | Area | Operation | Python e2b | JS e2b | Python code-interpreter | JS code-interpreter | Gitmoot client |
 | --- | --- | --- | --- | --- | --- | --- |
 | Control plane | `Sandbox.create` | 🟡 6/16 | 🟡 2/3 | — | — | — |
@@ -33,12 +37,14 @@ sandboxd. ⚪ means a cell has only such tests.
 | Control plane | `get_metrics` | ✅ 4/4 | ✅ 2/2 | — | — | — |
 | Control plane | secure envd access token | ✅ 4/4 | ✅ 2/2 (+3 offline) | — | — | — |
 | Control plane | `get_host` / guest ports | ❌ 0/2 | ❌ 0/2 | — | — | — |
+| Control plane | sandbox logs (`/v2/sandboxes/{id}/logs`, sandboxd tests) | ✅ 1/1 | ✅ 1/1 | — | — | — |
 | Control plane | pause, resume, snapshots | ❌ 0/28 | ❌ 0/23 (+8 offline) | — | — | — |
 | Control plane | lifecycle options (autoPause, onTimeout) | — | ❌ 0/12 (+13 offline) | — | — | — |
 | Control plane | `fork` | 🟡 2/8 | 🟡 1/4 | — | — | — |
 | Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | ❌ 0/33 (+27 offline) | — | — | — |
 | Control plane | IAM | — | ❌ 0/6 (+11 offline) | — | — | — |
 | Control plane | client config and request plumbing | ❌ 0/2 (+6 offline) | ❌ 0/11 (+58 offline) | — | — | — |
+| Control plane | unsupported features refused with 501 (sandboxd tests) | ✅ 10/10 | ✅ 9/9 | — | — | — |
 | Commands | `commands.run` | ✅ 13/13 | ✅ 6/6 (+13 offline) | — | — | — |
 | Commands | `commands.run` envs | ✅ 8/8 | ✅ 3/3 | — | — | — |
 | Commands | `commands.connect` | ✅ 4/4 | ✅ 2/2 | — | — | — |
@@ -63,7 +69,7 @@ sandboxd. ⚪ means a cell has only such tests.
 | PTY | `pty.kill` | ✅ 4/4 | ✅ 2/2 | — | — | — |
 | PTY | `pty.resize` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | PTY | `pty.send_input` | ✅ 2/2 | ✅ 1/1 | — | — | — |
-| Templates, volumes, secrets | template build API | 🟡 2/33 (+136 offline) | ❌ 0/56 (+28 offline) | — | — | — |
+| Templates, volumes, secrets | template build API | 🟡 4/33 (+136 offline) | 🟡 1/56 (+28 offline) | — | — | — |
 | Templates, volumes, secrets | volumes | ⚪ (+92 offline, 2 skip) | ❌ 0/52 (+4 offline, 1 skip) | — | — | — |
 | Templates, volumes, secrets | secrets | ⚪ (+30 offline) | ❌ 0/9 (+6 offline) | — | — | — |
 | Code interpreter | `run_code` | — | — | ❌ 0/10 (+5 offline) | ❌ 0/4 | — |
@@ -81,13 +87,30 @@ sandboxd. ⚪ means a cell has only such tests.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 360 pass against sandboxd, 621 pass offline,
-530 expected failures, 3 skipped.
+Totals: 384 pass against sandboxd, 621 pass offline,
+527 expected failures, 3 skipped.
+
+## Intentional refusals
+
+These operations are refused on purpose: every route answers `501` with a documented E2B
+error (see [compatibility.md](compatibility.md#not-supported)), asserted exactly by the
+"unsupported features refused" row. Their upstream tests stay red and are not planned work.
+
+- pause, resume, snapshots: pause, resume and snapshots are deferred with M5 (owner decision D7).
+- lifecycle options (autoPause, onTimeout): auto-pause and auto-resume are deferred with M5 (D7); the request-shape tests mock E2B's API host and cannot reach sandboxd.
+- `fork`: fork needs snapshots (D7).
+- network, internet access, egress proxy: the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted.
+- IAM: IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd.
+- template build API: templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served.
+- volumes: volumes are not supported: nothing outlives a sandbox.
+- secrets: secrets are not supported; pass values in `envVars`.
+- `Sandbox.list` (paused sandboxes), `Sandbox.connect` (resuming a paused sandbox) and `Sandbox.create` (auto-pause, MCP gateway) have refused tests too: their paused, auto-pause and MCP cases.
 
 ## Expected failures
 
 Every test below fails today and is recorded as `fail` in `conformance/expected.json`.
-A later milestone turns a cell green by making these pass and recording them.
+A later milestone turns a cell green by making these pass and recording them, except for
+the intentional refusals above.
 
 <details><summary>Control plane: `Sandbox.create` (11)</summary>
 
@@ -321,7 +344,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Templates, volumes, secrets: template build API (87)</summary>
+<details><summary>Templates, volumes, secrets: template build API (84)</summary>
 
 - Python e2b: `async/template_async/methods/test_make_symlink.py::test_make_symlink`
 - Python e2b: `async/template_async/methods/test_make_symlink.py::test_make_symlink_force`
@@ -334,7 +357,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `async/template_async/test_build.py::test_build_template_with_resolve_symlinks`
 - Python e2b: `async/template_async/test_build.py::test_build_template_with_skip_cache`
 - Python e2b: `async/template_async/test_build.py::test_build_template_with_symlinks`
-- Python e2b: `async/template_async/test_exists.py::test_check_base_template_name_exists`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_assign_single_tag_to_existing_template`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_build_template_with_tags_assign_and_delete`
 - Python e2b: `async/template_async/test_tags.py::TestTagsIntegration::test_rejects_invalid_tag_format_missing_alias`
@@ -349,7 +371,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - Python e2b: `sync/template_sync/test_build.py::test_build_template_from_base_template`
 - Python e2b: `sync/template_sync/test_build.py::test_build_template_with_resolve_symlinks`
 - Python e2b: `sync/template_sync/test_build.py::test_build_template_with_symlinks`
-- Python e2b: `sync/template_sync/test_exists.py::test_check_base_template_name_exists`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_assign_single_tag_to_existing_template`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_build_template_with_tags_assign_and_delete`
 - Python e2b: `sync/template_sync/test_tags.py::TestTagsIntegration::test_rejects_invalid_tag_format_missing_alias`
@@ -368,7 +389,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `template/build.test.ts > build template from base template`
 - JS e2b: `template/build.test.ts > build template with resolveSymlinks`
 - JS e2b: `template/build.test.ts > build template with symlinks`
-- JS e2b: `template/exists.test.ts > check if base template name exists`
 - JS e2b: `template/methods/makeSymlink.test.ts > make symlink`
 - JS e2b: `template/methods/makeSymlink.test.ts > make symlink (force)`
 - JS e2b: `template/methods/runCmd.test.ts > run command`
