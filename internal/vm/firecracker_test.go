@@ -834,3 +834,28 @@ func TestFirecrackerJailModesIgnoreUmask(t *testing.T) {
 		}
 	}
 }
+
+// The jailed VMM opens the kernel and root image as an unprivileged UID, so a
+// root-only install must be refused at startup with a clear reason instead of
+// failing every create at boot.
+func TestTrustedFileModeRequiresVMMReadableImages(t *testing.T) {
+	for _, tc := range []struct {
+		mode       os.FileMode
+		executable bool
+		ok         bool
+	}{
+		{0o444, false, true},
+		{0o644, false, true},
+		{0o400, false, false},
+		{0o600, false, false},
+		{0o640, false, false},
+		{0o755, true, true},
+		{0o644, true, false},
+		{os.ModeSymlink | 0o777, false, false},
+	} {
+		err := trustedFileMode("/x", tc.mode, tc.executable)
+		if (err == nil) != tc.ok {
+			t.Errorf("mode %v executable=%v: err=%v, want ok=%v", tc.mode, tc.executable, err, tc.ok)
+		}
+	}
+}
