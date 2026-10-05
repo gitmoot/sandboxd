@@ -203,8 +203,14 @@ func argAfter(args []string, flag string) string {
 	return args[i+1]
 }
 
-func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ string) error {
+func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, console *os.File) error {
 	h.record("vmm")
+	if console != nil {
+		// What the real guest's envd writes to the serial console.
+		if _, err := io.WriteString(console, "boot line\r\n"+`{"level":"info","logger":"envd","message":"fake envd up"}`+"\n"); err != nil {
+			return err
+		}
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.vmmArgs = append(h.vmmArgs, args)

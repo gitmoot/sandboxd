@@ -75,6 +75,8 @@ type guest struct {
 	// lifeline ends it (see envd.go).
 	envd     bool
 	lifeline io.Closer
+	// console keeps an envd guest's console output.
+	console *vm.Console
 }
 
 var (

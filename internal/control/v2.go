@@ -149,6 +149,10 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid sandbox request body")
 		return
 	}
+	if reason := request.unsupported(); reason != "" {
+		s.refuse(w, reason)
+		return
+	}
 	template, ok := s.templates.lookup(request.TemplateID)
 	if !ok {
 		s.fail(w, ProfileE2B, http.StatusNotFound, fmt.Sprintf("template %q not found", request.TemplateID))
@@ -156,10 +160,6 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	}
 	if template.Profile != ProfileE2B {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, fmt.Sprintf("template %q uses the %s profile; create it with POST /sandboxes", request.TemplateID, template.Profile))
-		return
-	}
-	if reason := request.unsupported(); reason != "" {
-		s.fail(w, ProfileE2B, http.StatusBadRequest, reason)
 		return
 	}
 	seconds := min(int64(defaultTimeout), int64(s.cfg.MaxTTL/time.Second))

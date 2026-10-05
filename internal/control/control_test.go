@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,9 @@ type fakeDriver struct {
 	listError    error
 	destroyError error
 	destroyed    []string
+	// consoles are the console lines Console returns by VM ID; a VM without
+	// an entry has none (vm.ErrNoConsole).
+	consoles map[string][]vm.ConsoleLine
 }
 
 func (d *fakeDriver) Create(_ context.Context, spec vm.Spec) (vm.Instance, error) {
@@ -65,6 +69,16 @@ func (d *fakeDriver) Destroy(_ context.Context, id string) error {
 	delete(d.instances, id)
 	d.destroyed = append(d.destroyed, id)
 	return nil
+}
+
+func (d *fakeDriver) Console(_ context.Context, id string) ([]vm.ConsoleLine, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	lines, ok := d.consoles[id]
+	if !ok {
+		return nil, vm.ErrNoConsole
+	}
+	return slices.Clone(lines), nil
 }
 
 func openService(t *testing.T, driver *fakeDriver) *Service {

@@ -135,6 +135,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method, handle = http.MethodPut, s.copyIn
 	case parts[2] == "run":
 		method, handle = http.MethodPost, s.run
+	case parts[2] == "console":
+		method, handle = http.MethodGet, s.console
 	case parts[2] == "usage":
 		method, handle = http.MethodGet, s.usage
 	case parts[2] == "expiry":

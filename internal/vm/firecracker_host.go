@@ -442,17 +442,15 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 }
 
 // StartVMM runs the jailer, which forks the VMM into a new PID namespace and
-// exits. The VMM's stdio (the guest serial console) goes to console.
-func (h *linuxFCHost) StartVMM(ctx context.Context, jailer string, args []string, console string) error {
-	out, err := os.OpenFile(console, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
+// exits. The VMM's stdio (the guest serial console) goes to console, or to
+// /dev/null when console is nil.
+func (h *linuxFCHost) StartVMM(ctx context.Context, jailer string, args []string, console *os.File) error {
 	c := exec.CommandContext(ctx, jailer, args...)
 	c.Env = []string{}
 	c.Dir = "/"
-	c.Stdout, c.Stderr = out, out
+	if console != nil {
+		c.Stdout, c.Stderr = console, console
+	}
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := c.Run(); err != nil {
 		return fmt.Errorf("jailer: %w", err)
