@@ -82,8 +82,8 @@ func (h *linuxFCHost) TrustedFile(path string, executable bool) error {
 	if err != nil {
 		return err
 	}
-	if !info.Mode().IsRegular() || (executable && info.Mode().Perm()&0o100 == 0) {
-		return fmt.Errorf("%s must be a regular%s file", path, map[bool]string{true: " executable", false: ""}[executable])
+	if err := trustedFileMode(path, info.Mode(), executable); err != nil {
+		return err
 	}
 	for current := path; ; current = filepath.Dir(current) {
 		info, err := os.Lstat(current)
@@ -98,6 +98,20 @@ func (h *linuxFCHost) TrustedFile(path string, executable bool) error {
 			return nil
 		}
 	}
+}
+
+// trustedFileMode checks the file's own mode. Kernels and root images are
+// hard-linked into each jail and opened by the unprivileged VMM UID, so they
+// must be readable by others; a 0600 or 0400 install would otherwise pass
+// startup and fail every create with an opaque boot error.
+func trustedFileMode(path string, mode fs.FileMode, executable bool) error {
+	if !mode.IsRegular() || (executable && mode.Perm()&0o100 == 0) {
+		return fmt.Errorf("%s must be a regular%s file", path, map[bool]string{true: " executable", false: ""}[executable])
+	}
+	if !executable && mode.Perm()&0o004 == 0 {
+		return fmt.Errorf("%s must be readable by others (mode %04o): the jailed VMM opens it as an unprivileged user", path, mode.Perm())
+	}
+	return nil
 }
 
 func (h *linuxFCHost) FreeBytes(path string) (uint64, error) {
