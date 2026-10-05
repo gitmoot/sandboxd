@@ -400,16 +400,29 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 	if _, err := h.run(ctx, []byte(network.Ruleset), h.tools.nsenter, ns, "--", h.tools.nft, "-f", "-"); err != nil {
 		return err
 	}
+	state, err := h.run(ctx, nil, h.tools.nsenter, ns, "--", h.tools.nft, "-s", "list", "table", "inet", fcNetnsTable)
+	if err != nil {
+		return err
+	}
+	if err := fcCheckNetnsHostPortState(string(state), network.HostPort); err != nil {
+		return err
+	}
 	ready, readyWrite, err := os.Pipe()
 	if err != nil {
 		return err
 	}
 	defer ready.Close()
-	slirp := exec.Command(h.tools.setpriv, "--reuid="+uid, "--regid="+uid, "--clear-groups",
+	// Host loopback (10.0.2.2 to the host's 127.0.0.1) stays off unless a
+	// host port is configured; the tables just verified, and the host table
+	// armed before any guest, then admit only that port.
+	slirpArgs := []string{"--reuid=" + uid, "--regid=" + uid, "--clear-groups",
 		"--inh-caps=-all", "--bounding-set=-all", "--no-new-privs", "--",
-		h.tools.slirp, "--configure", "--mtu=1500", "--disable-host-loopback", "--disable-dns",
-		"--enable-sandbox", "--enable-seccomp", "--ready-fd=3",
-		strconv.Itoa(holderPID), fcSlirpTap)
+		h.tools.slirp, "--configure", "--mtu=1500", "--disable-dns",
+		"--enable-sandbox", "--enable-seccomp", "--ready-fd=3"}
+	if network.HostPort == 0 {
+		slirpArgs = append(slirpArgs, "--disable-host-loopback")
+	}
+	slirp := exec.Command(h.tools.setpriv, append(slirpArgs, strconv.Itoa(holderPID), fcSlirpTap)...)
 	slirp.Env = []string{fcHostPath}
 	slirp.Dir = "/"
 	slirp.ExtraFiles = []*os.File{readyWrite}

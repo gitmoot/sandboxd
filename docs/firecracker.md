@@ -30,8 +30,9 @@ Docker, Tailscale or iptables chain, stays untouched.
 - **Namespace.** A user namespace that maps only the NAT UID owns the
   namespace. slirp4netns joins it as that UID with no host capabilities,
   using `--enable-sandbox --enable-seccomp --disable-host-loopback
-  --disable-dns`. The namespace table `inet sbx_vm` forwards only from
-  `sbxvm0` to `sbxsl0`, and only to addresses outside the deny list. It
+  --disable-dns` (`--disable-host-loopback` is dropped only with
+  `-fc-host-port`, below). The namespace table `inet sbx_vm` forwards only
+  from `sbxvm0` to `sbxsl0`, and only to addresses outside the deny list. It
   rejects all traffic to the namespace itself (including the NAT's 10.0.2.2
   host alias and 10.0.2.3 resolver), and it masquerades.
 - **Host.** All guest traffic leaves the host as sockets of the NAT UIDs.
@@ -68,6 +69,46 @@ once, and a second consecutive failure counts as a loss. On a clean
 shutdown the daemon destroys every guest, then removes the table and the
 cgroup parent.
 
+### One host port (`-fc-host-port`)
+
+Guests cannot reach the host, with one opt-in exception: `-fc-host-port
+<port>` (default 0, none) lets every guest open TCP connections to
+`10.0.2.2:<port>`, which is the host's `127.0.0.1:<port>`. It exists for a
+host service the review agent must call, such as Gitmoot's credential
+gateway (the model and GitHub credential broker): guests use
+`https://10.0.2.2:<port>`, so that service's TLS certificate needs the IP
+SAN `10.0.2.2`, and it must accept connections on loopback (from
+127.0.0.1). It is one port, not a list: one broker per host is the only
+use, and each extra port is one more host service reachable from untrusted
+code.
+
+What it changes, and nothing else:
+
+- slirp4netns runs without `--disable-host-loopback`, so it connects to
+  `127.0.0.1:<port>` as the NAT UID when the guest connects to
+  `10.0.2.2:<port>`.
+- `inet sbx_vm` gains, before the internet rule, `iifname "sbxvm0" oifname
+  "sbxsl0" ip daddr 10.0.2.2 tcp dport <port> accept`. Every other port or
+  protocol (UDP included) to 10.0.2.2 still hits the reject.
+- `inet sbx_fc` gains, as the first rule of `chain guest`, `meta skuid
+  <NAT UIDs> ip daddr 127.0.0.1 tcp dport <port> accept`. Only the NAT UIDs
+  (base+1000 … base+1999), never the VMM UIDs, and only that address and
+  port; other loopback ports, the host's other addresses (public, Docker,
+  Tailscale) on any port including `<port>`, private ranges and other
+  guests stay rejected.
+
+The daemon refuses port 22 (SSH), its own `-listen` port and anything
+outside 1–65535. It fails closed: `Arm` reads the host table back and fails
+unless the exception is present exactly once, first in `chain guest`, and
+no other accept rule exists (with no host port: no accept rule at all);
+each create reads the namespace table back and fails unless the 10.0.2.2
+rule is exactly as configured. The armed readback includes the exception,
+so the per-create check and the once-a-second monitor treat any change to
+it as a lost firewall. The real-KVM test `TestFirecrackerKVMHostPort` checks
+that guests reach a host listener on the allowed port at 10.0.2.2 and not on
+the host's own addresses, and that a second listener on another port, host
+SSH, UDP to the alias and the rest of the deny list stay unreachable.
+
 ## Recovery
 
 The driver keeps no in-memory state. Its inventory joins the ownership
@@ -97,6 +138,9 @@ sudo images/linux-amd64-fc/install-firecracker.sh /var/lib/sandboxd-fc
 # gcc/g++/make, python3, user 1000, plus the guest agent). Prints the path,
 # images/review-amd64-<sha256 prefix>.ext4, about 600 MB.
 sudo images/linux-amd64-fc/build.sh /var/lib/sandboxd-fc
+# The same plus Go 1.26 and a module cache (below). Prints the path,
+# images/review-go126-amd64-<sha256 prefix>.ext4, about 1 GB.
+sudo images/linux-amd64-fc/build.sh --go126 /var/lib/sandboxd-fc
 ```
 
 | Path | Content |
@@ -104,10 +148,37 @@ sudo images/linux-amd64-fc/build.sh /var/lib/sandboxd-fc
 | `bin/firecracker`, `bin/jailer` | v1.17.0 x86_64, release tarball SHA-256 `06094a11…de558` |
 | `kernel/vmlinux-6.1.186` | Firecracker CI kernel, SHA-256 `ea0e55d0…f69c8` |
 | `images/review-amd64-<sha>.ext4` | The read-only root image, with its `.sha256` |
+| `images/review-go126-amd64-<sha>.ext4` | The read-only Go review image, with its `.sha256` |
 | `jail/`, `run/` | Per-VM state, empty when no VM exists |
 
-Go and the review module cache, which `images/linux-arm64` includes, are
-not in this image yet.
+### Go review image (`--go126`)
+
+The amd64 counterpart of the Mac's `review-go126` image
+(`images/linux-arm64`): the review image above plus `/usr/local/go` copied
+unchanged from the same `golang:1.26.4-bookworm` image index, pinned by
+digest (Go 1.26.4, `go` and `gofmt` also in `/usr/local/bin`), and a
+pre-filled module cache. The cache holds the full module graph of each
+`GOMOD_REPOS` entry in the `Dockerfile` (`<clone URL>@<commit>`; currently
+gitmoot/gitmoot at `8d58db9d…63e3265f9`), downloaded and verified at build
+time exactly as `images/linux-arm64` does, about 75 MB. Bump the commit and
+rebuild when a listed repository changes its `go.mod`.
+
+Unlike the Mac image, guests here have internet access, so the cache is a
+read-only module proxy, not the module cache itself. The image's
+`/etc/sandboxd/env` sets `GOPROXY=file:///opt/gomodcache/cache/download,https://proxy.golang.org,direct`,
+`GOMODCACHE=/home/user/go/pkg/mod`, `GOPATH=/home/user/go`,
+`GOCACHE=/home/user/.cache/go-build`, `GOTOOLCHAIN=local` and
+`GOFLAGS=-mod=readonly`, and puts `/home/user/go/bin` and
+`/usr/local/go/bin` first on `PATH`. Cached modules are extracted onto the
+guest's private home disk without network access; anything else comes from
+the public proxy. Both are checked against the repository's `go.sum`, and
+modules missing from it against the default checksum database.
+
+`TestFirecrackerKVMGoImage` (`SANDBOXD_FC_KVM=1`; `SANDBOXD_FC_GO_IMAGE`
+overrides the image) boots it, checks `go version`, `git` and the CA bundle,
+builds a module without network access (`GOPROXY=off`), and builds a module
+using gitmoot's dependency `gopkg.in/yaml.v3` with the image's cache as the
+only proxy.
 
 ## E2B base image
 
@@ -287,15 +358,32 @@ it with `-enroll id=<worker-id>,url=<https URL>,key-file=<same key>` and
 time the gateway sent, capped by its own `-max-ttl` (default 1h), even when
 it cannot reach the gateway.
 
+### Standalone gateway on the client's host
+
+[`examples/sandboxd-firecracker.service`](examples/sandboxd-firecracker.service)
+is a sample systemd unit for a Firecracker gateway that serves a client on
+the same host (for example Gitmoot, as its `sandboxd-linux` provider): root,
+`UMask=0077`, stdin on `/dev/null`, API on `127.0.0.1:43190`, at most two
+VMs of 2 vCPUs and 2 GiB, template `review-amd64` served from the Go review
+image, `-fc-host-port 8443` for the host's credential gateway, and the
+ledger (`ledger.sqlite`) and API key (`api-key`, 0600) in
+`/var/lib/sandboxd-linux` (0700). The client uses
+`http://127.0.0.1:43190` as both API and envd base URL; envd requests
+carry `Host: 127.0.0.1:43190`, which `-gateway-host 127.0.0.1` matches.
+
 ## Tests
 
 - `go test ./internal/vm ./internal/guestagent ./cmd/sandboxd`: driver
   logic against a fake host, with no KVM needed. It covers jail layout,
   jailer limits, the disk floor, cleanup after failed creates, restart
-  reconciliation, firewall loss, the rulesets, the symlink-safe vsock dial
-  (a replaced socket or run directory never reaches another listener) and
-  the guest agent protocol.
+  reconciliation, firewall loss, the rulesets (golden files in
+  `internal/vm/testdata`, with and without `-fc-host-port`, and readbacks
+  captured from nft 1.0.9), the symlink-safe vsock dial (a replaced socket
+  or run directory never reaches another listener) and the guest agent
+  protocol.
 - `sudo SANDBOXD_FC_KVM=1 go test ./internal/vm -run TestFirecrackerKVM`:
-  boots two real VMs from the install above. It checks exec, exit codes,
-  CopyIn, cross-guest isolation, host and private probes against a host
-  listener on every interface, internet access and cleanup.
+  boots real VMs from the install above. `TestFirecrackerKVM` checks exec,
+  exit codes, CopyIn, cross-guest isolation, host and private probes against
+  a host listener on every interface, internet access and cleanup;
+  `TestFirecrackerKVMHostPort` the `-fc-host-port` exception;
+  `TestFirecrackerKVMGoImage` the Go review image.

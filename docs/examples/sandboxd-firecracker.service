@@ -1,0 +1,41 @@
+# Sample unit: a standalone Firecracker gateway on a Linux host
+# (docs/firecracker.md). Loopback-only API on 127.0.0.1:43190 for a client on
+# the same host, at most two VMs, guests may reach the host only at
+# 10.0.2.2:8443 (the host's 127.0.0.1:8443, a credential gateway).
+#
+# Before starting:
+#   install -d -m 0700 -o root -g root /var/lib/sandboxd-linux
+#   umask 077; head -c 32 /dev/urandom | base64 > /var/lib/sandboxd-linux/api-key
+#   images/linux-amd64-fc/install-firecracker.sh /var/lib/sandboxd-fc
+#   images/linux-amd64-fc/build.sh --go126 /var/lib/sandboxd-fc
+# then replace review-go126-amd64-<sha> below with the printed image name.
+[Unit]
+Description=sandboxd Firecracker gateway (review-amd64)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+StandardInput=null
+ExecStart=/usr/local/bin/sandboxd -driver firecracker -max-vms 2 \
+  -listen 127.0.0.1:43190 \
+  -db /var/lib/sandboxd-linux/ledger.sqlite \
+  -api-key-file /var/lib/sandboxd-linux/api-key \
+  -domain sandboxd-linux.internal -gateway-host 127.0.0.1 \
+  -worker-id linux-fc-1 \
+  -template review-amd64 \
+  -image /var/lib/sandboxd-fc/images/review-go126-amd64-<sha>.ext4 \
+  -fc-kernel /var/lib/sandboxd-fc/kernel/vmlinux-6.1.186 \
+  -fc-host-port 8443 \
+  -cpus 2 -memory-mib 2048
+# The driver destroys every guest and removes its nftables table and cgroup
+# parent on SIGTERM; allow for two VMs.
+KillMode=mixed
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
