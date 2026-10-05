@@ -50,6 +50,9 @@ type Config struct {
 	// gitmoot-strict template requiring Arch. A worker is never scheduled a
 	// template it declares for another architecture.
 	Templates map[string]Template
+	// ReadyTimeout bounds a new e2b sandbox's template start and ready
+	// commands; 0 means DefaultReadyTimeout.
+	ReadyTimeout time.Duration
 	// TokenSecret derives e2b-profile envd tokens (HMAC-SHA256 over the
 	// sandbox ID), so connect can return the same token again while the
 	// ledger keeps only its hash. Required with any e2b template.
@@ -84,6 +87,11 @@ type Service struct {
 	apiHash [32]byte
 	stop    chan struct{}
 	done    chan struct{}
+	// signers holds the envd token of every running e2b sandbox, so a
+	// signed file URL that names no sandbox is matched without the ledger
+	// or mu (SignedSandbox). signersMu is taken after mu, never before.
+	signersMu sync.RWMutex
+	signers   map[string]string
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -91,7 +99,7 @@ type Service struct {
 // HTTP requests. driver may be nil for a gateway that runs no local VMs.
 func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Service, error) {
 	if cfg.APIKey == "" || cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
-		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
+		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 || cfg.ReadyTimeout < 0 {
 		return nil, errors.New("invalid sandbox control configuration")
 	}
 	if driver == nil && len(cfg.Workers) == 0 {
@@ -160,7 +168,18 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		return nil, err
 	}
 	s := &Service{ledger: ledger, cfg: cfg, templates: templates, tokenKey: slices.Clone(cfg.TokenSecret), workers: members, byID: make(map[string]*member, len(members)),
-		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
+		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{}),
+		signers: make(map[string]string)}
+	rows, err := ledger.Active(ctx)
+	if err != nil {
+		_ = ledger.Close()
+		return nil, err
+	}
+	for _, row := range rows {
+		if row.State == "running" && rowProfile(row.Profile) == ProfileE2B {
+			s.indexSigner(row.ID)
+		}
+	}
 	for _, m := range members {
 		s.byID[m.id] = m
 		if m.local {
@@ -171,6 +190,26 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret = nil, nil, nil
 	go s.sweep()
 	return s, nil
+}
+
+// setState records row id's state. A row that leaves "running" leaves the
+// signed-URL index too.
+func (s *Service) setState(ctx context.Context, id, state string) error {
+	err := s.ledger.SetState(ctx, id, state)
+	if state != "running" {
+		s.signersMu.Lock()
+		delete(s.signers, id)
+		s.signersMu.Unlock()
+	}
+	return err
+}
+
+// indexSigner adds running e2b sandbox id to the signed-URL index.
+func (s *Service) indexSigner(id string) {
+	token := s.envdToken(id)
+	s.signersMu.Lock()
+	s.signers[id] = token
+	s.signersMu.Unlock()
 }
 
 // markBusy records that a worker call on row id is in flight. Callers hold
@@ -293,7 +332,7 @@ func (s *Service) Abort(ctx context.Context, id, token string) error {
 		s.mu.Unlock()
 		return errors.New("sandbox capability is no longer active")
 	}
-	stateErr := s.ledger.SetState(ctx, id, "unknown")
+	stateErr := s.setState(ctx, id, "unknown")
 	s.markBusy(id)
 	s.mu.Unlock()
 	destroyCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
@@ -305,7 +344,7 @@ func (s *Service) Abort(ctx context.Context, id, token string) error {
 	if destroyErr != nil {
 		return errors.Join(stateErr, destroyErr)
 	}
-	return errors.Join(stateErr, s.ledger.SetState(ctx, id, "gone"))
+	return errors.Join(stateErr, s.setState(ctx, id, "gone"))
 }
 
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serve) }
@@ -636,11 +675,14 @@ func (s *Service) launch(ctx context.Context, row *store.Row) error {
 	if err != nil || fenced || instance.ID != row.ID || !instance.Running {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
-		_ = s.ledger.SetState(context.Background(), row.ID, "unknown")
+		_ = s.setState(context.Background(), row.ID, "unknown")
 		return errLaunch
 	}
-	if err := s.ledger.SetState(context.Background(), row.ID, "running"); err != nil {
+	if err := s.setState(context.Background(), row.ID, "running"); err != nil {
 		return err
+	}
+	if rowProfile(row.Profile) == ProfileE2B {
+		s.indexSigner(row.ID)
 	}
 	row.State = "running"
 	return nil
@@ -935,7 +977,7 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		s.mu.Lock()
 	}
-	if err := s.ledger.SetState(r.Context(), id, "unknown"); err != nil {
+	if err := s.setState(r.Context(), id, "unknown"); err != nil {
 		s.mu.Unlock()
 		unavailable(w)
 		return
@@ -952,7 +994,7 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 		unavailable(w)
 		return
 	}
-	if err := s.ledger.SetState(r.Context(), id, "gone"); err != nil {
+	if err := s.setState(r.Context(), id, "gone"); err != nil {
 		unavailable(w)
 		return
 	}

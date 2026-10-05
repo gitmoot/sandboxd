@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -196,5 +197,66 @@ func TestHandshakeRejectsRefusal(t *testing.T) {
 	}()
 	if err := Handshake(host, Port); err == nil {
 		t.Fatal("refused handshake accepted")
+	}
+}
+
+// A port bridge whose guest port closes must close the host's stream at
+// once, while the host is idle: an open stream stays in the host's pool of
+// idle connections, and the next request on it hangs until it times out.
+// The guest end is a real, blocking socket wrapped as the agent wraps
+// accepted vsock sockets.
+func TestDialClosesIdleHostStreamWhenGuestPortCloses(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	closeUpstream := make(chan struct{})
+	go func() {
+		upstream, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		<-closeUpstream
+		_ = upstream.Close()
+	}()
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostFile := os.NewFile(uintptr(fds[0]), "host")
+	host, err := net.FileConn(hostFile)
+	_ = hostFile.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+	guest, err := SocketConn(fds[1], "guest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t)
+	s.DialHost = "127.0.0.1"
+	served := make(chan struct{})
+	go func() {
+		s.ServeConn(guest)
+		close(served)
+	}()
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := OpenPort(context.Background(), host, port); err != nil {
+		t.Fatal(err)
+	}
+	// Let the bridge block reading the host's idle stream, as a pooled
+	// keep-alive stream leaves it.
+	time.Sleep(100 * time.Millisecond)
+	close(closeUpstream)
+	_ = host.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if n, err := host.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("host stream after the guest port closed: read %d bytes, %v; want EOF", n, err)
+	}
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("bridge still running after both ends closed")
 	}
 }

@@ -292,7 +292,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		// A failed Create can complete late; even a formerly running VM can
 		// leave a job-owned volume after its container disappears. Confirm
 		// allocation cleanup before marking absence.
-		if err := s.ledger.SetState(ctx, row.ID, "unknown"); err != nil {
+		if err := s.setState(ctx, row.ID, "unknown"); err != nil {
 			s.mu.Unlock()
 			return s.offline(m, err)
 		}
@@ -319,7 +319,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 			return s.offline(m, fmt.Errorf("destroy on worker %s: %w", m.id, err))
 		}
 		s.mu.Lock()
-		err := s.ledger.SetState(ctx, id, "gone")
+		err := s.setState(ctx, id, "gone")
 		s.clearBusy(id)
 		s.mu.Unlock()
 		if err != nil {
@@ -647,6 +647,11 @@ func (s *Service) ForgetWorker(ctx context.Context, id string) ([]string, error)
 		return nil, ErrWorkerOnline
 	}
 	ids, err := s.ledger.Forget(ctx, id)
+	s.signersMu.Lock()
+	for _, sandbox := range ids {
+		delete(s.signers, sandbox)
+	}
+	s.signersMu.Unlock()
 	for _, sandbox := range ids {
 		log.Printf("forget-worker %s: sandbox %s released as destroyed-unverified; its VM was NOT proven gone", id, sandbox)
 	}

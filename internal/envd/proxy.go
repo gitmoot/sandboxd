@@ -1,6 +1,7 @@
 package envd
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,40 +28,63 @@ type E2BSandboxes interface {
 	IsE2B(id string) bool
 	// AuthorizeEnvd is Authorize for an e2b-profile sandbox.
 	AuthorizeEnvd(id, token string) bool
+	// AuthorizeTraffic is AuthorizeEnvd for the sandbox's traffic access
+	// token, which grants its exposed guest ports only.
+	AuthorizeTraffic(id, token string) bool
 	// EnvdToken re-derives an e2b-profile sandbox's envd access token, to
 	// check signed file URLs; ok is false for any other ID.
 	EnvdToken(id string) (token string, ok bool)
-	// DialEnvd opens a stream to the sandbox's envd over its worker's
-	// host-to-guest channel.
-	DialEnvd(ctx context.Context, id string) (net.Conn, error)
+	// SignedSandbox finds the running e2b-profile sandbox whose envd access
+	// token signed, a signed file URL that names no sandbox, was made with.
+	SignedSandbox(signed func(token string) bool) (id string, ok bool)
+	// Exposes reports whether id's template exposes guest port.
+	Exposes(id string, port int) bool
+	// DialPort opens a stream to a TCP port of the sandbox's guest loopback
+	// over its worker's host-to-guest channel.
+	DialPort(ctx context.Context, id string, port int) (net.Conn, error)
 }
 
 // Proxy forwards an e2b sandbox's envd traffic, after sandboxd has checked
 // the sandbox's envd access token (or a file URL signed with it), to the
-// upstream envd running in the guest. Only the envd routes the SDKs use are
+// upstream envd running in the guest, and traffic to the guest ports its
+// template exposes (ports.go). Only the envd routes the SDKs use are
 // forwarded; envd's internal routes (/init, /freeze, upgrades, ...) are
 // reachable by sandboxd alone.
 type Proxy struct {
 	Sandboxes   E2BSandboxes
 	Domain      string
 	GatewayHost string
+	// PortHosts routes "<port>-<id>.<domain>" hosts to exposed guest ports;
+	// it needs wildcard DNS and TLS for *.<domain> in front of sandboxd.
+	// Without it guest ports are reached only through the gateway host and
+	// E2B's routing headers. envd's own "49983-<id>.<domain>" is always
+	// routed.
+	PortHosts bool
+	// MaxPortStreams caps one sandbox's concurrent guest port requests
+	// (WebSocket and other upgraded streams included); 0 means
+	// DefaultMaxPortStreams.
+	MaxPortStreams int
 
-	proxy *httputil.ReverseProxy
+	proxy, ports *httputil.ReverseProxy
+	streamsMu    sync.Mutex
+	streams      map[string]int
 }
 
 // NewProxy returns a Proxy using one shared upstream transport.
 func NewProxy(sandboxes E2BSandboxes, domain, gatewayHost string) *Proxy {
-	p := &Proxy{Sandboxes: sandboxes, Domain: domain, GatewayHost: gatewayHost}
+	p := &Proxy{Sandboxes: sandboxes, Domain: domain, GatewayHost: gatewayHost, streams: make(map[string]int)}
+	transport := Transport(sandboxes.DialPort)
 	p.proxy = &httputil.ReverseProxy{
 		Rewrite: func(out *httputil.ProxyRequest) {
 			out.Out.URL.Scheme = "http"
 			out.Out.URL.Host = out.In.Context().Value(proxyTarget{}).(string)
 			out.Out.Host = out.Out.URL.Host
-			// Routing headers are sandboxd's, not envd's.
-			out.Out.Header.Del("E2b-Sandbox-Id")
-			out.Out.Header.Del("E2b-Sandbox-Port")
+			// envd needs X-Access-Token (its own token check) and
+			// Authorization (the Basic user a process or file runs as);
+			// sandboxd's routing and credentials are not envd's.
+			stripHeaders(out.Out.Header, gatewayHeaders...)
 		},
-		Transport:      Transport(sandboxes.DialEnvd),
+		Transport:      transport,
 		ModifyResponse: endStreams,
 		// Connect streams and process output must reach the client as
 		// envd writes them.
@@ -68,35 +93,42 @@ func NewProxy(sandboxes E2BSandboxes, domain, gatewayHost string) *Proxy {
 			jsonError(w, http.StatusBadGateway, "sandbox envd is not reachable")
 		},
 	}
+	p.ports = newPortProxy(transport)
 	return p
 }
 
 type proxyTarget struct{}
 
-// envdHostSuffix marks the internal upstream host of a sandbox's envd; it is
-// only ever resolved by Transport.
-const envdHostSuffix = ".envd.sandboxd.internal"
+// guestHostSuffix marks the internal upstream host of a sandbox's guest
+// loopback; it is only ever resolved by Transport.
+const guestHostSuffix = ".guest.sandboxd.internal"
 
 // EnvdURL is the base URL Transport resolves to sandbox id's envd.
 func EnvdURL(id string) string {
-	return "http://" + id + envdHostSuffix + ":" + strconv.Itoa(49983)
+	return "http://" + guestHost(id, EnvdPort)
 }
 
-// Transport is an HTTP transport to sandboxes' envd: it resolves EnvdURL
-// hosts through dial and nothing else, and keeps a few idle streams per
-// sandbox.
-func Transport(dial func(ctx context.Context, id string) (net.Conn, error)) *http.Transport {
+// guestHost is the internal upstream host of port on sandbox id's guest.
+func guestHost(id string, port int) string {
+	return id + guestHostSuffix + ":" + strconv.Itoa(port)
+}
+
+// Transport is an HTTP transport to sandboxes' guest ports: it resolves
+// EnvdURL and guestHost hosts through dial and nothing else, and keeps a few
+// idle streams per sandbox port.
+func Transport(dial func(ctx context.Context, id string, port int) (net.Conn, error)) *http.Transport {
 	return &http.Transport{
 		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-			host, _, err := net.SplitHostPort(address)
+			host, portText, err := net.SplitHostPort(address)
 			if err != nil {
 				return nil, err
 			}
-			id, ok := strings.CutSuffix(host, envdHostSuffix)
-			if !ok || !validSandboxID(id) {
-				return nil, errors.New("not a sandbox envd address")
+			id, ok := strings.CutSuffix(host, guestHostSuffix)
+			port, err := strconv.Atoi(portText)
+			if !ok || !validSandboxID(id) || err != nil || port < 1 || port > 65535 {
+				return nil, errors.New("not a sandbox guest address")
 			}
-			return dial(ctx, id)
+			return dial(ctx, id, port)
 		},
 		Proxy:                 nil,
 		DisableCompression:    true,
@@ -130,72 +162,188 @@ func envdRoute(u *url.URL) bool {
 	return false
 }
 
-// sandboxID resolves the addressed sandbox as Handler does: the wildcard
-// envd host, or E2B's routing headers on the gateway host.
-func (p *Proxy) sandboxID(r *http.Request) (string, bool) {
-	id, ok := sandboxHostID(r.Host, p.Domain)
-	if p.GatewayHost != "" && strings.EqualFold(hostName(r.Host), hostName(p.GatewayHost)) {
-		headerID := r.Header.Get("E2b-Sandbox-Id")
-		if r.Header.Get("E2b-Sandbox-Port") == "49983" && validSandboxID(headerID) {
-			id, ok = headerID, true
-		}
-	}
-	return id, ok
+// onGateway reports whether r is addressed to the gateway host.
+func (p *Proxy) onGateway(r *http.Request) bool {
+	return p.GatewayHost != "" && strings.EqualFold(hostName(r.Host), hostName(p.GatewayHost))
 }
 
-// serve handles r if it is envd traffic for an e2b sandbox, and reports
-// whether it did.
+// target resolves the addressed sandbox and guest port: a wildcard
+// "<port>-<id>.<domain>" host (other ports than envd's only with PortHosts),
+// or E2B's routing headers on the gateway host.
+func (p *Proxy) target(r *http.Request) (string, int, bool) {
+	id, port, ok := sandboxHostPort(r.Host, p.Domain)
+	if ok && port != EnvdPort && !p.PortHosts {
+		ok = false
+	}
+	if p.onGateway(r) {
+		headerID := r.Header.Get("E2b-Sandbox-Id")
+		headerPort, err := strconv.Atoi(r.Header.Get("E2b-Sandbox-Port"))
+		if err == nil && strconv.Itoa(headerPort) == r.Header.Get("E2b-Sandbox-Port") && headerPort >= 1 && headerPort <= 65535 && validSandboxID(headerID) {
+			id, port, ok = headerID, headerPort, true
+		}
+	}
+	return id, port, ok
+}
+
+// serve handles r if it is traffic for an e2b sandbox, and reports whether
+// it did: envd traffic, guest port traffic, or a signed file URL addressed
+// to the gateway host without routing headers (the SDKs build those from
+// E2B_SANDBOX_URL, so only the signature names the sandbox).
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
-	if p == nil || !envdRoute(r.URL) {
+	if p == nil {
 		return false
 	}
-	id, ok := p.sandboxID(r)
+	id, port, ok := p.target(r)
+	switch {
+	case ok && port != EnvdPort:
+		p.servePort(w, r, id, port)
+		return true
+	case !envdRoute(r.URL):
+		return false
+	case !ok && r.URL.Path == "/files" && r.URL.Query().Has("signature") && p.onGateway(r):
+		// Nothing names the sandbox and nothing has proven a token yet, so
+		// a signature that cannot be valid, or one that has expired, is
+		// refused before any sandbox is looked at.
+		switch wellFormed, expired := signatureShape(r); {
+		case !wellFormed:
+			return false
+		case expired:
+			jsonError(w, http.StatusUnauthorized, "signature is already expired")
+			return true
+		}
+		id, ok = p.Sandboxes.SignedSandbox(func(token string) bool {
+			valid, _ := fileSignature(r, token)
+			return valid
+		})
+	}
 	if !ok || !p.Sandboxes.IsE2B(id) {
 		return false
 	}
-	if !p.authorized(r, id) {
+	if status, message := p.authorized(r, id); status != 0 {
 		if r.URL.Path == "/health" {
 			// As Handler: E2B's edge answers 502 for a sandbox it cannot
 			// reach, which the SDKs' is_running reads as "not running".
 			jsonError(w, http.StatusBadGateway, "sandbox not running")
 			return true
 		}
-		jsonError(w, http.StatusUnauthorized, "unauthorized access, please provide a valid access token or method signing if supported")
+		jsonError(w, status, message)
 		return true
 	}
+	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, EnvdPort))
+	r = r.WithContext(ctx)
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/connect") {
 		// Connect client and bidirectional streams read the request while
 		// the response streams.
-		_ = http.NewResponseController(w).EnableFullDuplex()
+		serveFullDuplex(p.proxy, w, r)
+		return true
 	}
-	ctx := context.WithValue(r.Context(), proxyTarget{}, strings.TrimPrefix(EnvdURL(id), "http://"))
-	p.proxy.ServeHTTP(w, r.WithContext(ctx))
+	p.proxy.ServeHTTP(w, r)
 	return true
 }
 
-// authorized checks the envd access token, or for a file transfer without
-// one, a URL signature made with it (E2B's v1 signing).
-func (p *Proxy) authorized(r *http.Request, id string) bool {
-	if token := r.Header.Get("X-Access-Token"); token != "" {
-		return p.Sandboxes.AuthorizeEnvd(id, token)
+// serveFullDuplex runs proxy for r in full-duplex mode (the request body
+// is read while the response streams) and closes the request body before
+// it returns. In full-duplex mode net/http leaves an unread body (an
+// upstream that refused or dropped the request) to its post-handler Close;
+// that Close reads the body to its end, which starts the connection's
+// background read after the server stopped it, and the next request's read
+// then panics ("invalid concurrent Body.Read call") and drops the client's
+// keep-alive connection. Closed here, the server stops that background read
+// as usual; the response is flushed first, as the server would, so a client
+// never waits on it while its body is drained. A hijacked connection (an
+// upgraded stream, such as a WebSocket, which has already ended) belongs to
+// the proxy and is left alone: flushing it would panic.
+func serveFullDuplex(proxy http.Handler, w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).EnableFullDuplex()
+	tracked := &hijackTracker{ResponseWriter: w}
+	proxy.ServeHTTP(tracked, r)
+	if tracked.hijacked {
+		return
 	}
-	if r.URL.Path != "/files" || r.Method != http.MethodGet && r.Method != http.MethodPost {
-		return false
-	}
-	token, ok := p.Sandboxes.EnvdToken(id)
-	if !ok || !validFileSignature(r, token) {
-		return false
-	}
-	return p.Sandboxes.AuthorizeEnvd(id, token)
+	_ = http.NewResponseController(w).Flush()
+	_ = r.Body.Close()
 }
 
-// validFileSignature checks signature=v1_<b64(sha256(path:op:user:token[:exp]))>
-// and an unexpired signature_expiration, as envd does.
-func validFileSignature(r *http.Request, token string) bool {
+// hijackTracker records whether the handler hijacked the connection. It
+// implements Hijack itself, so http.ResponseController reaches it before
+// unwrapping; everything else unwraps to the server's ResponseWriter.
+type hijackTracker struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (h *hijackTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(h.ResponseWriter).Hijack()
+	if err == nil {
+		h.hijacked = true
+	}
+	return conn, rw, err
+}
+
+func (h *hijackTracker) Unwrap() http.ResponseWriter { return h.ResponseWriter }
+
+const unauthorizedEnvd = "unauthorized access, please provide a valid access token or method signing if supported"
+
+// authorized checks the envd access token, or for a file transfer without
+// one, a URL signature made with it (E2B's v1 signing). It returns 0, or the
+// refusal's status and message (envd's own for an expired signature).
+func (p *Proxy) authorized(r *http.Request, id string) (int, string) {
+	if token := r.Header.Get("X-Access-Token"); token != "" {
+		if p.Sandboxes.AuthorizeEnvd(id, token) {
+			return 0, ""
+		}
+		return http.StatusUnauthorized, unauthorizedEnvd
+	}
+	if r.URL.Path != "/files" || r.Method != http.MethodGet && r.Method != http.MethodPost {
+		return http.StatusUnauthorized, unauthorizedEnvd
+	}
+	token, ok := p.Sandboxes.EnvdToken(id)
+	if !ok {
+		return http.StatusUnauthorized, unauthorizedEnvd
+	}
+	valid, expired := fileSignature(r, token)
+	switch {
+	case !valid:
+		return http.StatusUnauthorized, unauthorizedEnvd
+	case expired:
+		return http.StatusUnauthorized, "signature is already expired"
+	case !p.Sandboxes.AuthorizeEnvd(id, token):
+		return http.StatusUnauthorized, unauthorizedEnvd
+	}
+	return 0, ""
+}
+
+// signatureLength is the length of a v1 file URL signature: "v1_" and the
+// unpadded base64 of a SHA-256.
+const signatureLength = len("v1_") + 43
+
+// signatureShape checks a file URL signature without any token: wellFormed
+// reports a v1 signature of the right length with a numeric expiration (if
+// any), expired one whose expiration has passed.
+func signatureShape(r *http.Request) (wellFormed, expired bool) {
+	query := r.URL.Query()
+	signature := query.Get("signature")
+	if len(signature) != signatureLength || !strings.HasPrefix(signature, "v1_") {
+		return false, false
+	}
+	if expiration := query.Get("signature_expiration"); expiration != "" {
+		unix, err := strconv.ParseInt(expiration, 10, 64)
+		if err != nil {
+			return false, false
+		}
+		return true, unix < time.Now().Unix()
+	}
+	return true, false
+}
+
+// fileSignature checks signature=v1_<b64(sha256(path:op:user:token[:exp]))>
+// as envd does: valid reports a signature made with token, expired one whose
+// signature_expiration has passed.
+func fileSignature(r *http.Request, token string) (valid, expired bool) {
 	query := r.URL.Query()
 	signature := query.Get("signature")
 	if signature == "" {
-		return false
+		return false, false
 	}
 	operation := "read"
 	if r.Method == http.MethodPost {
@@ -204,14 +352,15 @@ func validFileSignature(r *http.Request, token string) bool {
 	raw := strings.Join([]string{query.Get("path"), operation, query.Get("username"), token}, ":")
 	if expiration := query.Get("signature_expiration"); expiration != "" {
 		unix, err := strconv.ParseInt(expiration, 10, 64)
-		if err != nil || unix < time.Now().Unix() {
-			return false
+		if err != nil {
+			return false, false
 		}
+		expired = unix < time.Now().Unix()
 		raw += ":" + expiration
 	}
 	sum := sha256.Sum256([]byte(raw))
 	expected := "v1_" + base64.RawStdEncoding.EncodeToString(sum[:])
-	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1, expired
 }
 
 // endStreams makes a Connect streaming response whose envd connection breaks

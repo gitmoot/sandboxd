@@ -74,11 +74,12 @@ func Ping(ctx context.Context, conn io.ReadWriteCloser) error {
 	return nil
 }
 
-// OpenEnvd asks the agent to bridge conn to the guest's envd port. On
-// success conn carries raw envd bytes from then on; on failure it is closed.
-func OpenEnvd(ctx context.Context, conn io.ReadWriteCloser) error {
+// OpenPort asks the agent to bridge conn to port on the guest loopback. On
+// success conn carries raw bytes of that port from then on; on failure it is
+// closed.
+func OpenPort(ctx context.Context, conn io.ReadWriteCloser, port int) error {
 	stop := closeOnCancel(ctx, conn)
-	err := WriteRequest(conn, Request{Op: OpEnvd})
+	err := WriteRequest(conn, Request{Op: OpDial, Port: port})
 	var result Result
 	if err == nil {
 		result, err = readResult(conn)

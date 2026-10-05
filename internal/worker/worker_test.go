@@ -943,7 +943,7 @@ func (d *envdDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, err
 	return d.fakeDriver.Create(ctx, spec)
 }
 
-func (d *envdDriver) DialEnvd(_ context.Context, id string) (net.Conn, error) {
+func (d *envdDriver) DialPort(_ context.Context, id string, _ int) (net.Conn, error) {
 	d.mu.Lock()
 	_, ok := d.vms[id]
 	d.mu.Unlock()
@@ -970,7 +970,7 @@ func TestEnvdStream(t *testing.T) {
 	if len(driver.envd) != 1 || !driver.envd[0] {
 		t.Fatalf("worker created %v, want one envd guest", driver.envd)
 	}
-	conn, err := client.DialEnvd(context.Background(), "sandboxd-00000000000000000000000000000e2b")
+	conn, err := client.DialPort(context.Background(), "sandboxd-00000000000000000000000000000e2b", 49983)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -984,12 +984,12 @@ func TestEnvdStream(t *testing.T) {
 			t.Fatalf("echo = %d bytes, %v", len(echoed), err)
 		}
 	}
-	if _, err := client.DialEnvd(context.Background(), "sandboxd-0000000000000000000000000000dead"); err == nil {
-		t.Fatal("DialEnvd reached a missing VM")
+	if _, err := client.DialPort(context.Background(), "sandboxd-0000000000000000000000000000dead", 49983); err == nil {
+		t.Fatal("DialPort reached a missing VM")
 	}
 	// A driver without envd guests says so.
 	_, plain := serve(t, plainDriver{newFake()})
-	if _, err := enrolled(t, plain.URL, 1).DialEnvd(context.Background(), "sandboxd-00000000000000000000000000000e2b"); !errors.Is(err, vm.ErrNoEnvd) {
+	if _, err := enrolled(t, plain.URL, 1).DialPort(context.Background(), "sandboxd-00000000000000000000000000000e2b", 49983); !errors.Is(err, vm.ErrNoEnvd) {
 		t.Fatalf("plain driver: %v", err)
 	}
 }

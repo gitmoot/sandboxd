@@ -147,9 +147,9 @@ func (d Declaration) clone() Declaration {
 type Member interface {
 	vm.Driver
 	vm.ResourceMeter
-	// DialEnvd opens a stream to an e2b guest's envd (vm.EnvdDialer); a
-	// driver without envd guests fails with vm.ErrNoEnvd.
-	vm.EnvdDialer
+	// DialPort opens a stream to a TCP port of an e2b guest (vm.PortDialer);
+	// a driver without envd guests fails with vm.ErrNoEnvd.
+	vm.PortDialer
 	// Enroll presents a lease generation (strictly the gateway's durable
 	// counter, >= 1). A worker accepts it only if it is >= every lease it has
 	// accepted, then returns its declaration; every later call is made under
@@ -195,12 +195,12 @@ func (l *local) Usage(ctx context.Context, id string) (vm.Usage, error) {
 	return meter.Usage(ctx, id)
 }
 
-func (l *local) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
-	dialer, ok := l.Driver.(vm.EnvdDialer)
+func (l *local) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	dialer, ok := l.Driver.(vm.PortDialer)
 	if !ok {
 		return nil, vm.ErrNoEnvd
 	}
-	return dialer.DialEnvd(ctx, id)
+	return dialer.DialPort(ctx, id, port)
 }
 
 func (l *local) CreateUntil(ctx context.Context, spec vm.Spec, _ time.Time) (vm.Instance, error) {
@@ -274,9 +274,9 @@ const (
 	minKeyLen         = 16
 	staleMessage      = "stale worker lease"
 
-	// envdUpgrade is the Upgrade token of a worker envd stream: after "101
-	// Switching Protocols" the connection carries raw envd bytes.
-	envdUpgrade = "sandboxd-envd"
+	// portUpgrade is the Upgrade token of a worker guest port stream: after
+	// "101 Switching Protocols" the connection carries the port's raw bytes.
+	portUpgrade = "sandboxd-port"
 
 	frameStarted = 's'
 	frameStdout  = 'o'

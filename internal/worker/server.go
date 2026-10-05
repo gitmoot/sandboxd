@@ -111,7 +111,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 		return
-	case len(parts) < 2 || len(parts) > 3 || parts[0] != "vms" || !vmIDPattern.MatchString(parts[1]):
+	case len(parts) < 2 || len(parts) > 4 || parts[0] != "vms" || !vmIDPattern.MatchString(parts[1]):
 		http.NotFound(w, r)
 		return
 	}
@@ -121,6 +121,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case len(parts) == 2:
 		method, handle = http.MethodDelete, s.destroy
+	case len(parts) == 4:
+		port, err := strconv.Atoi(parts[3])
+		if parts[2] != "ports" || err != nil || !vm.ValidPort(port) || strconv.Itoa(port) != parts[3] {
+			http.NotFound(w, r)
+			return
+		}
+		method = http.MethodPost
+		handle = func(w http.ResponseWriter, r *http.Request, id string, leaseCtx context.Context) {
+			s.port(w, r, id, port, leaseCtx)
+		}
 	case parts[2] == "files":
 		method, handle = http.MethodPut, s.copyIn
 	case parts[2] == "run":
@@ -129,8 +139,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method, handle = http.MethodGet, s.usage
 	case parts[2] == "expiry":
 		method, handle = http.MethodPut, s.expire
-	case parts[2] == "envd":
-		method, handle = http.MethodPost, s.envd
 	default:
 		http.NotFound(w, r)
 		return
@@ -498,30 +506,31 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request, id string, leaseCtx
 	}
 }
 
-// envd upgrades the request to a raw byte stream to VM id's envd, opened by
-// the driver over its host-to-guest channel. The stream ends when either side
-// closes it, or when a newer lease supersedes the one it was opened under.
-func (s *Server) envd(w http.ResponseWriter, r *http.Request, id string, leaseCtx context.Context) {
-	dialer, ok := s.driver.(vm.EnvdDialer)
+// port upgrades the request to a raw byte stream to a TCP port of VM id,
+// opened by the driver over its host-to-guest channel. The stream ends when
+// either side closes it, or when a newer lease supersedes the one it was
+// opened under.
+func (s *Server) port(w http.ResponseWriter, r *http.Request, id string, port int, leaseCtx context.Context) {
+	dialer, ok := s.driver.(vm.PortDialer)
 	if !ok {
 		http.Error(w, vm.ErrNoEnvd.Error(), http.StatusNotImplemented)
 		return
 	}
-	if !headerHasToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), envdUpgrade) {
-		http.Error(w, "an envd stream must upgrade to "+envdUpgrade, http.StatusBadRequest)
+	if !headerHasToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), portUpgrade) {
+		http.Error(w, "a port stream must upgrade to "+portUpgrade, http.StatusBadRequest)
 		return
 	}
 	ctx, cancel := fenced(r, leaseCtx)
 	defer cancel()
-	guest, err := dialer.DialEnvd(ctx, id)
+	guest, err := dialer.DialPort(ctx, id, port)
 	if err != nil {
-		driverFailed(w, "envd", err)
+		driverFailed(w, "port", err)
 		return
 	}
 	defer guest.Close()
 	conn, buffered, err := http.NewResponseController(w).Hijack()
 	if err != nil {
-		http.Error(w, "envd streams need HTTP/1.1", http.StatusHTTPVersionNotSupported)
+		http.Error(w, "port streams need HTTP/1.1", http.StatusHTTPVersionNotSupported)
 		return
 	}
 	defer conn.Close()
@@ -529,7 +538,7 @@ func (s *Server) envd(w http.ResponseWriter, r *http.Request, id string, leaseCt
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return
 	}
-	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: "+envdUpgrade+"\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: "+portUpgrade+"\r\n\r\n"); err != nil {
 		return
 	}
 	stop := context.AfterFunc(leaseCtx, func() { _ = conn.Close(); _ = guest.Close() })

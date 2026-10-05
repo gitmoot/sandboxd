@@ -65,8 +65,9 @@ type fakeFCHost struct {
 	bootDies   bool
 	ownerShift int
 	stats      []fcCgroupSample
-	// envdAddr is where a booted guest's agent bridges OpEnvd.
-	envdAddr string
+	// envdPort is the loopback port tests dial through a booted e2b
+	// guest's agent (OpDial).
+	envdPort int
 	// oldAgent boots guests whose agent predates OpDisk.
 	oldAgent bool
 	// stateCalls counts firewall checks; stateFailures makes the next ones
@@ -233,7 +234,7 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ stri
 		return err
 	}
 	h.listeners[id] = listener
-	go serveFakeAgent(listener, guest, h.envdAddr, h.oldAgent)
+	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent)
 	return nil
 }
 
@@ -262,11 +263,15 @@ func listenUnixIn(dir, name string) (*net.UnixListener, error) {
 
 // serveFakeAgent answers Firecracker's vsock handshake on every connection
 // and serves a real guest agent whose filesystem is the guest directory.
-func serveFakeAgent(listener *net.UnixListener, guest, envdAddr string, oldAgent bool) {
+func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent bool) {
+	dialHost := ""
+	if dial {
+		dialHost = "127.0.0.1"
+	}
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
-		EnvdAddr: envdAddr, DiskPath: guest,
+		DialHost: dialHost, DiskPath: guest,
 	}
 	for {
 		conn, err := listener.Accept()
@@ -740,7 +745,7 @@ func TestFirecrackerUsageWithoutGuestDisk(t *testing.T) {
 }
 
 // echoEnvd stands in for every guest's envd: it echoes.
-func echoEnvd(t *testing.T) string {
+func echoEnvd(t *testing.T) int {
 	t.Helper()
 	envd, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -759,7 +764,7 @@ func echoEnvd(t *testing.T) string {
 			}()
 		}
 	}()
-	return envd.Addr().String()
+	return envd.Addr().(*net.TCPAddr).Port
 }
 
 func echoes(conn net.Conn) bool {
@@ -777,13 +782,13 @@ func echoes(conn net.Conn) bool {
 func TestFirecrackerFirewallMonitor(t *testing.T) {
 	d, host, cfg := newTestFirecracker(t)
 	d.firewallEvery = 50 * time.Millisecond
-	host.envdAddr = echoEnvd(t)
+	host.envdPort = echoEnvd(t)
 	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true}); err != nil {
 		t.Fatal(err)
 	}
 	var streams []net.Conn
 	for range 8 {
-		conn, err := d.DialEnvd(context.Background(), fcTestID)
+		conn, err := d.DialPort(context.Background(), fcTestID, host.envdPort)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -857,7 +862,7 @@ func TestFirecrackerEnvdGuest(t *testing.T) {
 		}
 	}()
 	d, host, cfg := newTestFirecracker(t)
-	host.envdAddr = envd.Addr().String()
+	host.envdPort = envd.Addr().(*net.TCPAddr).Port
 	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
 		t.Fatal(err)
 	}
@@ -876,11 +881,11 @@ func TestFirecrackerEnvdGuest(t *testing.T) {
 		t.Fatalf("boot arguments: strict %s, envd %s", strictConfig, envdConfig)
 	}
 	// A strict guest never bridges to envd, whatever its agent would do.
-	if conn, err := d.DialEnvd(context.Background(), fcTestID); err == nil {
+	if conn, err := d.DialPort(context.Background(), fcTestID, host.envdPort); err == nil {
 		conn.Close()
-		t.Fatal("DialEnvd reached a strict guest")
+		t.Fatal("DialPort reached a strict guest")
 	}
-	conn, err := d.DialEnvd(context.Background(), fcTestID2)
+	conn, err := d.DialPort(context.Background(), fcTestID2, host.envdPort)
 	if err != nil {
 		t.Fatal(err)
 	}

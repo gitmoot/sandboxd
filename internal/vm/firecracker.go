@@ -102,7 +102,7 @@ type FirecrackerDriver struct {
 var (
 	_ Driver        = (*FirecrackerDriver)(nil)
 	_ ResourceMeter = (*FirecrackerDriver)(nil)
-	_ EnvdDialer    = (*FirecrackerDriver)(nil)
+	_ PortDialer    = (*FirecrackerDriver)(nil)
 )
 
 // ErrDiskFloor reports that creating a VM would leave less free disk than the
@@ -166,7 +166,7 @@ type fcMeta struct {
 	Image     string `json:"image"`
 	CPUs      int    `json:"cpus"`
 	MemoryMiB int    `json:"memoryMiB"`
-	// Envd marks an e2b guest (Spec.Envd); only those serve DialEnvd.
+	// Envd marks an e2b guest (Spec.Envd); only those serve DialPort.
 	Envd bool `json:"envd,omitempty"`
 }
 
@@ -1019,11 +1019,15 @@ func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error)
 	return usage, nil
 }
 
-// DialEnvd opens a host-initiated stream to an e2b guest's envd: a fresh
-// vsock connection to the guest agent, which bridges it to envd on the guest
-// loopback. While it is open the stream is watched by the driver's firewall
-// monitor, as Run is; losing the firewall destroys the VM and ends it.
-func (d *FirecrackerDriver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+// DialPort opens a host-initiated stream to a TCP port of an e2b guest: a
+// fresh vsock connection to the guest agent, which bridges it to that port on
+// the guest loopback. While it is open the stream is watched by the driver's
+// firewall monitor, as Run is; losing the firewall destroys the VM and ends
+// it.
+func (d *FirecrackerDriver) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	if !ValidPort(port) {
+		return nil, fmt.Errorf("invalid guest port %d", port)
+	}
 	if err := d.firewallReady(ctx); err != nil {
 		return nil, fmt.Errorf("firewall is not armed before guest access: %w", err)
 	}
@@ -1041,22 +1045,23 @@ func (d *FirecrackerDriver) DialEnvd(ctx context.Context, id string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	if err := guestagent.OpenEnvd(ctx, conn); err != nil {
-		return nil, fmt.Errorf("envd of %q: %w", id, err)
+	if err := guestagent.OpenPort(ctx, conn, port); err != nil {
+		return nil, fmt.Errorf("port %d of %q: %w", port, id, err)
 	}
-	guarded := &fcEnvdConn{Conn: conn}
+	guarded := &fcGuestConn{Conn: conn}
 	guarded.unwatch = d.watchFirewall(id, func(error) { _ = conn.Close() })
 	return guarded, nil
 }
 
-// fcEnvdConn is an envd stream whose Close also ends its firewall watch.
-type fcEnvdConn struct {
+// fcGuestConn is a guest port stream whose Close also ends its firewall
+// watch.
+type fcGuestConn struct {
 	net.Conn
 	once    sync.Once
 	unwatch func()
 }
 
-func (c *fcEnvdConn) Close() error {
+func (c *fcGuestConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(c.unwatch)
 	return err

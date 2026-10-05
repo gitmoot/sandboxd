@@ -31,7 +31,7 @@ sandboxd. ⚪ means a cell has only such tests.
 | Control plane | `Sandbox.list` | 🟡 16/22 | 🟡 13/19 | — | — | — |
 | Control plane | `set_timeout` | ✅ 6/6 | ✅ 3/3 | — | — | — |
 | Control plane | `get_metrics` | ✅ 4/4 | ✅ 2/2 | — | — | — |
-| Control plane | secure envd access token | ✅ 4/4 | 🟡 1/2 (+3 offline) | — | — | — |
+| Control plane | secure envd access token | ✅ 4/4 | ✅ 2/2 (+3 offline) | — | — | — |
 | Control plane | `get_host` / guest ports | ❌ 0/2 | ❌ 0/2 | — | — | — |
 | Control plane | pause, resume, snapshots | ❌ 0/28 | ❌ 0/23 (+8 offline) | — | — | — |
 | Control plane | lifecycle options (autoPause, onTimeout) | — | ❌ 0/12 (+13 offline) | — | — | — |
@@ -57,7 +57,7 @@ sandboxd. ⚪ means a cell has only such tests.
 | Files | `files.watch_dir` | ✅ 17/17 | ✅ 7/7 (+4 offline) | — | — | — |
 | Files | file metadata | ✅ 18/18 | ✅ 9/9 | — | — | — |
 | Files | content encoding (gzip) | ✅ 8/8 | ✅ 4/4 | — | — | — |
-| Files | signed upload/download URLs | ❌ 0/6 | 🟡 1/7 | — | — | — |
+| Files | signed upload/download URLs | ✅ 6/6 | ✅ 7/7 | — | — | — |
 | PTY | `pty.create` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | PTY | `pty.connect` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | PTY | `pty.kill` | ✅ 4/4 | ✅ 2/2 | — | — | — |
@@ -81,8 +81,8 @@ sandboxd. ⚪ means a cell has only such tests.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 347 pass against sandboxd, 621 pass offline,
-543 expected failures, 3 skipped.
+Totals: 360 pass against sandboxd, 621 pass offline,
+530 expected failures, 3 skipped.
 
 ## Expected failures
 
@@ -127,12 +127,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `api/list.test.ts > paginate paused sandboxes #2`
 - JS e2b: `api/list.test.ts > paginate running and paused sandboxes`
 - JS e2b: `api/list.test.ts > paginate running and paused sandboxes #2`
-
-</details>
-
-<details><summary>Control plane: secure envd access token (1)</summary>
-
-- JS e2b: `sandbox/secure.test.ts > secure sandbox > test access file with signing`
 
 </details>
 
@@ -324,23 +318,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/apiDefaults.test.ts > Sandbox.pause omits memory when keepMemory is unset`
 - JS e2b: `sandbox/apiDefaults.test.ts > Sandbox.pause sends an explicit keepMemory`
 - JS e2b: `sandbox/urls.test.ts > sandbox file URLs > file URLs use direct sandbox host when envd API uses stable host`
-
-</details>
-
-<details><summary>Files: signed upload/download URLs (12)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_expired_signing`
-- Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_signing`
-- Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_signing_and_expiration`
-- Python e2b: `sync/sandbox_sync/files/test_secured.py::test_download_url_with_expired_signing`
-- Python e2b: `sync/sandbox_sync/files/test_secured.py::test_download_url_with_signing`
-- Python e2b: `sync/sandbox_sync/files/test_secured.py::test_download_url_with_signing_and_expiration`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with expired signing`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with valid signing`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test access file with valid signing as root`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with invalid signing`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing`
-- JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing as root user`
 
 </details>
 

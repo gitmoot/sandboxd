@@ -160,6 +160,104 @@ ZeroTier, the NAT's own host and resolver, metadata and RFC 1918 addresses
 were unreachable, vsock to the host was refused, and the internet was
 reachable.
 
+## Code-interpreter image
+
+The image of the `code-interpreter-v1` template: E2B's
+[code-interpreter](https://github.com/e2b-dev/code-interpreter) template
+(Jupyter Server, the FastAPI code-interpreter server on port 49999 and the
+python, javascript, r, java and bash kernels) on top of the e2b guest
+contract above (guest agent as PID 1, envd 0.9.0, `/etc/sandboxd/env`, user
+`user` 1000:1000 with passwordless sudo). Build it like the others (root,
+from the repository root; about 11 minutes uncached):
+
+```sh
+# Prints the path, images/code-interpreter-amd64-<sha256 prefix>.ext4,
+# about 3.6 GiB (3.4 GiB allocated).
+sudo images/code-interpreter-amd64-fc/build.sh /var/lib/sandboxd-fc
+```
+
+`build.sh` downloads upstream's `template/` from GitHub at
+`@e2b/code-interpreter-template@0.4.6` (commit
+`8d51873ccf620498347210dc3ec9698cf67c2829`, codeload archive SHA-256
+`0a03c6b0…eb130ca`), and the `Dockerfile` translates its `make_template()`
+(non-docker variant) step by step. Everything upstream leaves floating is
+pinned where it can be:
+
+| Component | Upstream | This image |
+| --- | --- | --- |
+| Base image | `python:3.13` | `python:3.13@sha256:138ea058…4d920d` (Python 3.13.16, Debian 13) |
+| Node.js | `setup_20.x` script, newest 20.x | nodesource `nodejs=20.20.2-1nodesource1`, repository key SHA-256 `b42e0321…0a271d` |
+| `e2b_charts` | unpinned | `1.0.0` (the repository's own `chart_data_extractor` at the commit) |
+| Python packages | `requirements.txt` | as upstream (top-level pins; dependencies resolve at build time) |
+| R | `r-base=4.5.*` | same (Debian 13 has 4.5.0-3) |
+| IRkernel | cloud.r-project.org, newest | Posit Package Manager CRAN snapshot `2026-10-01` (IRkernel 1.3.2) |
+| ijavascript | `e2b-dev/ijavascript` default branch | commit `79cb7d56dcfe0df9ff55eff0ca4dc920a6dcc361` (5.2.1); its git and semver dependencies still float |
+| bash_kernel | unpinned | `0.10.0` |
+| JDK | OpenJDK 11 GA tarball | same, SHA-256 `3784cfc4…6610f2e` as published by java.net |
+| IJava | 1.3.0 release zip | same, observed SHA-256 `484cc625…ec246b2` (no published checksum) |
+| Server venv | `server/requirements.txt` | as upstream (all pinned there) |
+
+Debian packages come from the live Debian and nodesource mirrors, so a
+rebuild picks up their security updates; the image's SHA-256 changes with
+them. Unlike upstream, apt installs skip recommended packages, and man and
+info pages, message catalogs, package documentation (copyright files stay)
+and the JDK's `jmods` and `src.zip` are removed.
+
+There is no systemd in the guest, so upstream's `jupyter.service` and
+`code-interpreter.service` become one supervisor,
+`/root/.jupyter/sandboxd-start.sh` (root, 0755). It runs in the foreground
+until killed: Jupyter Server (`MATPLOTLIBRC` set, stdout discarded), then,
+once `/root/.jupyter/jupyter-healthcheck.sh` passes, the code-interpreter
+server (`uvicorn main:app` on `0.0.0.0:49999`). Either one is restarted 1 s
+after it exits; when Jupyter exits, the code-interpreter server and the
+kernels Jupyter started are stopped too and everything restarts. Its own
+messages go to `/var/log/sandboxd-start.log`, Jupyter's stderr to
+`/var/log/jupyter.log`, the server's output to
+`/var/log/code-interpreter.log`. A second instance exits at once.
+
+sandboxd starts it through the template's start and ready commands: after
+envd's `/init` it runs the start command once as root through envd
+(`/bin/bash -l -c <start-cmd>`), does not wait for it, then runs the ready
+command until it exits 0 (at most `-template-ready-timeout`, default 3m, or the create fails). The
+registration:
+
+```sh
+-register-template 'id=code-interpreter-v1,image=/var/lib/sandboxd-fc/images/code-interpreter-amd64-<sha>.ext4,profile=e2b,envd-version=0.9.0,port=49999,start-cmd=/root/.jupyter/sandboxd-start.sh,ready-cmd=curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:49999/health'
+```
+
+Measured on this host's Firecracker worker (2 vCPUs, `-memory-mib 2048`,
+images `code-interpreter-amd64-487b6992d8d3` and `-a5e50c1be0ff` (the latter
+with the guest agent that closes a port stream as soon as the guest port
+closes), stock `e2b` and `e2b_code_interpreter` SDKs):
+
+- Create to ready (boot, envd init, start, ready): 5.1–6.9 s.
+- All five kernels execute through `/execute`, including create-time
+  `envs` in python and bash; a matplotlib plot returns a PNG and chart data.
+- Guest memory used (`free -m`): about 110 MiB booted, 390 MiB ready (the
+  server opens python and javascript contexts), 730–760 MiB with all five
+  kernels started. `-memory-mib 2048` is the recommended size; it leaves
+  about 1.2 GiB for user code.
+- `kill -9` of the code-interpreter server: healthy and executing again
+  within 4 s, measured inside the guest; of Jupyter Server: within 6 s (new
+  kernels; the old ones are gone, as under systemd). Through sandboxd's port
+  proxy, `run_code` works again 3.0 s after the server is killed and 5.1 s
+  after Jupyter is (image `-a5e50c1be0ff`; before it, a stale pooled stream
+  made the first call hang for 20 s).
+- Stock upstream suites against this worker (image `-a5e50c1be0ff`):
+  code-interpreter Python 163 passed, 0 failed; JS 82 passed, 0 failed.
+
+Upstream's tests kill with `kill -9 $(pgrep -f 'jupyter server')` and
+`kill -9 $(pgrep -f 'uvicorn main:app')`. The supervisor's own command lines
+contain neither string. Jupyter's process is
+`/usr/local/bin/python3.13 /usr/local/bin/jupyter-server …`, so the first
+command matches only the shell running it, here as on E2B.
+
+Licensing: the template is Apache-2.0; the image carries upstream's license
+and a source note in `/usr/share/doc/code-interpreter/` (`LICENSE`,
+`SOURCE`), next to envd's in `/usr/share/doc/envd/`. The kernels and
+packages keep their own licenses (Debian's copyright files are in
+`/usr/share/doc/<package>/copyright`).
+
 ## Running
 
 ```sh

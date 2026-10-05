@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -52,8 +53,18 @@ func (s *Service) profileOf(ctx context.Context, id string) Profile {
 // envdToken derives an e2b sandbox's envd access token, so connect can return
 // it again while the ledger stores only its hash.
 func (s *Service) envdToken(id string) string {
+	return s.derive("sandboxd envd access token v1", id)
+}
+
+// trafficToken derives an e2b sandbox's traffic access token, which grants
+// its exposed guest ports and nothing else.
+func (s *Service) trafficToken(id string) string {
+	return s.derive("sandboxd traffic access token v1", id)
+}
+
+func (s *Service) derive(label, id string) string {
 	mac := hmac.New(sha256.New, s.tokenKey)
-	mac.Write([]byte("sandboxd envd access token v1\x00" + id))
+	mac.Write([]byte(label + "\x00" + id))
 	return hex.EncodeToString(mac.Sum(nil))
 }
 
@@ -64,12 +75,15 @@ type e2bSandbox struct {
 	ClientID        string `json:"clientID"`
 	EnvdVersion     string `json:"envdVersion"`
 	EnvdAccessToken string `json:"envdAccessToken"`
-	Domain          string `json:"domain"`
+	// TrafficAccessToken is always issued: guest ports are never public
+	// (E2B's allowPublicTraffic=false).
+	TrafficAccessToken string `json:"trafficAccessToken"`
+	Domain             string `json:"domain"`
 }
 
 func (s *Service) e2bResponse(row store.Row) e2bSandbox {
 	return e2bSandbox{ID: row.ID, TemplateID: row.TemplateID, ClientID: clientID, EnvdVersion: s.describe(row).EnvdVersion,
-		EnvdAccessToken: s.envdToken(row.ID), Domain: s.cfg.Domain}
+		EnvdAccessToken: s.envdToken(row.ID), TrafficAccessToken: s.trafficToken(row.ID), Domain: s.cfg.Domain}
 }
 
 // createV2Request is the SDK 2.52.0 NewSandboxV2 body. Every field is known,
@@ -106,8 +120,8 @@ func (request createV2Request) unsupported() string {
 		return "autoResume is not supported"
 	case request.Secure != nil && !*request.Secure:
 		return "every sandbox requires its envd access token; secure=false is not supported"
-	case !absent(request.AllowInternetAccess), !absent(request.Network):
-		return "network and internet access options are not supported"
+	case !absent(request.AllowInternetAccess), !absent(request.Network) && !privateTraffic(request.Network):
+		return "network and internet access options are not supported (guest ports are never public: only network.allowPublicTraffic=false is accepted)"
 	case !absent(request.MCP):
 		return "MCP gateways are not supported"
 	case !absent(request.IAM):
@@ -116,6 +130,17 @@ func (request createV2Request) unsupported() string {
 		return "volume mounts are not supported"
 	}
 	return ""
+}
+
+// privateTraffic reports whether network asks for exactly what sandboxd
+// always does: guest ports reachable only with the traffic access token.
+func privateTraffic(network json.RawMessage) bool {
+	decoder := json.NewDecoder(bytes.NewReader(network))
+	decoder.DisallowUnknownFields()
+	var options struct {
+		AllowPublicTraffic *bool `json:"allowPublicTraffic"`
+	}
+	return decoder.Decode(&options) == nil && !decoder.More() && options.AllowPublicTraffic != nil && !*options.AllowPublicTraffic
 }
 
 func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
@@ -187,15 +212,23 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	// envd is the guest's entrypoint; until its /init the sandbox has
 	// neither its access token nor its environment, so a failed /init ends
 	// the sandbox. The envVars go to the guest and nowhere else.
-	if err := s.initEnvd(r.Context(), id, request.EnvVars); err != nil {
-		log.Printf("sandbox %s: envd initialization failed, destroying it: %v", id, err)
+	// Then the template's start command, if any, and its readiness: a
+	// sandbox that is not ready is never returned.
+	message := "sandbox envd did not start"
+	err = s.initEnvd(r.Context(), id, request.EnvVars)
+	if err == nil {
+		message = "sandbox template did not become ready"
+		err = s.startTemplate(r.Context(), id, template.Template)
+	}
+	if err != nil {
+		log.Printf("sandbox %s: %s, destroying it: %v", id, message, err)
 		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workerSlowTimeout)
 		abortErr := s.Abort(abortCtx, id, s.envdToken(id))
 		cancel()
 		if abortErr != nil {
-			log.Printf("sandbox %s: destroy after failed envd initialization: %v", id, abortErr)
+			log.Printf("sandbox %s: destroy after failed start: %v", id, abortErr)
 		}
-		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "sandbox envd did not start")
+		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, message)
 		return
 	}
 	jsonResponse(w, http.StatusCreated, s.e2bResponse(row))

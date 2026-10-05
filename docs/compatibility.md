@@ -28,7 +28,7 @@ Templates are registered by the operator only: `-template`/`-image` for a local 
 An `e2b` guest runs upstream [E2B envd](https://github.com/e2b-dev/infra) (Apache-2.0, pinned to 0.9.0; `images/e2b-amd64-fc`, `images/e2b-arm64`, see [firecracker.md](firecracker.md#e2b-base-image)) as its entrypoint, with a writable root as E2B provides. Register such templates with `envd-version=0.9.0`.
 
 - **Ingress.** sandboxd stays the only ingress. For an `e2b` sandbox it forwards, to the guest's envd only, `/process.Process/<Method>`, `/filesystem.Filesystem/<Method>` (method names matching `^[A-Z][A-Za-z0-9]*$`; a path with any percent-encoded byte, or a `.`/`..` segment, is never forwarded), `/files` (GET/POST, multipart, octet-stream, gzip), `/files/compose`, `/envs` and `/health`, after checking the sandbox's `X-Access-Token` itself (a missing or wrong token is `401`, and `/health` of a sandbox that is not running is `502`). A `GET`/`POST /files` without a token is accepted only with a valid, unexpired E2B v1 URL signature made with that token (`download_url`/`upload_url`). envd's internal routes (`/init`, `/freeze`, upgrades, ...) are never forwarded. Connect streaming, client streams and half-close pass through unbuffered. `gitmoot-strict` sandboxes keep the original `internal/envd` handler byte for byte; neither profile's token opens the other's data plane.
-- **Channel.** The proxy reaches envd only over the worker's host-initiated channel, never the guest network: on Firecracker a fresh vsock connection to the guest agent, which bridges it to envd on the guest loopback (the driver's firewall monitor watches it while it is open, as it does running commands); through an enrolled worker an authenticated `POST /worker/v1/vms/{id}/envd` HTTP/1.1 upgrade carrying the same stream; on the dev driver a Unix socket. The Apple driver refuses `e2b` guests until its exec-stdio channel (D10) lands.
+- **Channel.** The proxy reaches envd only over the worker's host-initiated channel, never the guest network: on Firecracker a fresh vsock connection to the guest agent, which bridges it to envd on the guest loopback (the driver's firewall monitor watches it while it is open, as it does running commands); through an enrolled worker an authenticated `POST /worker/v1/vms/{id}/ports/49983` HTTP/1.1 upgrade carrying the same stream (see guest ports below); on the dev driver a Unix socket. The Apple driver refuses `e2b` guests until its exec-stdio channel (D10) lands.
 - **Create.** After the VM boots, sandboxd sends envd its `/init`: the sandbox's envd access token, default user `user`, working directory `/home/user`, and the create request's `envVars`. `envVars` are held only in that request's memory and the guest; they are never written to the ledger or logged. If envd does not initialize within 30 s the sandbox is destroyed and create answers `503`.
 - **Users.** Commands and files default to `user` (1000:1000, home `/home/user`, passwordless `sudo`, as in E2B's base template). SDK `user="root"` is allowed inside the VM (owner decision D3, after the isolation probes in [#25](https://github.com/gitmoot/sandboxd/issues/25) passed): root inside the guest owns only that VM. See [firecracker.md](firecracker.md#root-inside-an-e2b-guest).
 - **Metrics.** Firecracker reports page cache from the VMM cgroup's `memory.stat` (`file`) and disk use from the guest agent's `statfs` of the writable filesystem (the home disk, or an `e2b` guest's root), so `get_metrics` no longer answers `503` there. A strict guest booted from an image whose agent predates the disk report keeps its CPU and memory metrics; only `e2b` metrics, which need disk figures, answer `503` for such a guest (`e2b` images always include it).
@@ -119,6 +119,19 @@ bridges.
 ordinary guests on gate failure and only requests anchor removal after every
 VM has been deleted.
 
+### e2b guest ports, `get_host` and signed file URLs (M3, [#26](https://github.com/gitmoot/sandboxd/issues/26))
+
+Guest ports other than envd's are **allowlist-only per template** and **never public** (E2B's `allowPublicTraffic=false`):
+
+- Register the ports with the template: `-register-template id=…,profile=e2b,…,port=49999[,port=…]`. Strict templates cannot expose ports. No other guest port is reachable, and envd's 49983 is never a template port.
+- Every request needs the sandbox's traffic access token (`E2b-Traffic-Access-Token`, returned as `trafficAccessToken` by create and connect, HMAC-derived like the envd token with a different label) or its envd access token (`X-Access-Token`). The traffic token opens the template's ports only, never envd. Refusals use E2B's edge bodies: 403 for a missing or invalid token or a port the template does not expose, 502 for an unknown sandbox or a closed port, 429 past `-port-max-streams` concurrent requests per sandbox (default 256; WebSocket and other upgraded streams count while open).
+- Routing: on the gateway host (`-gateway-host`) with the SDKs' `E2b-Sandbox-Id`/`E2b-Sandbox-Port` headers, which the code-interpreter SDKs send when `E2B_SANDBOX_URL` points at the gateway. The bytes reach the guest only over the host-initiated channel (Firecracker vsock → guest agent `OpDial` → guest loopback; the worker API's `POST /vms/<id>/ports/<n>` upgrade for enrolled workers); nothing listens on a host port and the guest network is not involved. HTTP, streaming and WebSocket upgrades pass through. When a guest port closes (its server restarts), the guest agent closes the host's stream at once, so the gateway never reuses a dead pooled connection.
+- Headers: a guest port is served by untrusted guest code, so sandboxd never forwards its routing headers, the traffic token, `X-API-Key`, `Authorization`, `Cookie` or `Proxy-Authorization` to it (a guest web app cannot use cookies or HTTP authentication through the gateway). `X-Access-Token` does reach the port: E2B's code-interpreter server reads it to call the sandbox's own envd (`/envs`), and it opens nothing but that sandbox's envd. envd gets `X-Access-Token` and `Authorization` (its token check and the Basic user a process or file runs as) and none of the others.
+- `create` accepts `network: {"allowPublicTraffic": false}` (what sandboxd always does); every other network option is still refused.
+- `get_host(port)` returns `<port>-<id>.<domain>`; the SDKs never apply `E2B_SANDBOX_URL` to it. That form needs wildcard DNS and TLS for `*.<domain>` in front of sandboxd. Owner decision D2 defers wildcard DNS, so host routing of guest ports is **off by default** in `sandboxd` and `sandboxd-dev` and `get_host` URLs do not resolve in a default deployment; the code-interpreter SDKs use the routing headers instead. `-port-hosts` turns host routing on once an operator has both. The token rules are the same; envd's own `49983-<id>.<domain>` host stays routed as before. For a client on the gateway's own machine, a domain under `localhost` (for example `sbx.localhost:<port>`) resolves without DNS setup on resolvers that implement RFC 6761, but still needs a TLS front.
+- Signed file URLs (`download_url`/`upload_url`) are built from `E2B_SANDBOX_URL` and carry no routing headers. sandboxd routes a `/files` request with a `signature` on the gateway host to the one running e2b sandbox whose envd token made that signature (the signature binds path, operation, user, expiry and token), so no wildcard DNS is needed. Such a request proves nothing until a signature matches, so a signature of the wrong shape or with an unparsable expiration is refused before any lookup, as is an expired one (envd's own `401 {"code":401,"message":"signature is already expired"}`), and the match reads only an in-memory index of running e2b sandboxes (kept on create, delete, reconcile and restart), never the ledger or the control lock.
+- Template start and ready commands: `start-cmd=<command>` runs once per sandbox as root through envd right after `/init`, in the background; `ready-cmd=<command>` then runs as root until it exits 0 before create returns 201. Both together are bounded by `-template-ready-timeout` (default 3m); a sandbox not ready by then is destroyed (503). Give the client's create request a longer timeout than a cold start (the stock SDKs default to 60 s). E2B runs the start command at template build time and snapshots the result; sandboxd has no snapshots, so this is a per-create cold start. The `code-interpreter-v1` image and its registration line are in [firecracker.md](firecracker.md#code-interpreter-image).
+
 ### CI conformance gate (dev driver)
 
 Every pull request runs `conformance/run.py` (`.github/workflows/conformance.yml`).
@@ -150,6 +163,22 @@ Node 22+; it installs the SDKs into a temporary venv and npm directory and
 deletes them afterwards unless `--workdir` is given.
 
 This proves the wire contract only. Isolation is proven on a real worker.
+
+**Code-interpreter in CI (M3 decision).** The gate does not boot the
+`code-interpreter-v1` image. That image is 3.6 GiB (Jupyter plus Python, R,
+Java, Node and bash kernels) and needs a Firecracker worker with KVM, which
+GitHub runners do not have. The dev driver cannot serve it either: its
+guests have no in-guest server on port 49999. The gate therefore keeps
+running the stock code-interpreter suites against the base `e2b` template
+and pins their outcomes (the `run_code` tests are recorded failures there).
+The acceptance evidence for `code-interpreter-v1` is a run of the same stock
+suites against a real Firecracker worker, repeated whenever the image, the
+guest agent or the port proxy changes. On 2026-10-05 (image
+`code-interpreter-amd64-a5e50c1be0ff`, `-memory-mib 2048`) it gave Python
+163 passed / 0 failed and JS 82 passed / 0 failed. A python-only dev-driver
+template is feasible: its server and kernel venv measured 429 MB and
+installed in 38 s. It would cover only the python kernel and has not been
+added.
 
 ### Network slots: one host-only network per concurrent guest
 
@@ -332,6 +361,13 @@ sandboxd ... -enroll id=linux-1,url=https://linux-1.<tailnet>:8444,key-file=/etc
   worker client bounds dialing, the TLS handshake and the wait for response
   headers, and each worker is reconciled on its own, so one stalled worker
   never holds up renewals, the sweep or the other workers.
+- **Upgrades.** The gateway and its workers are upgraded together. M3 (#26)
+  replaced the worker API's envd-only stream (`POST /vms/{id}/envd`) with
+  guest port streams (`POST /vms/{id}/ports/{port}`, upgrade token
+  `sandboxd-port`) and the guest agent's `OpEnvd` with `OpDial`, with no
+  compatibility path: an older worker refuses the new gateway's streams, and
+  an image whose agent predates `OpDial` serves no e2b guest traffic. No
+  remote worker ran the old protocol, so none was needed.
 - **Expiry on the worker.** The gateway sends each sandbox's end time to its
   worker on create, on renewal (`POST /sandboxes/{id}/timeout` fails with
   `503` if the worker cannot be told) and after every re-enrollment. The
@@ -622,7 +658,7 @@ sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \
 Stopping the helper does not by itself remove its PF anchor; inspect it with
 `sudo pfctl -a com.apple/gitmoot-sandboxd -sr`.
 
-Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result; both were proven separately on the Mac ([#6], [#8], [#10]).
+Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest ports (every guest port needs a token and a template allowlist entry; see the e2b guest ports section), snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result; both were proven separately on the Mac ([#6], [#8], [#10]).
 
 [#3]: https://github.com/gitmoot/sandboxd/issues/3
 [#6]: https://github.com/gitmoot/sandboxd/issues/6

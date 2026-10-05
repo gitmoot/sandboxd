@@ -4,6 +4,7 @@ package devvm
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -33,9 +34,11 @@ import (
 // that /home (with /home/user), /root, /run and /tmp are private,
 // /etc/passwd and /etc/group name only root and user (1000:1000), and
 // /etc/sudoers gives user passwordless sudo as E2B's base template does. Its
-// network namespace holds only loopback (no internet, unlike a real guest), so envd is never reachable from the host
-// network; the driver reaches it through a Unix socket the helper bridges to
-// envd's port, the dev stand-in for the Firecracker vsock channel.
+// network namespace holds only loopback (no internet, unlike a real guest), so
+// envd and every other guest port are never reachable from the host network;
+// the driver reaches them through a Unix socket the helper bridges to the
+// guest loopback (each stream names its port first), the dev stand-in for the
+// Firecracker vsock channel.
 type Envd struct {
 	// Binary is the absolute path of the envd executable; empty disables
 	// envd guests.
@@ -118,8 +121,11 @@ func (d *Driver) createEnvd(spec vm.Spec, dir string) (*guest, error) {
 	}
 }
 
-// DialEnvd connects to an envd guest's bridge socket.
-func (d *Driver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+// DialPort connects to an envd guest's bridge socket and asks it for port.
+func (d *Driver) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	if !vm.ValidPort(port) {
+		return nil, fmt.Errorf("invalid guest port %d", port)
+	}
 	g, err := d.running(id)
 	if err != nil {
 		return nil, err
@@ -135,7 +141,25 @@ func (d *Driver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	}
 	defer unix.Close(dirFD)
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d/%s", dirFD, envdSocket))
+	conn, err := dialer.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d/%s", dirFD, envdSocket))
+	if err != nil {
+		return nil, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	var status [1]byte
+	_, err = conn.Write(binary.BigEndian.AppendUint16(nil, uint16(port)))
+	if err == nil {
+		_, err = io.ReadFull(conn, status[:])
+	}
+	if !stop() {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	if err != nil || status[0] != bridgeConnected {
+		_ = conn.Close()
+		return nil, errors.Join(fmt.Errorf("guest port %d of %q is not open", port, id), err)
+	}
+	return conn, nil
 }
 
 // destroyEnvd closes the helper's lifeline: it kills every process of the
@@ -382,10 +406,16 @@ func killAll() {
 	}
 }
 
-// bridgeEnvd connects every accepted connection to envd on the namespace's
-// loopback, retrying while envd is still starting.
+// bridgeConnected and bridgeRefused answer a bridge stream's port request.
+const (
+	bridgeConnected byte = 0
+	bridgeRefused   byte = 1
+)
+
+// bridgeEnvd connects every accepted connection to the port it names (two
+// bytes, big-endian) on the namespace's loopback, answering one status byte
+// first. envd's port is retried while envd is still starting.
 func bridgeEnvd(listener net.Listener) {
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(vm.EnvdPort))
 	for {
 		client, err := listener.Accept()
 		if err != nil {
@@ -393,8 +423,23 @@ func bridgeEnvd(listener net.Listener) {
 		}
 		go func() {
 			defer client.Close()
+			var request [2]byte
+			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.ReadFull(client, request[:]); err != nil {
+				return
+			}
+			_ = client.SetReadDeadline(time.Time{})
+			port := int(binary.BigEndian.Uint16(request[:]))
+			if !vm.ValidPort(port) {
+				_, _ = client.Write([]byte{bridgeRefused})
+				return
+			}
+			address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 			var upstream net.Conn
-			deadline := time.Now().Add(envdStartTimeout)
+			deadline := time.Now()
+			if port == vm.EnvdPort {
+				deadline = deadline.Add(envdStartTimeout)
+			}
 			for {
 				upstream, err = net.DialTimeout("tcp", address, time.Second)
 				if err == nil || time.Now().After(deadline) {
@@ -403,9 +448,13 @@ func bridgeEnvd(listener net.Listener) {
 				time.Sleep(50 * time.Millisecond)
 			}
 			if err != nil {
+				_, _ = client.Write([]byte{bridgeRefused})
 				return
 			}
 			defer upstream.Close()
+			if _, err := client.Write([]byte{bridgeConnected}); err != nil {
+				return
+			}
 			done := make(chan struct{}, 2)
 			go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
 			go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
