@@ -1,15 +1,23 @@
 package envd
 
 import (
+	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -108,6 +116,69 @@ func TestPortHostsRoutingIsOptIn(t *testing.T) {
 		t.Fatalf("host routing without a token: %d", w.Code)
 	}
 }
+
+// refusingE2B is fakeE2B whose guest ports are closed.
+type refusingE2B struct{ fakeE2B }
+
+func (f *refusingE2B) DialPort(context.Context, string, int) (net.Conn, error) {
+	return nil, errors.New("guest port unreachable: connection refused")
+}
+
+// A full-duplex request (any guest port request, an envd Connect stream)
+// whose upstream refuses it gets its 502 and leaves the client's keep-alive
+// connection usable: the unread request body used to make net/http panic on
+// the connection's next read ("invalid concurrent Body.Read call") and drop
+// it, which clients retrying a restarting server saw as broken connections.
+func TestRefusedFullDuplexRequestKeepsConnection(t *testing.T) {
+	var logged strings.Builder
+	var logMu sync.Mutex
+	server := httptest.NewUnstartedServer(Routes(http.NotFoundHandler(), NewProxy(&refusingE2B{}, "sandboxd.test", "127.0.0.1"), http.NotFoundHandler()))
+	server.Config.ErrorLog = log.New(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logged.Write(p)
+	}), "", 0)
+	server.Start()
+	defer server.Close()
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+	requests := []string{
+		fmt.Sprintf("E2b-Sandbox-Port: %d\r\nE2b-Traffic-Access-Token: %s\r\nContent-Type: application/json", exposedPort, e2bTrafficToken),
+		fmt.Sprintf("E2b-Sandbox-Port: %d\r\nX-Access-Token: %s\r\nContent-Type: application/connect+json", EnvdPort, e2bToken),
+	}
+	for i := range 6 {
+		body := `{"code":"x = 1; x"}`
+		path := "/execute"
+		if i%2 == 1 {
+			path = "/process.Process/Start"
+		}
+		_, err := fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: 127.0.0.1\r\nE2b-Sandbox-Id: %s\r\n%s\r\nContent-Length: %d\r\n\r\n%s",
+			path, e2bID, requests[i%2], len(body), body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		response, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			logMu.Lock()
+			defer logMu.Unlock()
+			t.Fatalf("request %d on one connection: %v; server log: %s", i, err, logged.String())
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadGateway {
+			t.Fatalf("request %d: %d", i, response.StatusCode)
+		}
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 func TestSandboxHostPort(t *testing.T) {
 	for host, want := range map[string]string{

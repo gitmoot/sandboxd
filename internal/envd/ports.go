@@ -104,6 +104,7 @@ func (p *Proxy) servePort(w http.ResponseWriter, r *http.Request, id string, por
 	}
 	defer p.releaseStream(id)
 	_ = http.NewResponseController(w).EnableFullDuplex()
+	defer closeFullDuplexBody(w, r)
 	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, port))
 	ctx = context.WithValue(ctx, portTarget{}, portTarget{id: id, port: port})
 	p.ports.ServeHTTP(w, r.WithContext(ctx))

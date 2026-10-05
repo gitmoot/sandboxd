@@ -221,10 +221,25 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
 		// Connect client and bidirectional streams read the request while
 		// the response streams.
 		_ = http.NewResponseController(w).EnableFullDuplex()
+		defer closeFullDuplexBody(w, r)
 	}
 	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, EnvdPort))
 	p.proxy.ServeHTTP(w, r.WithContext(ctx))
 	return true
+}
+
+// closeFullDuplexBody closes the request body of a full-duplex handler
+// before it returns. In full-duplex mode net/http leaves an unread body (an
+// upstream that refused or dropped the request) to its post-handler Close;
+// that Close reads the body to its end, which starts the connection's
+// background read after the server stopped it, and the next request's read
+// then panics ("invalid concurrent Body.Read call") and drops the client's
+// keep-alive connection. Closed here, the server stops that background read
+// as usual. The response is flushed first, as the server would before its
+// Close, so a client never waits on it while its body is drained.
+func closeFullDuplexBody(w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).Flush()
+	_ = r.Body.Close()
 }
 
 const unauthorizedEnvd = "unauthorized access, please provide a valid access token or method signing if supported"
