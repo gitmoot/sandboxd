@@ -1,8 +1,9 @@
 # Linux worker: Firecracker driver
 
 `sandboxd -driver firecracker` runs each sandbox as a Firecracker microVM on
-Linux/KVM (x86_64). It serves the same API and guest contract as the Apple
-worker, for the same Gitmoot review profile. Tracking: [#29](https://github.com/gitmoot/sandboxd/issues/29).
+Linux/KVM (x86_64 only). It serves the same API as the Apple worker: the
+Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
+`e2b` profile that the stock E2B SDKs use. Tracking: [#29](https://github.com/gitmoot/sandboxd/issues/29).
 
 ## Isolation per VM
 
@@ -125,22 +126,61 @@ destroys orphans and partial VMs through `Destroy`, which kills both
 cgroups, deletes the namespace (and with it the tap), and removes the jail
 and the record. `Destroy` is idempotent from any partial state.
 
-## Install and rebuild (`/var/lib/sandboxd-fc`)
+## Install
 
-Host prerequisites: `/dev/kvm`, cgroup v2 with `cpu memory pids` enabled at
-the root, `nft`, `ip`, `nsenter`, `unshare`, `setpriv` and `slirp4netns`
-(tested with 1.2.1), plus Docker for building the image.
+Host prerequisites: an x86_64 host with `/dev/kvm`, cgroup v2 with
+`cpu memory pids` enabled at the root, `nft`, `ip`, `nsenter`, `unshare`,
+`setpriv` and `slirp4netns` (tested with 1.2.1), `curl`, plus Docker for
+building the images. Run the commands below as root, from a checkout of the
+same tag as the `sandboxd` binary: the guest agent in the images and the
+daemon talk a private protocol, so build the images with the agent of that
+release.
+
+### From a release
+
+Releases after v0.2.0 publish `sandboxd-<tag>-linux-amd64.tar.gz`
+(`sandboxd` and `sandboxd-guest-agent`) and, for a gateway that runs no VMs
+itself (`-driver none`), `sandboxd-<tag>-linux-arm64.tar.gz` (`sandboxd`
+only), built by `.github/workflows/release.yml` with
+`CGO_ENABLED=0 go build -trimpath`. The release page lists their SHA-256
+in `SHA256SUMS`; compare it in your own browser before a first install.
+
+```sh
+tag=<tag>
+git clone --branch "$tag" https://github.com/gitmoot/sandboxd && cd sandboxd
+d=$(mktemp -d)
+(cd "$d" && curl -fsSLO "https://github.com/gitmoot/sandboxd/releases/download/$tag/sandboxd-$tag-linux-amd64.tar.gz" \
+  && curl -fsSLO "https://github.com/gitmoot/sandboxd/releases/download/$tag/SHA256SUMS" \
+  && sha256sum -c --ignore-missing SHA256SUMS && tar -xzf "sandboxd-$tag-linux-amd64.tar.gz")
+install -m 0755 "$d/sandboxd" /usr/local/bin/sandboxd
+# The image build scripts take the release's guest agent instead of
+# building one; then they need no Go toolchain.
+export SANDBOXD_GUEST_AGENT="$d/sandboxd-guest-agent"
+```
+
+### From source
+
+With Go 1.26 (`go.mod`), from the checkout:
+
+```sh
+CGO_ENABLED=0 go build -trimpath -o /usr/local/bin/sandboxd ./cmd/sandboxd
+```
+
+Leave `SANDBOXD_GUEST_AGENT` unset; each image build script then builds
+`cmd/sandboxd-guest-agent` itself (`GOTOOLCHAIN` defaults to go1.26.4).
+
+### Firecracker, kernel and images (`/var/lib/sandboxd-fc`)
 
 ```sh
 # Firecracker v1.17.0 + jailer and guest kernel 6.1.186, each SHA-256 pinned.
-sudo images/linux-amd64-fc/install-firecracker.sh /var/lib/sandboxd-fc
+images/linux-amd64-fc/install-firecracker.sh /var/lib/sandboxd-fc
 # Read-only review root image (debian:bookworm-slim by digest, git, bash, curl,
 # gcc/g++/make, python3, user 1000, plus the guest agent). Prints the path,
 # images/review-amd64-<sha256 prefix>.ext4, about 600 MB.
-sudo images/linux-amd64-fc/build.sh /var/lib/sandboxd-fc
+images/linux-amd64-fc/build.sh /var/lib/sandboxd-fc
 # The same plus Go 1.26 and a module cache (below). Prints the path,
 # images/review-go126-amd64-<sha256 prefix>.ext4, about 1 GB.
-sudo images/linux-amd64-fc/build.sh --go126 /var/lib/sandboxd-fc
+images/linux-amd64-fc/build.sh --go126 /var/lib/sandboxd-fc
 ```
 
 | Path | Content |
@@ -187,7 +227,7 @@ Build it like the review image (root, from the repository root):
 
 ```sh
 # Prints the path, images/e2b-amd64-<sha256 prefix>.ext4, about 340 MB.
-sudo images/e2b-amd64-fc/build.sh /var/lib/sandboxd-fc
+images/e2b-amd64-fc/build.sh /var/lib/sandboxd-fc
 ```
 
 It is `debian:bookworm-slim` (same digest) with bash, ca-certificates, curl,
@@ -244,7 +284,7 @@ from the repository root; about 11 minutes uncached):
 ```sh
 # Prints the path, images/code-interpreter-amd64-<sha256 prefix>.ext4,
 # about 3.6 GiB (3.4 GiB allocated).
-sudo images/code-interpreter-amd64-fc/build.sh /var/lib/sandboxd-fc
+images/code-interpreter-amd64-fc/build.sh /var/lib/sandboxd-fc
 ```
 
 `build.sh` downloads upstream's `template/` from GitHub at
@@ -343,6 +383,21 @@ The daemon must run as root (jailer, namespaces, nftables). `-max-vms`
 defaults to 2 for this driver, with at most 64 slots. `-slot`, `-pin-image`,
 `-pf-socket` and the model relay flags are Apple-only, and the Firecracker
 driver rejects them. The other `-fc-*` flags are listed in `sandboxd -h`.
+
+For the stock E2B SDKs, also register an `e2b` template on the E2B base
+image and give the daemon the token secret those templates need (a 0600
+file of at least 32 bytes); `alias=base` makes it the SDKs' default
+template:
+
+```sh
+  -token-secret-file /var/lib/sandboxd/token-secret \
+  -register-template id=e2b-base,alias=base,profile=e2b,envd-version=0.9.0,image=/var/lib/sandboxd-fc/images/e2b-amd64-<sha>.ext4
+```
+
+Clients then set `E2B_API_URL` and `E2B_SANDBOX_URL` to sandboxd's URL,
+`E2B_API_KEY` to the API key and `E2B_DOMAIN` to `-domain`; the README's
+[Linux quick start](../README.md#quick-start-linux-firecracker) has the
+full sequence.
 
 It needs no terminal and works under any umask, so it can run as a
 systemd or other service with `UMask=0077` and stdin on `/dev/null`. The

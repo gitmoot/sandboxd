@@ -1,4 +1,6 @@
-# Gitmoot E2B subset
+# E2B API compatibility
+
+sandboxd serves two template profiles. The table below is the `gitmoot-strict` profile: the subset Gitmoot's pinned client uses, served by both the Apple and the Firecracker worker. The `e2b` profile, which the stock E2B SDKs use, is served by the Firecracker worker only and is described from [Template registry and profiles](#template-registry-and-profiles) on; [conformance-matrix.md](conformance-matrix.md) has its per-test SDK results.
 
 Client revision: `gitmoot/gitmoot@a61e1435e7625bf062e05eed21337765833eade6` (the build running in production since 2026-10-01; the earlier pin `10f31189` is not available upstream), package `internal/execbackend/e2b`. This is a **subset**, not an E2B SDK implementation. The client fixture tests at that revision are the reference for malformed responses, redirects, truncated streams, and ambiguous failures. The opt-in `TestSandboxdPinnedClientConformance` (`sandboxd_conformance_test.go`) in that same package exercises the actual client against sandboxd and a real VM; it passed on Apple container 1.4.1 over a private SSH tunnel on 2026-09-24, using a temporary key. On 2026-09-30 it passed again through the private Tailscale Serve HTTPS gateway with header routing ([#6]).
 
@@ -464,7 +466,8 @@ downloaded, verified, or resolved offline.
 Releases are built only by GitHub Actions (`.github/workflows/release.yml`)
 from a `vX.Y.Z` tag on `main`. Each release page lists the SHA-256 of
 `sandboxd-<tag>-darwin-arm64.tar.gz`, which holds `sandboxd` and
-`sandboxd-pf-helper`.
+`sandboxd-pf-helper`, and of the Linux tarballs
+([firecracker.md](firecracker.md#from-a-release)).
 
 ### Guest egress
 
