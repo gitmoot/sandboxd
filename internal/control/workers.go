@@ -223,7 +223,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	rows, err := s.ledger.Active(ctx)
 	settled := make(map[string]bool)
 	for _, row := range rows {
-		if row.WorkerID == m.id && !s.busy[row.ID] {
+		if row.WorkerID == m.id && s.busy[row.ID] == nil {
 			settled[row.ID] = true
 		}
 	}
@@ -265,7 +265,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	for _, row := range rows {
 		instance, observed := inventory[row.ID]
 		delete(inventory, row.ID)
-		if row.WorkerID != m.id || !settled[row.ID] || s.busy[row.ID] {
+		if row.WorkerID != m.id || !settled[row.ID] || s.busy[row.ID] != nil {
 			continue
 		}
 		current, err := s.ledger.Current(ctx, row)
@@ -296,11 +296,11 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 			s.mu.Unlock()
 			return s.offline(m, err)
 		}
-		s.busy[row.ID] = true
+		s.markBusy(row.ID)
 		rowsToDestroy = append(rowsToDestroy, row.ID)
 	}
 	for id := range inventory {
-		if !s.busy[id] {
+		if s.busy[id] == nil {
 			orphans = append(orphans, id)
 		}
 	}
@@ -309,7 +309,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	release := func(ids []string) {
 		s.mu.Lock()
 		for _, id := range ids {
-			delete(s.busy, id)
+			s.clearBusy(id)
 		}
 		s.mu.Unlock()
 	}
@@ -320,7 +320,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		}
 		s.mu.Lock()
 		err := s.ledger.SetState(ctx, id, "gone")
-		delete(s.busy, id)
+		s.clearBusy(id)
 		s.mu.Unlock()
 		if err != nil {
 			release(rowsToDestroy[i+1:])
@@ -674,7 +674,7 @@ func (g *Guests) owner(ctx context.Context, id string) (*member, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", envd.ErrRetryable, err)
 	}
-	if row.State != "running" || g.s.busy[id] {
+	if row.State != "running" || g.s.busy[id] != nil {
 		return nil, fmt.Errorf("%w: sandbox not running", envd.ErrRetryable)
 	}
 	return m, nil

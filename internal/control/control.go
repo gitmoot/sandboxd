@@ -70,8 +70,9 @@ type Service struct {
 	// localMember is the gateway's own driver, nil for a gateway without one.
 	localMember *member
 	// busy marks rows whose worker call (Create or Destroy) is in flight. They
-	// are not judged by reconciliation or listed until the call settles.
-	busy    map[string]bool
+	// are not judged by reconciliation or listed until the call settles; the
+	// channel is closed when it does.
+	busy    map[string]chan struct{}
 	apiHash [32]byte
 	stop    chan struct{}
 	done    chan struct{}
@@ -140,7 +141,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		return nil, err
 	}
 	s := &Service{ledger: ledger, cfg: cfg, templates: templates, workers: members, byID: make(map[string]*member, len(members)),
-		busy: make(map[string]bool), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
+		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
 	for _, m := range members {
 		s.byID[m.id] = m
 		if m.local {
@@ -151,6 +152,23 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	s.cfg.Workers = nil
 	go s.sweep()
 	return s, nil
+}
+
+// markBusy records that a worker call on row id is in flight. Callers hold
+// s.mu and have checked that id is not busy.
+func (s *Service) markBusy(id string) {
+	if s.busy[id] == nil {
+		s.busy[id] = make(chan struct{})
+	}
+}
+
+// clearBusy records that the call on row id settled and wakes its waiters.
+// Callers hold s.mu.
+func (s *Service) clearBusy(id string) {
+	if settled := s.busy[id]; settled != nil {
+		close(settled)
+		delete(s.busy, id)
+	}
 }
 
 func (s *Service) Close() error {
@@ -250,14 +268,14 @@ func (s *Service) Abort(ctx context.Context, id, token string) error {
 		return errors.New("sandbox capability is no longer active")
 	}
 	stateErr := s.ledger.SetState(ctx, id, "unknown")
-	s.busy[id] = true
+	s.markBusy(id)
 	s.mu.Unlock()
 	destroyCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
 	destroyErr := m.api.Destroy(destroyCtx, id)
 	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.busy, id)
+	s.clearBusy(id)
 	if destroyErr != nil {
 		return errors.Join(stateErr, destroyErr)
 	}
@@ -488,7 +506,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.busy[row.ID] = true
+	s.markBusy(row.ID)
 	s.mu.Unlock()
 
 	createCtx, cancel := context.WithTimeout(r.Context(), workerSlowTimeout)
@@ -499,7 +517,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.busy, row.ID)
+	s.clearBusy(row.ID)
 	// A worker that another gateway instance took over while this Create was
 	// in flight answered outside this gateway's lease. Its answer cannot admit
 	// the VM. A worker that merely blipped keeps this gateway's lease.
@@ -567,7 +585,7 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	offline = append(offline, s.unenrolled(rows)...)
 	result := make([]sandbox, 0, len(rows))
 	for _, row := range rows {
-		if s.busy[row.ID] {
+		if s.busy[row.ID] != nil {
 			continue // Create or Destroy in flight: not yet, or no longer, a sandbox.
 		}
 		m := s.byID[row.WorkerID]
@@ -627,7 +645,7 @@ func (s *Service) live(ctx context.Context, id string) (store.Row, *member, erro
 	if released(row) {
 		return store.Row{}, nil, sql.ErrNoRows
 	}
-	if row.State != "running" || s.busy[id] || m.serves[row.TemplateID] != row.Image {
+	if row.State != "running" || s.busy[id] != nil || m.serves[row.TemplateID] != row.Image {
 		return store.Row{}, nil, errors.New("sandbox not running")
 	}
 	if row, m, err = s.owned(ctx, id); err != nil {
@@ -721,38 +739,49 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	// The busy mark set below, not the worker's reconciliation turn, keeps a
-	// concurrent reconciliation from judging this row while Destroy runs.
+	// concurrent reconciliation from judging this row while Destroy runs. A
+	// teardown already in flight (an Abort, a reconciliation, another delete)
+	// is waited for, bounded, and decides: deleting stays idempotent.
+	waitCtx, cancelWait := context.WithTimeout(r.Context(), workerSlowTimeout)
+	defer cancelWait()
 	s.mu.Lock()
-	row, err = s.ledger.Get(r.Context(), id)
-	if err != nil || released(row) {
-		s.mu.Unlock()
-		if err != nil {
-			unavailable(w)
+	for {
+		row, err = s.ledger.Get(r.Context(), id)
+		if err != nil || released(row) {
+			s.mu.Unlock()
+			if err != nil {
+				unavailable(w)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if s.busy[id] {
-		// Another teardown (a reconciliation or a concurrent delete) of this
-		// sandbox is in flight; its outcome decides. Retry.
+		settled := s.busy[id]
+		if settled == nil {
+			break
+		}
 		s.mu.Unlock()
-		unavailable(w)
-		return
+		select {
+		case <-settled:
+		case <-waitCtx.Done():
+			unavailable(w) // still in flight: the reservation stays held
+			return
+		}
+		s.mu.Lock()
 	}
 	if err := s.ledger.SetState(r.Context(), id, "unknown"); err != nil {
 		s.mu.Unlock()
 		unavailable(w)
 		return
 	}
-	s.busy[id] = true
+	s.markBusy(id)
 	s.mu.Unlock()
 	destroyCtx, cancel := context.WithTimeout(r.Context(), workerSlowTimeout)
 	destroyErr := m.api.Destroy(destroyCtx, id)
 	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.busy, id)
+	s.clearBusy(id)
 	if destroyErr != nil {
 		unavailable(w)
 		return
