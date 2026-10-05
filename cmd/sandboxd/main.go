@@ -108,10 +108,14 @@ func run(ctx context.Context, args []string) (runErr error) {
 			return err
 		}
 	case "firecracker":
-		// Firecracker guests have no host-reachable network; PF slots, the
-		// bridge pin and the slot-gateway model relay are Apple-only.
+		// Firecracker guests reach the host only on -fc-host-port, if set;
+		// PF slots, the bridge pin and the slot-gateway model relay are
+		// Apple-only.
 		if len(slots) != 0 || *pinImage != "" || *pfSocket != "" || *relayListen != "" || *relayTarget != "" {
 			return fmt.Errorf("slot, pin-image, pf-socket and model-relay flags apply only to the apple driver")
+		}
+		if err := checkFirecrackerHostPort(*fc.hostPort, *listen); err != nil {
+			return err
 		}
 		if *maxVMs == 0 {
 			*maxVMs = 2

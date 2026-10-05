@@ -76,6 +76,9 @@ type fakeFCHost struct {
 	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
 	// mid-teardown.
 	onKill func(name string)
+	// dropAccept installs the host table without its accept rules, as an
+	// nft that silently loses one would.
+	dropAccept bool
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
@@ -111,6 +114,15 @@ func (h *fakeFCHost) ApplyFirewall(_ context.Context, ruleset string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.firewall = ruleset
+	if h.dropAccept {
+		var kept []string
+		for line := range strings.Lines(ruleset) {
+			if !strings.HasSuffix(line, " accept\n") {
+				kept = append(kept, line)
+			}
+		}
+		h.firewall = strings.Join(kept, "")
+	}
 	return nil
 }
 func (h *fakeFCHost) FirewallState(context.Context) (string, error) {
@@ -385,6 +397,9 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		"low uid base":      func(c *FirecrackerConfig) { c.UIDBase = 1000 },
 		"tiny home":         func(c *FirecrackerConfig) { c.HomeDiskMiB = 1 },
 		"no boot timeout":   func(c *FirecrackerConfig) { c.BootTimeout = 0 },
+		"host port 22":      func(c *FirecrackerConfig) { c.HostPort = 22 },
+		"host port big":     func(c *FirecrackerConfig) { c.HostPort = 65536 },
+		"host port neg":     func(c *FirecrackerConfig) { c.HostPort = -1 },
 		"renamed vmm":       func(c *FirecrackerConfig) { c.Firecracker = "/usr/bin/vmm" },
 		"unmasked deny":     func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{netip.MustParsePrefix("203.0.113.7/24")} },
 		"invalid deny":      func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{{}} },

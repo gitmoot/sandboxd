@@ -29,6 +29,17 @@ func TestDriverSelectionAndFirecrackerCap(t *testing.T) {
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "203.0.113.7/24"}, "is not a network prefix"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "metadata"}, "invalid value"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "203.0.113.0/24", "-fc-deny-cidr", "2001:db8::/32"}, "read API key"},
+		// One host port: a real TCP port, never SSH or sandboxd's own API.
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "0"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "8443"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "65535"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "65536"}, "outside 1-65535"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "-1"}, "outside 1-65535"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "22"}, "must not be SSH"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "43180"}, "must not be sandboxd's own listen port 43180"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43190"}, "own listen port 43190"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43180"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "https"}, "invalid value"},
 	} {
 		err := run(context.Background(), append(append([]string(nil), common...), tc.args...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

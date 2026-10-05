@@ -49,6 +49,10 @@ const (
 	fcMaxCPUs      = 32
 	fcMinMemoryMiB = 128
 	fcMaxMemoryMiB = 256 << 10
+	// fcHostAlias is slirp4netns's virtual host address. With host loopback
+	// enabled, slirp4netns connects there as the NAT UID to fcHostLoopback.
+	fcHostAlias    = "10.0.2.2"
+	fcHostLoopback = "127.0.0.1"
 )
 
 var fcSlotName = regexp.MustCompile(`^sbx[0-9]{1,3}$`)
@@ -78,6 +82,11 @@ type FirecrackerConfig struct {
 	// DenyCIDRs extends both guest deny lists, for example with a cloud
 	// provider's metadata endpoints on public addresses.
 	DenyCIDRs []netip.Prefix
+	// HostPort, when nonzero, is the one host TCP port guests may reach:
+	// fcHostAlias:HostPort in the guest is the host's 127.0.0.1:HostPort,
+	// for a host service such as a credential gateway. Every other host
+	// port and address stays denied. Zero (the default) allows none.
+	HostPort int
 }
 
 // FirecrackerDriver runs one Firecracker microVM per sandbox under the jailer:
@@ -156,13 +165,16 @@ type fcCgroupSample struct {
 
 // fcNetwork is one VM's private network: a namespace owned by a user
 // namespace of NetUID, the VMM's tap (owned by VMMUID), the namespace's own
-// nftables table, and slirp4netns running as NetUID in Cgroup.
+// nftables table, and slirp4netns running as NetUID in Cgroup. A nonzero
+// HostPort enables slirp4netns's host loopback, and the namespace table must
+// then list exactly fcNetnsHostPortRule(HostPort) or the network fails.
 type fcNetwork struct {
-	Netns   string
-	Cgroup  string
-	NetUID  int
-	VMMUID  int
-	Ruleset string
+	Netns    string
+	Cgroup   string
+	NetUID   int
+	VMMUID   int
+	Ruleset  string
+	HostPort int
 }
 
 // fcMeta is the ownership record of one VM, written before any host state
@@ -216,6 +228,9 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	}
 	if cfg.BootTimeout <= 0 {
 		return nil, errors.New("Firecracker boot timeout must be positive")
+	}
+	if err := ValidateFirecrackerHostPort(cfg.HostPort); err != nil {
+		return nil, err
 	}
 	for _, path := range []string{cfg.Firecracker, cfg.Jailer} {
 		if err := host.TrustedFile(path, true); err != nil {
@@ -272,7 +287,14 @@ func (d *FirecrackerDriver) uidRange() (int, int) {
 // private and special ranges; everything else is the internet. The output
 // hook only adds rejects for those UIDs and never touches other tables,
 // Docker or iptables chains. auto-merge accepts overlapping deny entries.
-func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string) string {
+// A nonzero hostPort lets the NAT UIDs (never the VMMs) open TCP connections
+// to 127.0.0.1:hostPort, where slirp4netns sends guest connections to
+// fcHostAlias:hostPort; no other host address or port.
+func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string, hostPort int) string {
+	exception := ""
+	if hostPort != 0 {
+		exception = "\t\t" + fcHostPortRule(uidLow+fcUIDStride, uidHigh, hostPort) + "\n"
+	}
 	return fmt.Sprintf(`table inet %s {
 	set deny4 {
 		type ipv4_addr
@@ -291,18 +313,35 @@ func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string) string {
 		meta skuid %d-%d jump guest
 	}
 	chain guest {
-		fib daddr type { local, broadcast, multicast, anycast } counter reject with icmpx type admin-prohibited
+%s		fib daddr type { local, broadcast, multicast, anycast } counter reject with icmpx type admin-prohibited
 		ip daddr @deny4 counter reject with icmpx type admin-prohibited
 		ip6 daddr @deny6 counter reject with icmpx type admin-prohibited
 	}
 }
-`, fcHostTable, strings.Join(deny4, ", "), strings.Join(deny6, ", "), uidLow, uidHigh)
+`, fcHostTable, strings.Join(deny4, ", "), strings.Join(deny6, ", "), uidLow, uidHigh, exception)
+}
+
+// fcHostPortRule is the host table's one exception, exactly as
+// `nft -s list` prints it back.
+func fcHostPortRule(netLow, netHigh, port int) string {
+	return fmt.Sprintf("meta skuid %d-%d ip daddr %s tcp dport %d accept", netLow, netHigh, fcHostLoopback, port)
+}
+
+// fcNetnsHostPortRule is the namespace table's one exception, exactly as
+// `nft -s list` prints it back.
+func fcNetnsHostPortRule(port int) string {
+	return fmt.Sprintf("iifname %q oifname %q ip daddr %s tcp dport %d accept", fcGuestTap, fcSlirpTap, fcHostAlias, port)
 }
 
 // fcNetnsRuleset confines the VM's own namespace: the guest may only be
 // forwarded to public addresses through the NAT tap, never to the namespace
-// itself, the NAT's virtual host (10.0.2.2) or its resolver.
-func fcNetnsRuleset(deny4 []string) string {
+// itself, the NAT's virtual host (10.0.2.2) or its resolver. A nonzero
+// hostPort is the one exception: TCP to 10.0.2.2:hostPort is forwarded.
+func fcNetnsRuleset(deny4 []string, hostPort int) string {
+	exception := ""
+	if hostPort != 0 {
+		exception = "\t\t" + fcNetnsHostPortRule(hostPort) + "\n"
+	}
 	return fmt.Sprintf(`table inet %s {
 	set deny4 {
 		type ipv4_addr
@@ -318,7 +357,7 @@ func fcNetnsRuleset(deny4 []string) string {
 	chain forward {
 		type filter hook forward priority filter; policy drop;
 		ct state established,related accept
-		iifname %[3]q oifname %[4]q meta nfproto ipv4 ip daddr != @deny4 accept
+%[5]s		iifname %[3]q oifname %[4]q meta nfproto ipv4 ip daddr != @deny4 accept
 		iifname %[3]q reject with icmpx type admin-prohibited
 	}
 	chain postrouting {
@@ -326,7 +365,7 @@ func fcNetnsRuleset(deny4 []string) string {
 		oifname %[4]q masquerade
 	}
 }
-`, fcNetnsTable, strings.Join(deny4, ", "), fcGuestTap, fcSlirpTap)
+`, fcNetnsTable, strings.Join(deny4, ", "), fcGuestTap, fcSlirpTap, exception)
 }
 
 // Arm creates the cgroup parent and atomically (re)installs the host table,
@@ -340,7 +379,7 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 		return err
 	}
 	low, high := d.uidRange()
-	if err := d.host.ApplyFirewall(ctx, fcHostRuleset(low, high, d.deny4, d.deny6)); err != nil {
+	if err := d.host.ApplyFirewall(ctx, fcHostRuleset(low, high, d.deny4, d.deny6, d.cfg.HostPort)); err != nil {
 		return err
 	}
 	state, err := d.host.FirewallState(ctx)
@@ -350,7 +389,69 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 	if state == "" {
 		return errors.New("host firewall table is empty after install")
 	}
+	if err := fcCheckHostPortState(state, low+fcUIDStride, high, d.cfg.HostPort); err != nil {
+		return err
+	}
 	d.armed = state
+	return nil
+}
+
+// fcCheckHostPortState requires the host table's readback to hold the host
+// port exception exactly when one is configured, as the guest chain's first
+// rule, and no other accept rule. Ready then compares every later readback
+// with this one, so the monitor covers the exception too.
+func fcCheckHostPortState(state string, netLow, netHigh, hostPort int) error {
+	var accepts []string
+	inGuest, first := false, ""
+	for line := range strings.Lines(state) {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "chain guest {":
+			inGuest = true
+		case inGuest && line == "}":
+			inGuest = false
+		case inGuest && line != "" && first == "":
+			first = line
+		}
+		if strings.HasSuffix(line, " accept") && !strings.HasPrefix(line, "type ") {
+			accepts = append(accepts, line)
+		}
+	}
+	if hostPort == 0 {
+		if len(accepts) != 0 {
+			return fmt.Errorf("host firewall table has unexpected accept rules %q", accepts)
+		}
+		return nil
+	}
+	want := fcHostPortRule(netLow, netHigh, hostPort)
+	if first != want || len(accepts) != 1 {
+		return fmt.Errorf("host firewall table does not read back the host port exception %q first (accept rules %q)", want, accepts)
+	}
+	return nil
+}
+
+// fcCheckNetnsHostPortState requires a namespace table's readback to name
+// the NAT's host alias, or any port, only in the host port exception, and
+// to hold that exception exactly when one is configured.
+func fcCheckNetnsHostPortState(state string, hostPort int) error {
+	want := ""
+	if hostPort != 0 {
+		want = fcNetnsHostPortRule(hostPort)
+	}
+	found := false
+	for line := range strings.Lines(state) {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, fcHostAlias) && !strings.Contains(line, "dport") {
+			continue
+		}
+		if want == "" || line != want || found {
+			return fmt.Errorf("namespace firewall table has unexpected host rule %q", line)
+		}
+		found = true
+	}
+	if want != "" && !found {
+		return fmt.Errorf("namespace firewall table does not read back the host port exception %q", want)
+	}
 	return nil
 }
 
@@ -786,7 +887,8 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta) e
 	}
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: fcNetnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
-		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: fcNetnsRuleset(d.deny4),
+		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: fcNetnsRuleset(d.deny4, d.cfg.HostPort),
+		HostPort: d.cfg.HostPort,
 	}); err != nil {
 		return err
 	}
