@@ -263,9 +263,14 @@ func TestRestartDoesNotReassignLiveVMToNewWorker(t *testing.T) {
 	if got := request(t, second, http.MethodGet, "/sandboxes/"+sandbox.ID, nil); got.Code != http.StatusServiceUnavailable {
 		t.Fatalf("reassigned old VM to replacement worker: %d", got.Code)
 	}
-	if got := request(t, second, http.MethodGet, "/v2/sandboxes", nil); got.Code != http.StatusServiceUnavailable {
-		t.Fatalf("false complete inventory for unknown worker: %d", got.Code)
+	// The old identity is reported like an offline worker: its sandbox stays
+	// listed as unconfirmed rather than being dropped or claimed.
+	list := request(t, second, http.MethodGet, "/v2/sandboxes", nil)
+	if list.Code != http.StatusOK || list.Header().Get("X-Sandboxd-Offline-Workers") != "mac-original" ||
+		!strings.Contains(list.Body.String(), sandbox.ID) {
+		t.Fatalf("old worker's sandbox hidden or not marked unconfirmed: %d %v %s", list.Code, list.Header(), list.Body.String())
 	}
+	// Both identities ran on this host: the old VM still holds the only slot.
 	if got := request(t, second, http.MethodPost, "/sandboxes", createBody("new-job", 1)); got.Code != http.StatusConflict {
 		t.Fatalf("old worker VM released its capacity: %d", got.Code)
 	}
@@ -432,5 +437,103 @@ func TestDeleteDuringPartitionHoldsCapacityUntilTeardownSucceeds(t *testing.T) {
 	defer d.mu.Unlock()
 	if _, alive := d.instances[id]; alive {
 		t.Fatal("the partitioned VM was never torn down")
+	}
+}
+
+// slowDestroyDriver holds every Destroy until release closes, reporting each
+// one that reached the driver, as a VM teardown that takes a while does.
+type slowDestroyDriver struct {
+	*fakeDriver
+	entered chan string
+	release chan struct{}
+}
+
+func (d *slowDestroyDriver) Destroy(ctx context.Context, id string) error {
+	d.entered <- id
+	<-d.release
+	return d.fakeDriver.Destroy(ctx, id)
+}
+
+func openSlowDestroyService(t *testing.T) (*Service, *slowDestroyDriver) {
+	t.Helper()
+	driver := &slowDestroyDriver{fakeDriver: &fakeDriver{instances: make(map[string]vm.Instance)},
+		entered: make(chan string, 4), release: make(chan struct{})}
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver,
+		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64", Domain: "sandbox.example", WorkerID: "mac-local",
+			CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour, Slots: []string{"slot-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return s, driver
+}
+
+func idempotentDeleteStatus(code int) bool {
+	return code == http.StatusNoContent || code == http.StatusNotFound
+}
+
+// A canceled guest command aborts its VM; the client's own delete can arrive
+// while that teardown is still running, and again after it. Both deletes are
+// idempotent successes, never 503, and the VM is torn down exactly once.
+func TestDeleteDuringAbortIsIdempotent(t *testing.T) {
+	s, driver := openSlowDestroyService(t)
+	id, token := createSandbox(t, s, "job-cancel")
+	aborted := make(chan error, 1)
+	go func() { aborted <- s.Abort(context.Background(), id, token) }()
+	if got := <-driver.entered; got != id {
+		t.Fatalf("abort destroyed %s", got)
+	}
+	deleted := make(chan int, 1)
+	go func() { deleted <- request(t, s, http.MethodDelete, "/sandboxes/"+id, nil).Code }()
+	select {
+	case code := <-deleted:
+		t.Fatalf("delete answered %d while the abort's teardown was still in flight", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(driver.release)
+	if err := <-aborted; err != nil {
+		t.Fatal(err)
+	}
+	if code := <-deleted; !idempotentDeleteStatus(code) {
+		t.Fatalf("delete racing an abort: %d, want 204 or 404", code)
+	}
+	if code := request(t, s, http.MethodDelete, "/sandboxes/"+id, nil).Code; !idempotentDeleteStatus(code) {
+		t.Fatalf("delete after the abort: %d, want 204 or 404", code)
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if len(driver.destroyed) != 1 {
+		t.Fatalf("teardowns = %d, want exactly 1", len(driver.destroyed))
+	}
+}
+
+// Two deletes of one sandbox at once: the second waits for the first's
+// teardown and both succeed.
+func TestConcurrentDeletesAreIdempotent(t *testing.T) {
+	s, driver := openSlowDestroyService(t)
+	id, _ := createSandbox(t, s, "job-delete")
+	codes := make(chan int, 2)
+	go func() { codes <- request(t, s, http.MethodDelete, "/sandboxes/"+id, nil).Code }()
+	<-driver.entered
+	go func() { codes <- request(t, s, http.MethodDelete, "/sandboxes/"+id, nil).Code }()
+	select {
+	case code := <-codes:
+		t.Fatalf("a delete answered %d while the other's teardown was in flight", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(driver.release)
+	for range 2 {
+		if code := <-codes; !idempotentDeleteStatus(code) {
+			t.Fatalf("concurrent delete: %d, want 204 or 404", code)
+		}
+	}
+	driver.mu.Lock()
+	defer driver.mu.Unlock()
+	if len(driver.destroyed) != 1 {
+		t.Fatalf("teardowns = %d, want exactly 1", len(driver.destroyed))
 	}
 }

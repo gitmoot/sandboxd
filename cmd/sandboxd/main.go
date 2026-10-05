@@ -19,19 +19,26 @@ import (
 	"github.com/gitmoot/sandboxd/internal/envd"
 	"github.com/gitmoot/sandboxd/internal/firewall"
 	"github.com/gitmoot/sandboxd/internal/vm"
+	"github.com/gitmoot/sandboxd/internal/worker"
 )
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, os.Args[1:]); err != nil {
+	run := run
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "forget-worker" {
+		run = func(ctx context.Context, args []string) error { return forgetWorker(ctx, args, os.Stdout) }
+		args = args[1:]
+	}
+	if err := run(ctx, args); err != nil {
 		log.Fatal(err)
 	}
 }
 
 func run(ctx context.Context, args []string) (runErr error) {
 	flags := flag.NewFlagSet("sandboxd", flag.ContinueOnError)
-	driverName := flags.String("driver", "apple", "VM driver: apple (Apple container on macOS) or firecracker (Linux/KVM)")
+	driverName := flags.String("driver", "apple", "VM driver: apple (Apple container on macOS), firecracker (Linux/KVM), or none (a gateway that only schedules onto -enroll workers)")
 	fc := addFirecrackerFlags(flags)
 	listen := flags.String("listen", "127.0.0.1:43180", "loopback address behind private HTTPS proxy")
 	database := flags.String("db", "", "durable SQLite ledger path")
@@ -52,6 +59,11 @@ func run(ctx context.Context, args []string) (runErr error) {
 	relayTarget := flags.String("model-relay-target", "", "loopback endpoint of a fixed SSH reverse tunnel")
 	maxVMs := flags.Int("max-vms", 0, "maximum concurrent VMs; zero means one per slot (apple, never more than the slots) or 2 (firecracker)")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-job lifetime")
+	var enrolls enrollFlags
+	flags.Var(&enrolls, "enroll", "repeatable remote worker the gateway also schedules onto: id=<worker-id>,url=<https worker API URL>,key-file=<0600 per-worker key file>")
+	templateArchs := make(templateArchFlags)
+	flags.Var(templateArchs, "template-arch", "repeatable template served by enrolled workers: <template>=arm64|amd64")
+	workerKeyFile := flags.String("worker-key-file", "", "serve only the enrolled-worker API on -listen, authenticated by this 0600 per-worker key file, instead of the control and guest APIs")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -62,9 +74,18 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil || !net.ParseIP(host).IsLoopback() {
 		return fmt.Errorf("listen address must be an explicit loopback IP and port")
 	}
-	if *database == "" || *keyFile == "" || *image == "" || *template == "" || *gatewayHost == "" || *domain == "" || *workerID == "" ||
-		(*driverName == "apple" && (*pinImage == "" || *pfSocket == "")) || strings.ContainsAny(*gatewayHost, "/?# ") {
-		return fmt.Errorf("db, api-key-file, image, template, domain, gateway-host and worker-id are required, plus pin-image and pf-socket for the apple driver")
+	workerMode := *workerKeyFile != ""
+	local := *driverName != "none"
+	if local && (*image == "" || *template == "" || *workerID == "") || *driverName == "apple" && (*pinImage == "" || *pfSocket == "") ||
+		!workerMode && (*database == "" || *keyFile == "" || *gatewayHost == "" || *domain == "" || strings.ContainsAny(*gatewayHost, "/?# ")) {
+		return fmt.Errorf("image, template and worker-id are required for a local driver, plus pin-image and pf-socket for the apple driver; " +
+			"a gateway (no -worker-key-file) also needs db, api-key-file, domain and gateway-host")
+	}
+	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0) {
+		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and cannot enroll workers or register templates")
+	}
+	if !local && len(enrolls) == 0 {
+		return fmt.Errorf("the none driver runs no VMs; it needs at least one -enroll worker")
 	}
 	var slotNames []string
 	switch *driverName {
@@ -89,26 +110,43 @@ func run(ctx context.Context, args []string) (runErr error) {
 			return fmt.Errorf("max-vms must be between 1 and 64 for the firecracker driver")
 		}
 		slotNames = vm.FirecrackerSlotNames(*maxVMs)
+	case "none":
+		if len(slots) != 0 || *pinImage != "" || *pfSocket != "" || *relayListen != "" || *relayTarget != "" || *maxVMs != 0 {
+			return fmt.Errorf("the none driver runs no VMs: slot, pin-image, pf-socket, model-relay and max-vms flags do not apply")
+		}
 	default:
 		return fmt.Errorf("unknown driver %q", *driverName)
 	}
-	if *maxVMs == 0 {
-		*maxVMs = len(slotNames)
+	if local {
+		if *maxVMs == 0 {
+			*maxVMs = len(slotNames)
+		}
+		if *maxVMs < 1 || *maxVMs > len(slotNames) {
+			return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slotNames))
+		}
 	}
-	if *maxVMs < 1 || *maxVMs > len(slotNames) {
-		return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slotNames))
-	}
-	key, err := os.ReadFile(*keyFile)
-	if err != nil {
-		return fmt.Errorf("read API key: %w", err)
-	}
-	info, err := os.Stat(*keyFile)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("API key must be in a regular 0600 file")
-	}
-	apiKey := strings.TrimSpace(string(key))
-	if len(apiKey) < 8 || strings.ContainsAny(apiKey, "\r\n") {
-		return fmt.Errorf("API key must be a single nonempty value of at least eight bytes")
+	var apiKey, workerKey string
+	var remotes []control.Remote
+	if workerMode {
+		if workerKey, err = readSecretFile(*workerKeyFile, 16); err != nil {
+			return fmt.Errorf("worker key: %w", err)
+		}
+	} else {
+		key, err := os.ReadFile(*keyFile)
+		if err != nil {
+			return fmt.Errorf("read API key: %w", err)
+		}
+		info, err := os.Stat(*keyFile)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("API key must be in a regular 0600 file")
+		}
+		apiKey = strings.TrimSpace(string(key))
+		if len(apiKey) < 8 || strings.ContainsAny(apiKey, "\r\n") {
+			return fmt.Errorf("API key must be a single nonempty value of at least eight bytes")
+		}
+		if remotes, err = enrolls.remotes(*workerID); err != nil {
+			return err
+		}
 	}
 	var driver isolatedDriver
 	switch *driverName {
@@ -166,16 +204,36 @@ func run(ctx context.Context, args []string) (runErr error) {
 		log.Printf("Firecracker guests confined by nftables table inet sbx_fc and per-VM namespaces")
 		driver = firecracker
 	}
-	service, err := control.Open(ctx, *database, driver, control.Config{
-		APIKey: apiKey, TemplateID: *template, Image: *image, Domain: *domain, WorkerID: *workerID,
-		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slotNames,
-	})
-	if err != nil {
-		return err
+	var handler http.Handler
+	if workerMode {
+		server, err := worker.NewServer(driver, workerDeclaration(*driverName, *workerID, *template, *image, *cpus, *memory, *maxVMs, slotNames), workerKey, *maxTTL)
+		if err != nil {
+			return err
+		}
+		handler = server
+		// The worker ends every VM at its end time itself, also while the
+		// gateway is unreachable; -max-ttl caps that end time.
+		reapCtx, stopReap := context.WithCancel(ctx)
+		defer stopReap()
+		go server.ReapEvery(reapCtx, time.Second)
+		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
+	} else {
+		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, Templates: templateArchs, Workers: remotes}
+		var local vm.Driver
+		if driver != nil {
+			local = driver
+			cfg.TemplateID, cfg.Image, cfg.WorkerID = *template, *image, *workerID
+			cfg.CPUs, cfg.MemoryMiB, cfg.MaxVMs, cfg.Slots = *cpus, *memory, *maxVMs, slotNames
+			cfg.Arch, cfg.DriverName = driverArch(*driverName), *driverName
+		}
+		service, err := control.Open(ctx, *database, local, cfg)
+		if err != nil {
+			return err
+		}
+		defer service.Close()
+		guest := &envd.Handler{Driver: service.Guests(), Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
+		handler = envd.Routes(guest, service.Handler())
 	}
-	defer service.Close()
-	guest := &envd.Handler{Driver: driver, Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
-	handler := envd.Routes(guest, service.Handler())
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
@@ -205,6 +263,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	defer stopGuard()
 	guardFailed := make(chan error, 1)
 	go func() {
+		if driver == nil {
+			return // No local VMs: each enrolled worker guards its own isolation.
+		}
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
