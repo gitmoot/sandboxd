@@ -16,16 +16,19 @@ import (
 )
 
 const (
-	e2bID    = "sandboxd-00000000000000000000000000000e2b"
-	strictID = "sandboxd-0000000000000000000000000000057c"
-	e2bToken = "e2b-token"
+	e2bID           = "sandboxd-00000000000000000000000000000e2b"
+	strictID        = "sandboxd-0000000000000000000000000000057c"
+	e2bToken        = "e2b-token"
+	e2bTrafficToken = "e2b-traffic-token"
+	exposedPort     = 49999
 )
 
 // fakeE2B serves one e2b sandbox whose envd is upstream, an HTTP server
-// reached only through DialEnvd.
+// reached only through DialPort.
 type fakeE2B struct {
 	upstream *httptest.Server
 	dials    int
+	ports    []int
 }
 
 func (f *fakeE2B) IsE2B(id string) bool { return id == e2bID }
@@ -33,7 +36,15 @@ func (f *fakeE2B) AuthorizeEnvd(id, token string) bool {
 	return id == e2bID && token == e2bToken
 }
 func (f *fakeE2B) EnvdToken(id string) (string, bool) { return e2bToken, id == e2bID }
-func (f *fakeE2B) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+func (f *fakeE2B) AuthorizeTraffic(id, token string) bool {
+	return id == e2bID && token == e2bTrafficToken
+}
+func (f *fakeE2B) SignedSandbox(signed func(string) bool) (string, bool) {
+	return e2bID, signed(e2bToken)
+}
+func (f *fakeE2B) Exposes(id string, port int) bool { return id == e2bID && port == exposedPort }
+func (f *fakeE2B) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	f.ports = append(f.ports, port)
 	f.dials++
 	var dialer net.Dialer
 	return dialer.DialContext(ctx, "tcp", f.upstream.Listener.Addr().String())

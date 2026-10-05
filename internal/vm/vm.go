@@ -21,7 +21,7 @@ type Spec struct {
 	CPUs      int
 	MemoryMiB int
 	// Envd boots an e2b-profile guest: a writable root and upstream envd as
-	// its entrypoint, reached only through EnvdDialer. Unset, the guest is
+	// its entrypoint, reached only through PortDialer. Unset, the guest is
 	// the gitmoot-strict guest the driver has always started.
 	Envd bool
 }
@@ -29,12 +29,19 @@ type Spec struct {
 // EnvdPort is the port upstream envd listens on inside an e2b guest.
 const EnvdPort = guestagent.EnvdPort
 
-// EnvdDialer is implemented by drivers that can start Envd guests. DialEnvd
-// opens a fresh host-initiated byte stream to the guest's envd port over the
-// driver's private host-to-guest channel (never the guest network). The
-// guest never initiates it, and everything read from it is guest-controlled.
-type EnvdDialer interface {
-	DialEnvd(ctx context.Context, id string) (net.Conn, error)
+// PortDialer is implemented by drivers that can start Envd guests. DialPort
+// opens a fresh host-initiated byte stream to a TCP port on the guest's
+// loopback (envd's, or one the sandbox's template exposes) over the driver's
+// private host-to-guest channel (never the guest network). The guest never
+// initiates it, and everything read from it is guest-controlled. Callers
+// choose the port; drivers only check it is 1-65535.
+type PortDialer interface {
+	DialPort(ctx context.Context, id string, port int) (net.Conn, error)
+}
+
+// ValidPort reports whether port is a TCP port number DialPort accepts.
+func ValidPort(port int) bool {
+	return port >= 1 && port <= 65535
 }
 
 // ErrNoEnvd reports a driver or worker that cannot run envd guests.

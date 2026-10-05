@@ -65,6 +65,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	tokenSecretFile := flags.String("token-secret-file", "", "0600 file deriving e2b envd tokens; default: a random secret for this process")
 	domain := flags.String("domain", "", "sandbox DNS domain reported to clients")
 	gatewayHost := flags.String("gateway-host", "127.0.0.1", "host name for header-routed guest traffic")
+	portHosts := flags.Bool("port-hosts", false, "also route exposed guest ports by wildcard host <port>-<id>.<domain> (needs wildcard DNS and TLS for *.<domain> in front of sandboxd); without it guest ports are reached only via -gateway-host and routing headers")
 	maxVMs := flags.Int("max-vms", 4, "maximum concurrent guests")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-sandbox lifetime")
 	cpus := flags.Int("cpus", 2, "CPU count reported for each guest")
@@ -134,7 +135,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: envd.Routes(guest, envd.NewProxy(service, *domain, *gatewayHost), service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	server := &http.Server{Handler: envd.Routes(guest, portProxy(service, *domain, *gatewayHost, *portHosts), service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	log.Printf("sandboxd-dev listening on http://%s (devvm driver, NO isolation, state %s)", listener.Addr(), root)
@@ -186,4 +187,11 @@ func readKey(path string) (string, error) {
 		return "", errors.New("API key must be a single value of at least eight bytes")
 	}
 	return key, nil
+}
+
+// portProxy is envd.NewProxy with host-based guest port routing set.
+func portProxy(sandboxes envd.E2BSandboxes, domain, gatewayHost string, portHosts bool) *envd.Proxy {
+	proxy := envd.NewProxy(sandboxes, domain, gatewayHost)
+	proxy.PortHosts = portHosts
+	return proxy
 }

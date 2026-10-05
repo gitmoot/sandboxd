@@ -8,7 +8,10 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
 // Profile selects the API surface and semantics a template's sandboxes get.
@@ -23,6 +26,9 @@ const (
 	// optional owner metadata, semver envdVersion, full metrics, JSON errors.
 	ProfileE2B Profile = "e2b"
 )
+
+// envdPort is envd's guest port; it is never an exposed template port.
+const envdPort = vm.EnvdPort
 
 // strictEnvdVersion is what gitmoot-strict sandboxes have always reported.
 const strictEnvdVersion = "sandboxd-1"
@@ -44,6 +50,16 @@ type Template struct {
 	// EnvdVersion is the semantic version e2b-profile sandboxes report; the
 	// SDKs gate features on it. Strict templates leave it empty.
 	EnvdVersion string
+	// Ports are the guest TCP ports (never envd's) clients may reach through
+	// the gateway, with the sandbox's traffic or envd access token. No other
+	// guest port is reachable. e2b templates only.
+	Ports []int
+	// StartCmd, when set, runs once per sandbox as root through envd right
+	// after envd's /init, in the background (E2B runs it at template build
+	// time and snapshots the result; sandboxd has no snapshots). ReadyCmd,
+	// when set, is then run as root until it exits 0 before the create
+	// returns. e2b templates only.
+	StartCmd, ReadyCmd string
 }
 
 // entry is a registered template with its ID.
@@ -93,6 +109,7 @@ func newRegistry(primaryID, primaryImage, localArch string, extra map[string]Tem
 	for _, id := range slices.Sorted(maps.Keys(extra)) {
 		template := extra[id]
 		template.Aliases = slices.Clone(template.Aliases)
+		template.Ports = slices.Clone(template.Ports)
 		if template.Profile == "" {
 			template.Profile = ProfileStrict
 		}
@@ -137,6 +154,9 @@ func (t Template) validate(id string) error {
 		if t.EnvdVersion != "" {
 			return fmt.Errorf("gitmoot-strict template %q always reports envd %s; drop envd-version", id, strictEnvdVersion)
 		}
+		if len(t.Ports) > 0 || t.StartCmd != "" || t.ReadyCmd != "" {
+			return fmt.Errorf("gitmoot-strict template %q cannot expose ports or run start/ready commands", id)
+		}
 	case ProfileE2B:
 		match := semver.FindStringSubmatch(t.EnvdVersion)
 		if match == nil {
@@ -145,6 +165,18 @@ func (t Template) validate(id string) error {
 		// The SDKs kill a fresh sandbox reporting envd older than 0.1.0.
 		if match[1] == "0" && match[2] == "0" {
 			return fmt.Errorf("e2b template %q: envd-version must be at least 0.1.0", id)
+		}
+		seen := make(map[int]bool)
+		for _, port := range t.Ports {
+			if port < 1 || port > 65535 || port == envdPort || seen[port] {
+				return fmt.Errorf("e2b template %q: port %d must be 1-65535, not envd's %d, and listed once", id, port, envdPort)
+			}
+			seen[port] = true
+		}
+		for name, command := range map[string]string{"start-cmd": t.StartCmd, "ready-cmd": t.ReadyCmd} {
+			if strings.ContainsFunc(command, func(r rune) bool { return r < ' ' || r == 0x7f }) || len(command) > 4096 {
+				return fmt.Errorf("e2b template %q: invalid %s", id, name)
+			}
 		}
 	default:
 		return fmt.Errorf("template %q: profile must be %q or %q, got %q", id, ProfileStrict, ProfileE2B, t.Profile)
@@ -180,11 +212,13 @@ func rowProfile(profile string) Profile {
 // ParseTemplate parses one operator registration:
 //
 //	id=<id>[,arch=arm64|amd64][,image=<ref>][,profile=gitmoot-strict|e2b][,alias=<name>]...[,envd-version=X.Y.Z]
+//	  [,port=<n>]...[,start-cmd=<command>][,ready-cmd=<command>]
 //
 // The profile defaults to gitmoot-strict and the architecture to the local
 // worker's. Without an image only enrolled workers can serve the template.
 // With a non-empty fixedImage (a driver with a single image) the image key
-// may be omitted and must otherwise equal it.
+// may be omitted and must otherwise equal it. Ports and commands are e2b
+// only; commands cannot contain commas.
 func ParseTemplate(spec, fixedImage string) (string, Template, error) {
 	var id string
 	template := Template{Image: fixedImage}
@@ -194,7 +228,7 @@ func ParseTemplate(spec, fixedImage string) (string, Template, error) {
 		if !ok || value == "" {
 			return "", Template{}, fmt.Errorf("template field %q is not key=value", field)
 		}
-		if key != "alias" && seen[key] {
+		if key != "alias" && key != "port" && seen[key] {
 			return "", Template{}, fmt.Errorf("template field %q repeated", key)
 		}
 		seen[key] = true
@@ -214,6 +248,16 @@ func ParseTemplate(spec, fixedImage string) (string, Template, error) {
 			template.Profile = Profile(value)
 		case "envd-version":
 			template.EnvdVersion = value
+		case "port":
+			port, err := strconv.Atoi(value)
+			if err != nil || strconv.Itoa(port) != value {
+				return "", Template{}, fmt.Errorf("template port %q is not a number", value)
+			}
+			template.Ports = append(template.Ports, port)
+		case "start-cmd":
+			template.StartCmd = value
+		case "ready-cmd":
+			template.ReadyCmd = value
 		default:
 			return "", Template{}, fmt.Errorf("unknown template field %q", key)
 		}

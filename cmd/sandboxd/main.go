@@ -50,6 +50,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	template := flags.String("template", "", "the local driver's primary gitmoot-strict template identifier, served from -image")
 	domain := flags.String("domain", "", "private sandbox DNS domain")
 	gatewayHost := flags.String("gateway-host", "", "private HTTPS hostname for header-routed guest traffic")
+	portHosts := flags.Bool("port-hosts", false, "also route exposed guest ports by wildcard host <port>-<id>.<domain> (needs wildcard DNS and TLS for *.<domain> in front of sandboxd); without it guest ports are reached only via -gateway-host and routing headers")
 	var slots firewall.SlotFlags
 	flags.Var(&slots, "slot", "repeatable dedicated labeled host-only Apple network slot, one guest each: name=<network>,ipv4=<subnet>,gw=<gateway>,ipv6=<ula-prefix>")
 	workerID := flags.String("worker-id", "", "stable trusted worker identity recorded for every VM")
@@ -248,7 +249,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		}
 		defer service.Close()
 		guest := &envd.Handler{Driver: service.Guests(), Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
-		handler = envd.Routes(guest, envd.NewProxy(service, *domain, *gatewayHost), service.Handler())
+		handler = envd.Routes(guest, portProxy(service, *domain, *gatewayHost, *portHosts), service.Handler())
 	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -325,4 +326,11 @@ func run(ctx context.Context, args []string) (runErr error) {
 		}
 		return nil
 	}
+}
+
+// portProxy is envd.NewProxy with host-based guest port routing set.
+func portProxy(sandboxes envd.E2BSandboxes, domain, gatewayHost string, portHosts bool) *envd.Proxy {
+	proxy := envd.NewProxy(sandboxes, domain, gatewayHost)
+	proxy.PortHosts = portHosts
+	return proxy
 }

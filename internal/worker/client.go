@@ -368,12 +368,15 @@ func (c *Client) Usage(ctx context.Context, id string) (vm.Usage, error) {
 	return vm.Usage(usage), nil
 }
 
-// DialEnvd opens a stream to VM id's envd through the worker: an HTTP/1.1
-// upgrade the worker bridges to its driver's envd channel. ctx bounds only
-// the dial; the stream lasts until it is closed.
-func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+// DialPort opens a stream to a TCP port of VM id through the worker: an
+// HTTP/1.1 upgrade the worker bridges to its driver's guest port channel. ctx
+// bounds only the dial; the stream lasts until it is closed.
+func (c *Client) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
 	if err := c.checkVM(id); err != nil {
 		return nil, err
+	}
+	if !vm.ValidPort(port) {
+		return nil, fmt.Errorf("worker %s: invalid guest port %d", c.id, port)
 	}
 	c.mu.Lock()
 	lease := c.lease
@@ -383,7 +386,7 @@ func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	}
 	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	stop := context.AfterFunc(ctx, cancel)
-	req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.base+"/vms/"+id+"/envd", nil)
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.base+"/vms/"+id+"/ports/"+strconv.Itoa(port), nil)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -391,7 +394,7 @@ func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	req.Header.Set("Authorization", c.auth)
 	req.Header.Set(leaseHeader, strconv.FormatInt(lease, 10))
 	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", envdUpgrade)
+	req.Header.Set("Upgrade", portUpgrade)
 	resp, err := c.client.Do(req)
 	if !stop() {
 		if err == nil {
@@ -402,7 +405,7 @@ func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	}
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("worker %s: envd %s: %w: %w", c.id, id, ErrUnavailable, err)
+		return nil, fmt.Errorf("worker %s: port %d of %s: %w: %w", c.id, port, id, ErrUnavailable, err)
 	}
 	if resp.StatusCode == http.StatusNotImplemented {
 		resp.Body.Close()
@@ -410,11 +413,11 @@ func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 		return nil, fmt.Errorf("worker %s: %w", c.id, vm.ErrNoEnvd)
 	}
 	stream, ok := resp.Body.(io.ReadWriteCloser)
-	if resp.StatusCode != http.StatusSwitchingProtocols || !ok || !strings.EqualFold(resp.Header.Get("Upgrade"), envdUpgrade) {
+	if resp.StatusCode != http.StatusSwitchingProtocols || !ok || !strings.EqualFold(resp.Header.Get("Upgrade"), portUpgrade) {
 		defer resp.Body.Close()
 		defer cancel()
 		if resp.StatusCode == http.StatusSwitchingProtocols {
-			return nil, fmt.Errorf("worker %s: envd: malformed upgrade", c.id)
+			return nil, fmt.Errorf("worker %s: port stream: malformed upgrade", c.id)
 		}
 		return nil, c.expect(resp, http.StatusSwitchingProtocols)
 	}

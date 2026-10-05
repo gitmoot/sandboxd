@@ -736,3 +736,24 @@ func TestConnectNeverShortensUnderConcurrentExtends(t *testing.T) {
 		t.Fatalf("set_timeout did not shorten: %v", got)
 	}
 }
+
+func TestParseTemplatePortsAndCommands(t *testing.T) {
+	id, template, err := ParseTemplate("id=ci,profile=e2b,envd-version=0.9.0,port=49999,port=8080,start-cmd=/root/start.sh,ready-cmd=curl -fsS http://127.0.0.1:49999/health", "img")
+	if err != nil || id != "ci" || !slices.Equal(template.Ports, []int{49999, 8080}) || template.StartCmd != "/root/start.sh" || template.ReadyCmd != "curl -fsS http://127.0.0.1:49999/health" {
+		t.Fatalf("parsed %q %+v %v", id, template, err)
+	}
+	for _, spec := range []string{
+		"id=s,port=49999",  // strict templates expose nothing
+		"id=s,start-cmd=x", // nor run commands
+		"id=e,profile=e2b,envd-version=0.9.0,port=49983",      // envd's port is not a template port
+		"id=e,profile=e2b,envd-version=0.9.0,port=0",          // out of range
+		"id=e,profile=e2b,envd-version=0.9.0,port=65536",      // out of range
+		"id=e,profile=e2b,envd-version=0.9.0,port=080",        // not canonical
+		"id=e,profile=e2b,envd-version=0.9.0,port=80,port=80", // listed twice
+		"id=e,profile=e2b,envd-version=0.9.0,start-cmd=a,start-cmd=b",
+	} {
+		if _, _, err := ParseTemplate(spec, "img"); err == nil {
+			t.Fatalf("%s: accepted", spec)
+		}
+	}
+}

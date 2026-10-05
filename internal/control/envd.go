@@ -3,12 +3,14 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/gitmoot/sandboxd/internal/envd"
@@ -50,9 +52,59 @@ func (s *Service) EnvdToken(id string) (string, bool) {
 	return s.envdToken(id), true
 }
 
-// DialEnvd opens a stream to an e2b sandbox's envd through the worker that
-// owns it under its current lease.
-func (s *Service) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+// AuthorizeTraffic is AuthorizeEnvd for an e2b sandbox's traffic access
+// token. Both tokens derive from the same key; the ledger stores only the
+// envd token's hash, so the traffic token is checked against its derivation
+// and the sandbox is then checked as AuthorizeEnvd does.
+func (s *Service) AuthorizeTraffic(id, token string) bool {
+	if !validID(id) || token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(s.trafficToken(id))) != 1 {
+		return false
+	}
+	return s.authorize(id, s.envdToken(id), ProfileE2B)
+}
+
+// SignedSandbox finds the running e2b sandbox whose envd access token signed
+// a file URL that names no sandbox (the SDKs build signed URLs from
+// E2B_SANDBOX_URL, without routing headers). The signature binds exactly one
+// token, so at most one sandbox matches.
+func (s *Service) SignedSandbox(signed func(token string) bool) (string, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.mu.Lock()
+	rows, err := s.ledger.Active(ctx)
+	s.mu.Unlock()
+	if err != nil {
+		return "", false
+	}
+	for _, row := range rows {
+		if row.State == "running" && rowProfile(row.Profile) == ProfileE2B && signed(s.envdToken(row.ID)) {
+			return row.ID, true
+		}
+	}
+	return "", false
+}
+
+// Exposes reports whether e2b sandbox id's template exposes guest port.
+func (s *Service) Exposes(id string, port int) bool {
+	if !validID(id) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.mu.Lock()
+	row, err := s.ledger.Get(ctx, id)
+	s.mu.Unlock()
+	if err != nil || rowProfile(row.Profile) != ProfileE2B {
+		return false
+	}
+	template, ok := s.templates.byID[row.TemplateID]
+	return ok && slices.Contains(template.Ports, port)
+}
+
+// DialPort opens a stream to a TCP port of an e2b sandbox's guest loopback
+// through the worker that owns it under its current lease. Callers decide
+// which ports are reachable (envd's, or Exposes).
+func (s *Service) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
 	s.mu.Lock()
 	row, m, err := s.owned(ctx, id)
 	s.mu.Unlock()
@@ -62,7 +114,44 @@ func (s *Service) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	if rowProfile(row.Profile) != ProfileE2B {
 		return nil, fmt.Errorf("sandbox %s is not an e2b sandbox", id)
 	}
-	return m.api.DialEnvd(ctx, id)
+	return m.api.DialPort(ctx, id, port)
+}
+
+// templateReadyTimeout bounds a template's ready command polling.
+const templateReadyTimeout = 3 * time.Minute
+
+// startTemplate runs a new e2b sandbox's template start command in the
+// background and then its ready command until it exits 0, both as root
+// through envd.
+func (s *Service) startTemplate(ctx context.Context, id string, template Template) error {
+	if template.StartCmd == "" && template.ReadyCmd == "" {
+		return nil
+	}
+	transport := envd.Transport(s.DialPort)
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport}
+	token := s.envdToken(id)
+	ctx, cancel := context.WithTimeout(ctx, templateReadyTimeout)
+	defer cancel()
+	if template.StartCmd != "" {
+		if _, err := envd.RunAsRoot(ctx, client, id, token, template.StartCmd, false); err != nil {
+			return fmt.Errorf("start command: %w", err)
+		}
+	}
+	if template.ReadyCmd == "" {
+		return nil
+	}
+	for {
+		code, err := envd.RunAsRoot(ctx, client, id, token, template.ReadyCmd, true)
+		if err == nil && code == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(errors.New("ready command never succeeded"), err)
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // envdInit is the body of envd's POST /init: the sandbox's access token,
@@ -85,7 +174,7 @@ func (s *Service) initEnvd(ctx context.Context, id string, envVars map[string]st
 	defer clear(body)
 	ctx, cancel := context.WithTimeout(ctx, envdInitTimeout)
 	defer cancel()
-	transport := envd.Transport(s.DialEnvd)
+	transport := envd.Transport(s.DialPort)
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport}
 	var last error

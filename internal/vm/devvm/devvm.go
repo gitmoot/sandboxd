@@ -80,7 +80,7 @@ type guest struct {
 var (
 	_ vm.Driver        = (*Driver)(nil)
 	_ vm.ResourceMeter = (*Driver)(nil)
-	_ vm.EnvdDialer    = (*Driver)(nil)
+	_ vm.PortDialer    = (*Driver)(nil)
 )
 
 // New uses root, which must be absent or empty, as the parent of all guest
@@ -187,7 +187,7 @@ func (d *Driver) List(context.Context) ([]vm.Instance, error) {
 }
 
 // runningStrict is running for a strict guest; envd guests are reached only
-// through DialEnvd.
+// through DialPort.
 func (d *Driver) runningStrict(id string) (*guest, error) {
 	g, err := d.running(id)
 	if err == nil && g.envd {

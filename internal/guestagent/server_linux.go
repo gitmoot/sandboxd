@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,9 +38,9 @@ type Server struct {
 	// WaitDelay bounds how long output is drained after the command exits
 	// while background children keep its pipes open.
 	WaitDelay time.Duration
-	// EnvdAddr is the guest-local envd address OpEnvd bridges to, empty when
-	// the guest runs no envd.
-	EnvdAddr string
+	// DialHost is the guest-local host OpDial connects to, empty when the
+	// guest serves no OpDial (only e2b guests do).
+	DialHost string
 	// DiskPath is a path on the guest's writable filesystem, reported by
 	// OpDisk; empty disables OpDisk.
 	DiskPath string
@@ -64,8 +65,8 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		result = s.exec(conn, reader, request)
 	case OpWrite:
 		result = s.write(reader, request)
-	case OpEnvd:
-		if result = s.envd(conn, reader); result.Error == "" {
+	case OpDial:
+		if result = s.dial(conn, reader, request.Port); result.Error == "" {
 			return
 		}
 	case OpDisk:
@@ -76,16 +77,20 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	_ = WriteJSONFrame(conn, FrameResult, result)
 }
 
-// envd connects to envd and, once the host has its acknowledgement, copies
-// bytes both ways until either side ends; then both are closed. An empty
-// Error means the bridge ran and nothing more may be written to conn.
-func (s *Server) envd(conn io.ReadWriteCloser, reader *bufio.Reader) Result {
-	if s.EnvdAddr == "" {
-		return Result{Error: "this guest runs no envd"}
+// dial connects to port on DialHost and, once the host has its
+// acknowledgement, copies bytes both ways until either side ends; then both
+// are closed. An empty Error means the bridge ran and nothing more may be
+// written to conn.
+func (s *Server) dial(conn io.ReadWriteCloser, reader *bufio.Reader, port int) Result {
+	if s.DialHost == "" {
+		return Result{Error: "this guest serves no ports"}
 	}
-	upstream, err := net.DialTimeout("tcp", s.EnvdAddr, 5*time.Second)
+	if port < 1 || port > 65535 {
+		return Result{Error: fmt.Sprintf("invalid guest port %d", port)}
+	}
+	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(s.DialHost, strconv.Itoa(port)), 5*time.Second)
 	if err != nil {
-		return Result{Error: fmt.Sprintf("envd unreachable: %v", err)}
+		return Result{Error: fmt.Sprintf("guest port %d unreachable: %v", port, err)}
 	}
 	defer upstream.Close()
 	if err := WriteJSONFrame(conn, FrameResult, Result{}); err != nil {

@@ -24,18 +24,18 @@ import (
 // Port is the guest vsock port the agent listens on.
 const Port = 1024
 
-// EnvdPort is the guest TCP port upstream envd listens on; OpEnvd bridges to
-// it on the guest loopback.
+// EnvdPort is the guest TCP port upstream envd listens on.
 const EnvdPort = 49983
 
 const (
 	OpPing  = "ping"
 	OpExec  = "exec"
 	OpWrite = "write"
-	// OpEnvd bridges the connection to the guest's envd port. After a
-	// successful Result frame the connection carries raw envd bytes in both
-	// directions until either side closes; no further frames follow.
-	OpEnvd = "envd"
+	// OpDial bridges the connection to Request.Port on the guest loopback
+	// (envd, or a port the sandbox's template exposes; e2b guests only).
+	// After a successful Result frame the connection carries raw bytes in
+	// both directions until either side closes; no further frames follow.
+	OpDial = "dial"
 	// OpDisk reports the guest's writable filesystem: DiskTotal and DiskUsed.
 	OpDisk = "disk"
 )
@@ -64,6 +64,8 @@ type Request struct {
 	Env  map[string]string `json:"env,omitempty"`
 	Path string            `json:"path,omitempty"`
 	Size int64             `json:"size,omitempty"`
+	// Port is OpDial's guest TCP port, 1-65535.
+	Port int `json:"port,omitempty"`
 }
 
 // Started acknowledges an accepted command. ID is a positive per-agent

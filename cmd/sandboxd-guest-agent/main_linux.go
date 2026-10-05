@@ -5,7 +5,8 @@
 //
 // An e2b guest (kernel argument sandboxd.envd=1) instead gets a writable
 // overlay root on the per-VM disk and runs upstream envd as root; the vsock
-// server then also bridges host connections to envd on the guest loopback.
+// server then also bridges host connections to TCP ports on the guest
+// loopback (envd, and the ports its template exposes; sandboxd chooses).
 package main
 
 import (
@@ -13,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -309,7 +309,7 @@ func serve(envd bool) error {
 		DiskPath:    homeDir,
 	}
 	if envd {
-		server.EnvdAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(guestagent.EnvdPort))
+		server.DialHost = "127.0.0.1"
 		server.DiskPath = "/"
 	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
