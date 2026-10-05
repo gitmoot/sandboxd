@@ -198,11 +198,21 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ stri
 		return h.failVMM
 	}
 	id := argAfter(args, "--id")
+	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), "firecracker", id, "root")
+	// The real VMM runs as its own unprivileged UID and owns only what the
+	// driver chowns to it; the root-owned files it reads must be readable by
+	// others, or Firecracker panics at startup and exits.
+	for _, name := range []string{"vm.json", "vmlinux", "rootfs.ext4"} {
+		info, err := os.Stat(filepath.Join(chroot, name))
+		if err != nil || info.Mode().Perm()&0o004 == 0 {
+			h.cgroups[id] = false
+			return nil
+		}
+	}
 	h.cgroups[id] = !h.bootDies
 	if h.bootDies {
 		return nil
 	}
-	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), "firecracker", id, "root")
 	guest := h.t.TempDir()
 	h.guests[chroot] = guest
 	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
@@ -286,7 +296,11 @@ func newTestFirecracker(t *testing.T, mutate ...func(*FirecrackerConfig)) (*Fire
 		Slots: FirecrackerSlotNames(2), UIDBase: 2900000, HomeDiskMiB: 1024, DiskFloorMiB: 4096, BootTimeout: 2 * time.Second,
 	}
 	for _, path := range []string{cfg.Firecracker, cfg.Jailer, cfg.Kernel, cfg.Images[0]} {
+		// As install -m 0444 does, whatever the test process's umask.
 		if err := os.WriteFile(path, []byte(filepath.Base(path)), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o444); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -785,5 +799,38 @@ func TestFirecrackerDialRefusesReplacedSocket(t *testing.T) {
 	case <-accepted:
 	case <-time.After(5 * time.Second):
 		t.Fatal("control: plain connect did not reach the decoy")
+	}
+}
+
+// A daemon started by a service manager or detached shell may run with umask
+// 0077. The jail files the unprivileged VMM reads must still be readable by
+// it, or Firecracker panics on /vm.json and every create fails.
+func TestFirecrackerJailModesIgnoreUmask(t *testing.T) {
+	d, _, cfg := newTestFirecracker(t)
+	old := unix.Umask(0o077)
+	defer unix.Umask(old)
+	ctx := context.Background()
+	if _, err := d.Create(ctx, Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatalf("create under umask 0077: %v", err)
+	}
+	if code, err := d.Run(ctx, fcTestID, Command{Args: []string{"true"}}, io.Discard, io.Discard); err != nil || code != 0 {
+		t.Fatalf("run: code=%d err=%v", code, err)
+	}
+	root := d.chroot(fcTestID)
+	for path, want := range map[string]os.FileMode{
+		d.jailBase():                       0o755,
+		d.jailsDir():                       0o755,
+		d.jailDir(fcTestID):                0o700,
+		root:                               0o755,
+		filepath.Join(root, "vm.json"):     0o444,
+		filepath.Join(root, "home.ext4"):   0o600,
+		filepath.Join(root, fcVsockDir):    0o700,
+		filepath.Join(root, "vmlinux"):     0o444,
+		filepath.Join(root, "rootfs.ext4"): 0o444,
+	} {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != want {
+			t.Errorf("%s: mode %v (%v), want %v", path, info.Mode().Perm(), err, want)
+		}
 	}
 }

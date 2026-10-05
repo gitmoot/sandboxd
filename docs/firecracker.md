@@ -119,6 +119,11 @@ defaults to 2 for this driver, with at most 64 slots. `-slot`, `-pin-image`,
 `-pf-socket` and the model relay flags are Apple-only, and the Firecracker
 driver rejects them. The other `-fc-*` flags are listed in `sandboxd -h`.
 
+It needs no terminal and works under any umask, so it can run as a
+systemd or other service with `UMask=0077` and stdin on `/dev/null`. The
+driver sets every jail mode explicitly; the VMM's UID must be able to read
+the root-owned `/vm.json`, kernel and root image in its jail.
+
 ## Tests
 
 - `go test ./internal/vm ./internal/guestagent ./cmd/sandboxd`: driver

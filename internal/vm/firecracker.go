@@ -608,29 +608,41 @@ func (d *FirecrackerDriver) jailerArgs(meta fcMeta) []string {
 	}
 }
 
-// writeFileExcl creates path with mode and exactly data; it never replaces
-// an existing file.
+// writeFileExcl creates path with exactly mode and data; it never replaces
+// an existing file. The mode is set explicitly: the daemon's umask (0077
+// under a hardened service manager) must not decide what the VMM can read.
 func writeFileExcl(path string, data []byte, mode os.FileMode) error {
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
 	_, err = file.Write(data)
-	return errors.Join(err, file.Sync(), file.Close())
+	return errors.Join(err, file.Chmod(mode), file.Sync(), file.Close())
+}
+
+// mkdirExact creates one directory with exactly mode, whatever the umask.
+func mkdirExact(path string, mode os.FileMode) error {
+	if err := os.Mkdir(path, mode); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
 }
 
 // prepareJail lays out the chroot before the jailer runs: hard links of the
 // read-only kernel and root image, a fresh sparse home disk and a socket
-// directory owned by the VMM UID, and the VM configuration.
+// directory owned by the VMM UID, and the world-readable VM configuration.
+// The VMM reads these as its own UID, so no mode may depend on the umask.
 func (d *FirecrackerDriver) prepareJail(spec Spec, meta fcMeta) error {
 	root := d.chroot(spec.ID)
-	if err := os.MkdirAll(d.jailsDir(), 0o755); err != nil {
+	for _, dir := range []string{d.jailBase(), d.jailsDir()} {
+		if err := mkdirExact(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return err
+		}
+	}
+	if err := mkdirExact(d.jailDir(spec.ID), 0o700); err != nil {
 		return err
 	}
-	if err := os.Mkdir(d.jailDir(spec.ID), 0o700); err != nil {
-		return err
-	}
-	if err := os.Mkdir(root, 0o755); err != nil {
+	if err := mkdirExact(root, 0o755); err != nil {
 		return err
 	}
 	if err := os.Link(d.cfg.Kernel, filepath.Join(root, "vmlinux")); err != nil {
@@ -644,14 +656,14 @@ func (d *FirecrackerDriver) prepareJail(spec Spec, meta fcMeta) error {
 	if err != nil {
 		return err
 	}
-	if err := errors.Join(file.Truncate(int64(d.cfg.HomeDiskMiB)<<20), file.Close()); err != nil {
+	if err := errors.Join(file.Truncate(int64(d.cfg.HomeDiskMiB)<<20), file.Chmod(0o600), file.Close()); err != nil {
 		return err
 	}
 	if err := d.host.Chown(home, meta.VMMUID, meta.VMMUID); err != nil {
 		return err
 	}
 	run := filepath.Join(root, filepath.Dir(fcVsockPath))
-	if err := os.Mkdir(run, 0o700); err != nil {
+	if err := mkdirExact(run, 0o700); err != nil {
 		return err
 	}
 	if err := d.host.Chown(run, meta.VMMUID, meta.VMMUID); err != nil {
