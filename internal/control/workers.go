@@ -178,12 +178,12 @@ func (s *Service) enroll(ctx context.Context, m *member) error {
 	serves := make(map[string]string, len(decl.Templates))
 	refused := make(map[string]string)
 	for template, image := range decl.Templates {
-		arch, known := s.templates[template]
+		registered, known := s.templates.byID[template]
 		switch {
 		case !known:
 			refused[template] = "template is not registered at the gateway"
-		case arch != decl.Arch:
-			refused[template] = fmt.Sprintf("architecture mismatch: template requires %s, worker runs %s", arch, decl.Arch)
+		case registered.Arch != decl.Arch:
+			refused[template] = fmt.Sprintf("architecture mismatch: template requires %s, worker runs %s", registered.Arch, decl.Arch)
 		default:
 			serves[template] = image
 		}
@@ -544,8 +544,8 @@ func (s *Service) capacity(w http.ResponseWriter, r *http.Request) {
 		report.Workers = append(report.Workers, workerCapacity{WorkerID: id, Templates: []string{}, RefusedTemplates: map[string]string{},
 			UsedSlots: used[id], Error: "worker is not enrolled; its sandboxes are unconfirmed until it is enrolled again or forgotten"})
 	}
-	for template, arch := range s.templates {
-		entry := templateCapacity{TemplateID: template, Arch: arch}
+	for template, registered := range s.templates.byID {
+		entry := templateCapacity{TemplateID: template, Arch: registered.Arch}
 		for _, m := range s.workers {
 			if _, ok := m.serves[template]; ok && m.online {
 				entry.TotalSlots += m.decl.MaxVMs

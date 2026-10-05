@@ -68,7 +68,7 @@ func TestWorkerDeclaresItsRealDriverAndArchitecture(t *testing.T) {
 		{"firecracker", "amd64", "/var/lib/sandboxd-fc/images/review-amd64.ext4"},
 		{"apple", "arm64", "linux-arm64"},
 	} {
-		decl := workerDeclaration(tc.driver, "worker-1", "review", tc.image, 2, 1024, 1, []string{"sbx0"})
+		decl := workerDeclaration(tc.driver, "worker-1", map[string]string{"review": tc.image}, 2, 1024, 1, []string{"sbx0"})
 		if decl.Arch != tc.arch || decl.Driver != tc.driver || decl.Templates["review"] != tc.image || decl.Validate() != nil {
 			t.Fatalf("%s worker declared %+v (%v)", tc.driver, decl, decl.Validate())
 		}

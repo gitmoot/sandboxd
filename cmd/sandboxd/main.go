@@ -47,7 +47,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	image := flags.String("image", "", "allowlisted guest image: Linux ARM64 OCI image (apple) or absolute read-only ext4 root image (firecracker)")
 	pinImage := flags.String("pin-image", "", "trusted digest-pinned read-only bridge VM image")
 	pfSocket := flags.String("pf-socket", "", "root helper Unix socket")
-	template := flags.String("template", "", "allowlisted E2B-compatible template identifier")
+	template := flags.String("template", "", "the local driver's primary gitmoot-strict template identifier, served from -image")
 	domain := flags.String("domain", "", "private sandbox DNS domain")
 	gatewayHost := flags.String("gateway-host", "", "private HTTPS hostname for header-routed guest traffic")
 	var slots firewall.SlotFlags
@@ -63,6 +63,10 @@ func run(ctx context.Context, args []string) (runErr error) {
 	flags.Var(&enrolls, "enroll", "repeatable remote worker the gateway also schedules onto: id=<worker-id>,url=<https worker API URL>,key-file=<0600 per-worker key file>")
 	templateArchs := make(templateArchFlags)
 	flags.Var(templateArchs, "template-arch", "repeatable template served by enrolled workers: <template>=arm64|amd64")
+	var registered control.TemplateFlags
+	flags.Var(&registered, "register-template", "repeatable operator-registered template: id=<id>[,arch=arm64|amd64][,image=<image>][,profile=gitmoot-strict|e2b][,alias=<name>]...[,envd-version=X.Y.Z]; "+
+		"with an image this host also serves it (a -worker-key-file worker declares only id and image)")
+	tokenSecretFile := flags.String("token-secret-file", "", "0600 file of at least 32 bytes deriving e2b-profile envd tokens; required with any e2b template")
 	workerKeyFile := flags.String("worker-key-file", "", "serve only the enrolled-worker API on -listen, authenticated by this 0600 per-worker key file, instead of the control and guest APIs")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -81,7 +85,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		return fmt.Errorf("image, template and worker-id are required for a local driver, plus pin-image and pf-socket for the apple driver; " +
 			"a gateway (no -worker-key-file) also needs db, api-key-file, domain and gateway-host")
 	}
-	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0) {
+	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0 || *tokenSecretFile != "") {
 		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and cannot enroll workers or register templates")
 	}
 	if !local && len(enrolls) == 0 {
@@ -127,6 +131,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	var apiKey, workerKey string
 	var remotes []control.Remote
+	var tokenSecret []byte
 	if workerMode {
 		if workerKey, err = readSecretFile(*workerKeyFile, 16); err != nil {
 			return fmt.Errorf("worker key: %w", err)
@@ -147,7 +152,18 @@ func run(ctx context.Context, args []string) (runErr error) {
 		if remotes, err = enrolls.remotes(*workerID); err != nil {
 			return err
 		}
+		if *tokenSecretFile != "" {
+			if tokenSecret, err = control.ReadTokenSecret(*tokenSecretFile); err != nil {
+				return err
+			}
+		}
 	}
+	templates, err := mergeTemplates(registered.Templates, templateArchs)
+	if err != nil {
+		return err
+	}
+	// A local driver's image allowlist is exactly the images it serves.
+	images := control.Images(*image, registered.Templates)
 	var driver isolatedDriver
 	switch *driverName {
 	case "apple":
@@ -155,7 +171,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		if err != nil {
 			return err
 		}
-		apple, err := vm.NewAppleDriver(*cli, []string{*image}, slotNames, *workerID, *pinImage, gate)
+		apple, err := vm.NewAppleDriver(*cli, images, slotNames, *workerID, *pinImage, gate)
 		if err != nil {
 			return err
 		}
@@ -192,7 +208,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	case "firecracker":
 		// Guests that survived a daemon kill keep running; the control
 		// plane's reconciliation keeps those its ledger still owns.
-		firecracker, shutdown, err := startFirecracker(ctx, fc, *image, slotNames)
+		firecracker, shutdown, err := startFirecracker(ctx, fc, images, slotNames)
 		if err != nil {
 			return err
 		}
@@ -206,7 +222,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	var handler http.Handler
 	if workerMode {
-		server, err := worker.NewServer(driver, workerDeclaration(*driverName, *workerID, *template, *image, *cpus, *memory, *maxVMs, slotNames), workerKey, *maxTTL)
+		server, err := worker.NewServer(driver, workerDeclaration(*driverName, *workerID, control.Declared(*template, *image, registered.Templates), *cpus, *memory, *maxVMs, slotNames), workerKey, *maxTTL)
 		if err != nil {
 			return err
 		}
@@ -218,7 +234,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		go server.ReapEvery(reapCtx, time.Second)
 		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
 	} else {
-		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, Templates: templateArchs, Workers: remotes}
+		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, Templates: templates, TokenSecret: tokenSecret, Workers: remotes}
 		var local vm.Driver
 		if driver != nil {
 			local = driver

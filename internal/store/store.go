@@ -30,6 +30,8 @@ type Row struct {
 	WorkerID   string
 	TokenHash  []byte
 	Metadata   string
+	// JobID "" marks a row outside the job fence (an e2b-profile sandbox): it
+	// never supersedes, and is never superseded by, another attempt.
 	JobID      string
 	Attempt    int64
 	Generation int64
@@ -45,7 +47,10 @@ type Row struct {
 	MemoryMiB int
 	// Lease is the worker enrollment lease under which the row was last
 	// proven present. Guest access requires the worker's current lease.
-	Lease   int64
+	Lease int64
+	// Profile is the template profile the row was admitted under; "" marks a
+	// row created before profiles were recorded, all of them gitmoot-strict.
+	Profile string
 	Started time.Time
 	Ends    time.Time
 }
@@ -166,7 +171,7 @@ func migrateIdentity(ctx context.Context, db *sql.DB) error {
 		{"template_id", "TEXT NOT NULL DEFAULT ''"}, {"image", "TEXT NOT NULL DEFAULT ''"},
 		{"worker_id", "TEXT NOT NULL DEFAULT ''"}, {"slot", "TEXT NOT NULL DEFAULT ''"},
 		{"cpus", "INTEGER NOT NULL DEFAULT 0"}, {"memory_mib", "INTEGER NOT NULL DEFAULT 0"},
-		{"lease", "INTEGER NOT NULL DEFAULT 0"},
+		{"lease", "INTEGER NOT NULL DEFAULT 0"}, {"profile", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		if existing[column.name] {
 			continue
@@ -214,13 +219,15 @@ func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int, slots []string
 			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		}
 	}()
-	var generation, attempt int64
-	err = conn.QueryRowContext(ctx, "SELECT generation,attempt FROM sandboxes WHERE job_id=? ORDER BY generation DESC,attempt DESC LIMIT 1", row.JobID).Scan(&generation, &attempt)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
-	if err == nil && (row.Generation < generation || row.Generation == generation && row.Attempt <= attempt) {
-		return "", ErrStale
+	if row.JobID != "" {
+		var generation, attempt int64
+		err = conn.QueryRowContext(ctx, "SELECT generation,attempt FROM sandboxes WHERE job_id=? ORDER BY generation DESC,attempt DESC LIMIT 1", row.JobID).Scan(&generation, &attempt)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if err == nil && (row.Generation < generation || row.Generation == generation && row.Attempt <= attempt) {
+			return "", ErrStale
+		}
 	}
 	live, err := conn.QueryContext(ctx, "SELECT worker_id,slot FROM sandboxes WHERE "+liveState)
 	if err != nil {
@@ -261,9 +268,9 @@ func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int, slots []string
 	if slot == "" {
 		return "", ErrCapacity
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,started_ns,ends_ns)
-		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
-		row.TemplateID, row.Image, row.WorkerID, slot, row.CPUs, row.MemoryMiB, row.Lease, row.Started.UnixNano(), row.Ends.UnixNano())
+	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,started_ns,ends_ns)
+		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?,?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
+		row.TemplateID, row.Image, row.WorkerID, slot, row.CPUs, row.MemoryMiB, row.Lease, row.Profile, row.Started.UnixNano(), row.Ends.UnixNano())
 	if err != nil {
 		return "", err
 	}
@@ -277,7 +284,7 @@ func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	var row Row
 	var start, end int64
 	err := scanner.Scan(&row.ID, &row.TokenHash, &row.Metadata, &row.JobID, &row.Attempt, &row.Generation, &row.Fence, &row.State,
-		&row.TemplateID, &row.Image, &row.WorkerID, &row.Slot, &row.CPUs, &row.MemoryMiB, &row.Lease, &start, &end)
+		&row.TemplateID, &row.Image, &row.WorkerID, &row.Slot, &row.CPUs, &row.MemoryMiB, &row.Lease, &row.Profile, &start, &end)
 	if err == nil {
 		row.Started = time.Unix(0, start).UTC()
 		row.Ends = time.Unix(0, end).UTC()
@@ -285,7 +292,7 @@ func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	return row, err
 }
 
-const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,started_ns,ends_ns"
+const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,started_ns,ends_ns"
 
 func (s *Store) Get(ctx context.Context, id string) (Row, error) {
 	return scanRow(s.db.QueryRowContext(ctx, "SELECT "+columns+" FROM sandboxes WHERE id=?", id))
@@ -308,7 +315,12 @@ func (s *Store) Active(ctx context.Context) ([]Row, error) {
 	return result, rows.Err()
 }
 
+// Current reports whether row is its job's newest attempt. A row outside the
+// job fence (JobID "") is always current.
 func (s *Store) Current(ctx context.Context, row Row) (bool, error) {
+	if row.JobID == "" {
+		return true, nil
+	}
 	var id string
 	err := s.db.QueryRowContext(ctx, "SELECT id FROM sandboxes WHERE job_id=? ORDER BY generation DESC,attempt DESC LIMIT 1", row.JobID).Scan(&id)
 	return id == row.ID, err

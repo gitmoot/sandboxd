@@ -14,7 +14,7 @@ import (
 // startFirecracker arms the host firewall before any guest work. Guests that
 // survived a daemon kill keep running behind the table, which outlives the
 // daemon. The returned shutdown destroys every guest, then removes the table.
-func startFirecracker(ctx context.Context, f firecrackerFlags, image string, slots []string) (isolatedDriver, func(context.Context) error, error) {
+func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []string) (isolatedDriver, func(context.Context) error, error) {
 	binary := *f.firecracker
 	if binary == "" {
 		binary = filepath.Join(*f.root, "bin", "firecracker")
@@ -27,7 +27,7 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, image string, slo
 		return nil, nil, errors.New("fc-kernel is required for the firecracker driver")
 	}
 	driver, err := vm.NewFirecrackerDriver(vm.FirecrackerConfig{
-		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: []string{image}, Slots: slots,
+		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: images, Slots: slots,
 		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
 		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny,
 	})

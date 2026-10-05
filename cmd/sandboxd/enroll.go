@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -106,6 +107,24 @@ func (f templateArchFlags) Set(value string) error {
 	return nil
 }
 
+// mergeTemplates combines -register-template entries with -template-arch
+// shorthands; a template named by both must agree on its architecture.
+func mergeTemplates(registered map[string]control.Template, archs templateArchFlags) (map[string]control.Template, error) {
+	templates := maps.Clone(registered)
+	if templates == nil {
+		templates = make(map[string]control.Template)
+	}
+	for id, arch := range archs {
+		template := templates[id]
+		if template.Arch != "" && template.Arch != arch {
+			return nil, fmt.Errorf("template %q is registered for %s and %s", id, template.Arch, arch)
+		}
+		template.Arch = arch
+		templates[id] = template
+	}
+	return templates, nil
+}
+
 // readSecretFile reads a single-line secret from a regular file that only its
 // owner can read.
 func readSecretFile(path string, minBytes int) (string, error) {
@@ -138,8 +157,8 @@ func driverArch(driver string) string {
 
 // workerDeclaration is what a -worker-key-file worker declares to the gateway
 // that enrolls it.
-func workerDeclaration(driver, id, template, image string, cpus, memoryMiB, maxVMs int, slots []string) worker.Declaration {
-	return worker.Declaration{ID: id, Arch: driverArch(driver), Driver: driver, Templates: map[string]string{template: image},
+func workerDeclaration(driver, id string, templates map[string]string, cpus, memoryMiB, maxVMs int, slots []string) worker.Declaration {
+	return worker.Declaration{ID: id, Arch: driverArch(driver), Driver: driver, Templates: templates,
 		CPUs: cpus, MemoryMiB: memoryMiB, MaxVMs: maxVMs, Slots: slices.Clone(slots)}
 }
 

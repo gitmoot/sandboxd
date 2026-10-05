@@ -259,7 +259,7 @@ func newFakeWorker(t *testing.T, id, arch string, templates map[string]string, m
 var (
 	arm64Templates = map[string]string{"review-arm64": "linux-arm64"}
 	amd64Templates = map[string]string{"review-amd64": "linux-amd64"}
-	gatewayArchs   = map[string]string{"review-arm64": "arm64", "review-amd64": "amd64"}
+	gatewayArchs   = map[string]Template{"review-arm64": {Arch: "arm64"}, "review-amd64": {Arch: "amd64"}}
 )
 
 // openGateway runs a gateway with no local driver over the given workers.

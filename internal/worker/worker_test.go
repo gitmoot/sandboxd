@@ -145,7 +145,8 @@ func (f *fakeDriver) Destroy(_ context.Context, id string) error {
 
 func (f *fakeDriver) Usage(_ context.Context, id string) (vm.Usage, error) {
 	f.touch()
-	return vm.Usage{CPUUsedPct: 12.5, MemoryUsedBytes: 1 << 20, MemoryLimitBytes: 2 << 30}, nil
+	return vm.Usage{CPUUsedPct: 12.5, MemoryUsedBytes: 1 << 20, MemoryLimitBytes: 2 << 30,
+		Detailed: true, MemoryCacheBytes: 4096, DiskUsedBytes: 8192, DiskTotalBytes: 10 << 30}, nil
 }
 
 // plainDriver hides the fake's ResourceMeter.
@@ -246,7 +247,8 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	usage, err := client.Usage(ctx, vmA)
-	if err != nil || usage != (vm.Usage{CPUUsedPct: 12.5, MemoryUsedBytes: 1 << 20, MemoryLimitBytes: 2 << 30}) {
+	if err != nil || usage != (vm.Usage{CPUUsedPct: 12.5, MemoryUsedBytes: 1 << 20, MemoryLimitBytes: 2 << 30,
+		Detailed: true, MemoryCacheBytes: 4096, DiskUsedBytes: 8192, DiskTotalBytes: 10 << 30}) {
 		t.Fatalf("usage = %+v, %v", usage, err)
 	}
 	if err := client.Destroy(ctx, vmA); err != nil {

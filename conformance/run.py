@@ -56,7 +56,14 @@ E2B_SDK_COMMIT = "970b34dc24d628f8061e539925468c123e345d5f"
 E2B_CI_JS_COMMIT = "10235faa2878a4ef38547f8ea7e676d7bd25c585"
 GITMOOT_COMMIT = "a61e1435e7625bf062e05eed21337765833eade6"
 NPM = "npm@11.21.0"
-TEMPLATE = "base"
+# Templates sandboxd-dev registers: Gitmoot's strict template, and the SDK
+# suites' default "base" as an alias of an e2b-profile template. ENVD_VERSION
+# is the oldest envd with every control-plane feature the suites use (disk
+# metrics need 0.2.4).
+STRICT_TEMPLATE = "review-arm64"
+E2B_TEMPLATE = "sandboxd-base"
+E2B_ALIAS = "base"
+ENVD_VERSION = "0.2.4"
 DOMAIN = "sandboxd.test"
 SUITE_TIMEOUT = 45 * 60
 SDK_ENV = ("E2B_API_URL", "E2B_SANDBOX_URL", "E2B_API_KEY", "E2B_DOMAIN")
@@ -599,7 +606,8 @@ def dev_server(ws: Workspace, suite: str):
     server_log = (ws.logs / f"{suite}-server.log").open("w")
     process = subprocess.Popen([
         str(ws.server), "-listen", f"127.0.0.1:{port}", "-db", str(run_dir / "ledger.db"),
-        "-api-key-file", str(key_file), "-state-dir", str(state), "-template", TEMPLATE,
+        "-api-key-file", str(key_file), "-state-dir", str(state), "-template", STRICT_TEMPLATE,
+        "-register-template", f"id={E2B_TEMPLATE},alias={E2B_ALIAS},profile=e2b,envd-version={ENVD_VERSION}",
         "-domain", DOMAIN, "-gateway-host", "127.0.0.1", "-max-vms", "16",
     ], stdout=server_log, stderr=subprocess.STDOUT)
     try:
@@ -749,7 +757,7 @@ def run_suite(ws: Workspace, suite: Suite, offline: bool = False) -> dict[str, s
             return run_vitest(ws, label, package, js_targets(package, [""], ["tests/runtimes/"]), server)
         if suite.name == "gitmoot":
             env = dict(os.environ, CGO_ENABLED="0", SANDBOXD_CONFORMANCE_URL=server.url,
-                       SANDBOXD_CONFORMANCE_KEY_FILE=str(server.key_file), SANDBOXD_CONFORMANCE_TEMPLATE=TEMPLATE,
+                       SANDBOXD_CONFORMANCE_KEY_FILE=str(server.key_file), SANDBOXD_CONFORMANCE_TEMPLATE=STRICT_TEMPLATE,
                        SANDBOXD_CONFORMANCE_CANCEL="1")
             log_path = ws.logs / f"{label}.log"
             run_logged(["go", "test", "./internal/execbackend/e2b", "-count=1", "-json"], ws.gitmoot, env, log_path)
