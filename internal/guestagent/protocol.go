@@ -24,10 +24,20 @@ import (
 // Port is the guest vsock port the agent listens on.
 const Port = 1024
 
+// EnvdPort is the guest TCP port upstream envd listens on; OpEnvd bridges to
+// it on the guest loopback.
+const EnvdPort = 49983
+
 const (
 	OpPing  = "ping"
 	OpExec  = "exec"
 	OpWrite = "write"
+	// OpEnvd bridges the connection to the guest's envd port. After a
+	// successful Result frame the connection carries raw envd bytes in both
+	// directions until either side closes; no further frames follow.
+	OpEnvd = "envd"
+	// OpDisk reports the guest's writable filesystem: DiskTotal and DiskUsed.
+	OpDisk = "disk"
 )
 
 const (
@@ -67,6 +77,9 @@ type Started struct {
 type Result struct {
 	Code  int    `json:"code"`
 	Error string `json:"error,omitempty"`
+	// DiskTotal and DiskUsed answer OpDisk, in bytes.
+	DiskTotal uint64 `json:"diskTotal,omitempty"`
+	DiskUsed  uint64 `json:"diskUsed,omitempty"`
 }
 
 // WriteRequest sends the request line.

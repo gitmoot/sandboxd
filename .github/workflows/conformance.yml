@@ -36,8 +36,12 @@ jobs:
         run: |
           python3 conformance/run.py --render
           git diff --exit-code -- docs/conformance-matrix.md
+      # e2b guests run the pinned upstream envd as root through the runner's
+      # passwordless sudo (see internal/vm/devvm/envd.go).
       - name: Run pinned suites and compare with conformance/expected.json
-        run: python3 conformance/run.py --report "$RUNNER_TEMP/conformance"
+        run: |
+          sudo -n true
+          python3 conformance/run.py --report "$RUNNER_TEMP/conformance"
       - name: Publish results
         if: always()
         uses: actions/upload-artifact@v4

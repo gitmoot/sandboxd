@@ -140,7 +140,7 @@ func TestGuestUploadRequiresCapabilityAndConfinedPath(t *testing.T) {
 
 func TestGuestHealthReportsOnlyLiveAuthorizedSandboxes(t *testing.T) {
 	h := &Handler{Driver: &guestFixture{}, Authorizer: allowedSandbox{}, GatewayHost: "mac.private.test"}
-	routes := Routes(h, http.NotFoundHandler())
+	routes := Routes(h, nil, http.NotFoundHandler())
 	health := func(token string) int {
 		r := httptest.NewRequest(http.MethodGet, "http://mac.private.test/health", nil)
 		r.Header.Set("E2b-Sandbox-Id", "sandboxd-a1")

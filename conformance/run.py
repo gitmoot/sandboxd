@@ -19,7 +19,8 @@ Modes:
 
 The SDK suites are configured only through E2B_API_URL, E2B_SANDBOX_URL,
 E2B_API_KEY and E2B_DOMAIN; every other E2B_* variable is removed from their
-environment. Needs git, go, python3 (3.11+) and node (22+) with npx.
+environment. Needs git, go, python3 (3.11+), node (22+) with npx, and root or
+passwordless sudo: e2b guests run the pinned upstream envd as root.
 Standard library only.
 """
 
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import http.server
 import json
 import os
@@ -40,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,13 +60,15 @@ E2B_CI_JS_COMMIT = "10235faa2878a4ef38547f8ea7e676d7bd25c585"
 GITMOOT_COMMIT = "a61e1435e7625bf062e05eed21337765833eade6"
 NPM = "npm@11.21.0"
 # Templates sandboxd-dev registers: Gitmoot's strict template, and the SDK
-# suites' default "base" as an alias of an e2b-profile template. ENVD_VERSION
-# is the oldest envd with every control-plane feature the suites use (disk
-# metrics need 0.2.4).
+# suites' default "base" as an alias of an e2b-profile template, whose guests
+# run the pinned upstream envd (the same release as images/e2b-amd64-fc);
+# ENVD_VERSION is that release, reported to the SDKs.
 STRICT_TEMPLATE = "review-arm64"
 E2B_TEMPLATE = "sandboxd-base"
 E2B_ALIAS = "base"
-ENVD_VERSION = "0.2.4"
+ENVD_VERSION = "0.9.0"
+ENVD_URL = "https://storage.googleapis.com/e2b-artifact-binaries/envd/v0.9.0/envd"
+ENVD_SHA256 = "c42a31d738718b5cf7654e258e5b111308646a905331b266294cdcbeb0a02355"
 DOMAIN = "sandboxd.test"
 SUITE_TIMEOUT = 45 * 60
 SDK_ENV = ("E2B_API_URL", "E2B_SANDBOX_URL", "E2B_API_KEY", "E2B_DOMAIN")
@@ -524,6 +529,10 @@ class Workspace:
         return self.root / "js" / "node_modules"
 
     @property
+    def envd(self) -> Path:
+        return self.root / "bin" / f"envd-{ENVD_VERSION}"
+
+    @property
     def server(self) -> Path:
         return self.root / "bin" / "sandboxd-dev"
 
@@ -574,6 +583,17 @@ def prepare(ws: Workspace, suites: list[Suite]) -> None:
     for package in (ws.sdk / "packages" / "js-sdk", ws.ci_js / "packages" / "code-interpreter-js"):
         if package.is_dir() and not (package / "node_modules").exists():
             (package / "node_modules").symlink_to(ws.node_modules)
+    if not ws.envd.exists():
+        log(f"fetching upstream envd {ENVD_VERSION} (linux/amd64)")
+        with urllib.request.urlopen(ENVD_URL, timeout=300) as response:
+            data = response.read()
+        if hashlib.sha256(data).hexdigest() != ENVD_SHA256:
+            raise HarnessError(f"envd {ENVD_VERSION} checksum mismatch")
+        ws.envd.parent.mkdir(parents=True, exist_ok=True)
+        partial = ws.envd.with_suffix(".partial")
+        partial.write_bytes(data)
+        partial.chmod(0o755)
+        partial.rename(ws.envd)
     log("building sandboxd-dev (-tags sandboxd_devdriver)")
     env = dict(os.environ, CGO_ENABLED="0")
     sh(["go", "build", "-tags", "sandboxd_devdriver", "-o", str(ws.server), "./cmd/sandboxd-dev"], cwd=REPO, env=env, timeout=900)
@@ -608,7 +628,7 @@ def dev_server(ws: Workspace, suite: str):
         str(ws.server), "-listen", f"127.0.0.1:{port}", "-db", str(run_dir / "ledger.db"),
         "-api-key-file", str(key_file), "-state-dir", str(state), "-template", STRICT_TEMPLATE,
         "-register-template", f"id={E2B_TEMPLATE},alias={E2B_ALIAS},profile=e2b,envd-version={ENVD_VERSION}",
-        "-domain", DOMAIN, "-gateway-host", "127.0.0.1", "-max-vms", "16",
+        "-domain", DOMAIN, "-gateway-host", "127.0.0.1", "-max-vms", "16", "-envd", str(ws.envd),
     ], stdout=server_log, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 30

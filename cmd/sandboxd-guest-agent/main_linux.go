@@ -2,6 +2,10 @@
 // mounts the guest's private filesystems, formats the per-VM writable home
 // disk, and supervises the vsock server, which runs commands and file writes
 // as the guest user (uid/gid 1000). It never listens on the guest network.
+//
+// An e2b guest (kernel argument sandboxd.envd=1) instead gets a writable
+// overlay root on the per-VM disk and runs upstream envd as root; the vsock
+// server then also bridges host connections to envd on the guest loopback.
 package main
 
 import (
@@ -9,9 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +34,13 @@ const (
 	homeDir  = "/home/user"
 	homeDisk = "/dev/vdb"
 	envFile  = "/etc/sandboxd/env"
+	// envdKernelArg marks an e2b guest (vm.Spec.Envd): a writable overlay
+	// root on the per-VM disk and upstream envd as its service.
+	envdKernelArg = "sandboxd.envd=1"
+	envdPath      = "/usr/bin/envd"
+	// stateDir is where an e2b guest mounts its disk before pivot_root; it
+	// exists in every Debian-based image.
+	stateDir = "/mnt"
 )
 
 func main() {
@@ -38,14 +52,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-	case len(os.Args) == 2 && os.Args[1] == "serve":
-		if err := serve(); err != nil {
+	case len(os.Args) == 2 && (os.Args[1] == "serve" || os.Args[1] == "serve-envd"):
+		if err := serve(os.Args[1] == "serve-envd"); err != nil {
 			log.Fatal(err)
 		}
 	case os.Getpid() == 1:
 		initGuest()
 	default:
-		log.Fatal("must run as PID 1, or with 'serve' or 'write <path>'")
+		log.Fatal("must run as PID 1, or with 'serve', 'serve-envd' or 'write <path>'")
 	}
 }
 
@@ -67,15 +81,37 @@ type mount struct {
 
 func initGuest() {
 	const nosuid = unix.MS_NOSUID | unix.MS_NODEV
+	// /proc first: the kernel command line says which guest this is.
+	if err := unix.Mount("proc", "/proc", "proc", nosuid|unix.MS_NOEXEC, ""); err != nil {
+		halt("mount /proc: %v", err)
+	}
+	cmdline, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		halt("read /proc/cmdline: %v", err)
+	}
+	envd := slices.Contains(strings.Fields(string(cmdline)), envdKernelArg)
+	if envd {
+		if err := unix.Unmount("/proc", 0); err != nil {
+			halt("unmount /proc: %v", err)
+		}
+		writableRoot()
+		if err := unix.Mount("proc", "/proc", "proc", nosuid|unix.MS_NOEXEC, ""); err != nil {
+			halt("mount /proc: %v", err)
+		}
+	}
 	mounts := []mount{
-		{"proc", "/proc", "proc", nosuid | unix.MS_NOEXEC, "", 0o555},
 		{"sysfs", "/sys", "sysfs", nosuid | unix.MS_NOEXEC | unix.MS_RDONLY, "", 0o555},
 		{"devtmpfs", "/dev", "devtmpfs", unix.MS_NOSUID | unix.MS_NOEXEC, "mode=0755", 0o755},
 		{"devpts", "/dev/pts", "devpts", unix.MS_NOSUID | unix.MS_NOEXEC, "newinstance,gid=5,mode=0620,ptmxmode=0666", 0o755},
 		{"tmpfs", "/dev/shm", "tmpfs", nosuid, "mode=1777,size=64m", 0o1777},
 		{"tmpfs", "/run", "tmpfs", nosuid, "mode=0755,size=32m", 0o755},
-		{"tmpfs", "/tmp", "tmpfs", nosuid, "mode=1777,size=512m", 0o1777},
-		{"tmpfs", "/var/tmp", "tmpfs", nosuid, "mode=1777,size=256m", 0o1777},
+	}
+	if !envd {
+		// The strict guest's root is read-only; an e2b guest keeps /tmp on
+		// its writable root, as E2B does.
+		mounts = append(mounts,
+			mount{"tmpfs", "/tmp", "tmpfs", nosuid, "mode=1777,size=512m", 0o1777},
+			mount{"tmpfs", "/var/tmp", "tmpfs", nosuid, "mode=1777,size=256m", 0o1777})
 	}
 	for _, m := range mounts {
 		if err := os.MkdirAll(m.target, m.mode); err != nil && !errors.Is(err, unix.EROFS) {
@@ -93,18 +129,16 @@ func initGuest() {
 	if err := os.Symlink("pts/ptmx", "/dev/ptmx"); err != nil {
 		halt("ptmx: %v", err)
 	}
-	// The writable home disk is fresh for every VM; its root belongs to the
-	// guest user, like the Apple driver's private volume.
-	mkfs := exec.Command("/sbin/mkfs.ext4", "-q", "-F", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "home", homeDisk)
-	mkfs.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
-	if out, err := mkfs.CombinedOutput(); err != nil {
-		halt("format home disk: %v: %s", err, out)
-	}
-	if err := unix.Mount(homeDisk, homeDir, "ext4", unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
-		halt("mount home disk: %v", err)
-	}
-	if err := os.Chmod(homeDir, 0o755); err != nil {
-		halt("chmod home: %v", err)
+	if !envd {
+		// The writable home disk is fresh for every VM; its root belongs to
+		// the guest user, like the Apple driver's private volume.
+		formatDisk("root_owner=1000:1000,lazy_itable_init=1", "home")
+		if err := unix.Mount(homeDisk, homeDir, "ext4", unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
+			halt("mount home disk: %v", err)
+		}
+		if err := os.Chmod(homeDir, 0o755); err != nil {
+			halt("chmod home: %v", err)
+		}
 	}
 	_ = unix.Sethostname([]byte("sandbox"))
 	if err := loopbackUp(); err != nil {
@@ -114,13 +148,20 @@ func initGuest() {
 	// own waits never race this loop.
 	signals := make(chan os.Signal, 8)
 	signal.Notify(signals, unix.SIGCHLD)
-	server := exec.Command("/proc/self/exe", "serve")
+	mode := "serve"
+	if envd {
+		mode = "serve-envd"
+	}
+	server := exec.Command("/proc/self/exe", mode)
 	server.Stdout, server.Stderr = os.Stdout, os.Stderr
 	server.Env = []string{}
 	if err := server.Start(); err != nil {
 		halt("start server: %v", err)
 	}
-	serverPID := server.Process.Pid
+	serverPID, envdPID := server.Process.Pid, 0
+	if envd {
+		envdPID = startEnvd()
+	}
 	for range signals {
 		for {
 			var status unix.WaitStatus
@@ -128,11 +169,87 @@ func initGuest() {
 			if pid <= 0 || err != nil {
 				break
 			}
-			if pid == serverPID {
+			switch pid {
+			case serverPID:
 				halt("server exited: %v", status)
+			case envdPID:
+				// Without envd the sandbox is unusable; end the VM so the
+				// host sees it stopped and destroys it.
+				halt("envd exited: %v", status)
 			}
 		}
 	}
+}
+
+func formatDisk(extended, label string) {
+	mkfs := exec.Command("/sbin/mkfs.ext4", "-q", "-F", "-m", "0", "-E", extended, "-L", label, homeDisk)
+	mkfs.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
+	if out, err := mkfs.CombinedOutput(); err != nil {
+		halt("format %s disk: %v: %s", label, err, out)
+	}
+}
+
+// writableRoot gives an e2b guest the writable root E2B provides: an overlay
+// of the read-only image (lower) and the fresh per-VM disk (upper), which
+// becomes / by pivot_root. The image itself is never written, and the old
+// root is detached, so nothing else of the boot environment stays reachable.
+func writableRoot() {
+	formatDisk("root_owner=0:0,lazy_itable_init=1", "state")
+	if err := unix.Mount(homeDisk, stateDir, "ext4", unix.MS_NODEV, ""); err != nil {
+		halt("mount state disk: %v", err)
+	}
+	for _, dir := range []string{"upper", "work", "root"} {
+		if err := os.Mkdir(stateDir+"/"+dir, 0o755); err != nil {
+			halt("mkdir state %s: %v", dir, err)
+		}
+	}
+	options := "lowerdir=/,upperdir=" + stateDir + "/upper,workdir=" + stateDir + "/work"
+	if err := unix.Mount("overlay", stateDir+"/root", "overlay", 0, options); err != nil {
+		halt("mount overlay root: %v", err)
+	}
+	if err := unix.Chdir(stateDir + "/root"); err != nil {
+		halt("chdir new root: %v", err)
+	}
+	if err := unix.PivotRoot(".", "."); err != nil {
+		halt("pivot_root: %v", err)
+	}
+	if err := unix.Unmount(".", unix.MNT_DETACH); err != nil {
+		halt("detach old root: %v", err)
+	}
+	if err := unix.Chdir("/"); err != nil {
+		halt("chdir /: %v", err)
+	}
+}
+
+// startEnvd starts upstream envd as root, on the guest loopback only being
+// reachable from the host: the agent bridges vsock to it. The guest network
+// is outbound-only (the host never routes to it), so envd's wildcard listener
+// is reachable from inside the guest alone.
+func startEnvd() int {
+	env, err := readEnv()
+	if err != nil {
+		halt("envd environment: %v", err)
+	}
+	cmd := exec.Command(envdPath, "-isnotfc", "-no-cgroups", "-port", strconv.Itoa(guestagent.EnvdPort))
+	// envd takes PATH from its own environment for every process it starts.
+	cmd.Env = []string{"PATH=" + lookupEnv(env, "PATH"), "HOME=/root", "LANG=" + lookupEnv(env, "LANG")}
+	cmd.Dir = "/"
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		halt("start envd: %v", err)
+	}
+	return cmd.Process.Pid
+}
+
+func lookupEnv(env []string, name string) string {
+	value := ""
+	for _, entry := range env {
+		if key, v, ok := strings.Cut(entry, "="); ok && key == name {
+			value = v
+		}
+	}
+	return value
 }
 
 func loopbackUp() error {
@@ -174,7 +291,7 @@ func readEnv() ([]string, error) {
 	return env, scanner.Err()
 }
 
-func serve() error {
+func serve(envd bool) error {
 	env, err := readEnv()
 	if err != nil {
 		return err
@@ -189,6 +306,11 @@ func serve() error {
 		Credential:  &syscall.Credential{Uid: guestUID, Gid: guestGID, Groups: []uint32{}},
 		WriteHelper: []string{self, "write"},
 		WaitDelay:   2 * time.Second,
+		DiskPath:    homeDir,
+	}
+	if envd {
+		server.EnvdAddr = net.JoinHostPort("127.0.0.1", strconv.Itoa(guestagent.EnvdPort))
+		server.DiskPath = "/"
 	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {

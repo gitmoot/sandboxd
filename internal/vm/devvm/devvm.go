@@ -59,6 +59,7 @@ var (
 type Driver struct {
 	root  string
 	sleep string
+	envd  Envd
 	mu    sync.Mutex
 	vms   map[string]*guest
 }
@@ -70,18 +71,26 @@ type guest struct {
 	home      string
 	holder    *exec.Cmd
 	exited    chan struct{}
+	// envd marks an envd guest: holder is its root helper, and closing
+	// lifeline ends it (see envd.go).
+	envd     bool
+	lifeline io.Closer
 }
 
 var (
 	_ vm.Driver        = (*Driver)(nil)
 	_ vm.ResourceMeter = (*Driver)(nil)
+	_ vm.EnvdDialer    = (*Driver)(nil)
 )
 
 // New uses root, which must be absent or empty, as the parent of all guest
-// directories.
-func New(root string) (*Driver, error) {
+// directories. envd configures envd guests; its zero value refuses them.
+func New(root string, envd Envd) (*Driver, error) {
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, errors.New("dev driver state directory must be an absolute clean path")
+	}
+	if err := envd.validate(); err != nil {
+		return nil, err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
@@ -97,7 +106,7 @@ func New(root string) (*Driver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dev driver needs sleep(1) for guest holder processes: %w", err)
 	}
-	return &Driver{root: root, sleep: sleep, vms: map[string]*guest{}}, nil
+	return &Driver{root: root, sleep: sleep, envd: envd, vms: map[string]*guest{}}, nil
 }
 
 // Create starts a holder process whose process group is the guest: every
@@ -126,6 +135,14 @@ func (d *Driver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 	home := filepath.Join(dir, "home", "user")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return vm.Instance{}, err
+	}
+	if spec.Envd {
+		g, err := d.createEnvd(spec, dir)
+		if err != nil {
+			return vm.Instance{}, errors.Join(err, os.RemoveAll(dir))
+		}
+		d.vms[spec.ID] = g
+		return vm.Instance{ID: spec.ID, Running: true, Network: spec.Network}, nil
 	}
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		return vm.Instance{}, errors.Join(err, os.RemoveAll(dir))
@@ -169,6 +186,16 @@ func (d *Driver) List(context.Context) ([]vm.Instance, error) {
 	return instances, nil
 }
 
+// runningStrict is running for a strict guest; envd guests are reached only
+// through DialEnvd.
+func (d *Driver) runningStrict(id string) (*guest, error) {
+	g, err := d.running(id)
+	if err == nil && g.envd {
+		return nil, fmt.Errorf("guest %q runs envd; it has no strict guest API", id)
+	}
+	return g, err
+}
+
 func (d *Driver) running(id string) (*guest, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -193,7 +220,7 @@ func (g *guest) hostPath(guestPath string) (string, error) {
 // CopyIn writes a regular host file into the guest, creating missing parents
 // (mode 0700) and truncating an existing file, as the Apple driver does.
 func (d *Driver) CopyIn(ctx context.Context, id, source, destination string) error {
-	g, err := d.running(id)
+	g, err := d.runningStrict(id)
 	if err != nil {
 		return err
 	}
@@ -264,7 +291,7 @@ func noSymlinks(home, target string) error {
 // Run starts the command in the guest's process group. Cancellation kills the
 // command; Destroy kills everything the guest started.
 func (d *Driver) Run(ctx context.Context, id string, command vm.Command, stdout, stderr io.Writer) (int, error) {
-	g, err := d.running(id)
+	g, err := d.runningStrict(id)
 	if err != nil {
 		return 0, err
 	}
@@ -340,7 +367,11 @@ func (d *Driver) Usage(ctx context.Context, id string) (vm.Usage, error) {
 	if err != nil {
 		return vm.Usage{}, err
 	}
-	first, err := sampleGroup(g.pgid())
+	sample := func() (groupSample, error) { return sampleGroup(g.pgid()) }
+	if g.envd {
+		sample = func() (groupSample, error) { return sampleTree(g.holder.Process.Pid) }
+	}
+	first, err := sample()
 	if err != nil {
 		return vm.Usage{}, err
 	}
@@ -350,7 +381,7 @@ func (d *Driver) Usage(ctx context.Context, id string) (vm.Usage, error) {
 		return vm.Usage{}, ctx.Err()
 	case <-time.After(cpuInterval):
 	}
-	second, err := sampleGroup(g.pgid())
+	second, err := sample()
 	if err != nil {
 		return vm.Usage{}, err
 	}
@@ -362,8 +393,10 @@ func (d *Driver) Usage(ctx context.Context, id string) (vm.Usage, error) {
 		ticks = second.ticks - first.ticks
 	}
 	elapsed := time.Since(started).Seconds()
-	diskUsed, err := allocatedBytes(g.home)
-	if err != nil {
+	var diskUsed uint64
+	if g.envd {
+		diskUsed = readableBytes(g.home, filepath.Join(g.dir, "tmp"), filepath.Join(g.dir, "root"))
+	} else if diskUsed, err = allocatedBytes(g.home); err != nil {
 		return vm.Usage{}, err
 	}
 	var volume syscall.Statfs_t
@@ -451,7 +484,7 @@ func sampleGroup(pgid int) (groupSample, error) {
 }
 
 type procStat struct {
-	pgrp                   int
+	ppid, pgrp             int
 	utime, stime, rssPages uint64
 }
 
@@ -468,14 +501,15 @@ func statFields(raw string) (procStat, bool) {
 	if len(fields) < 22 {
 		return procStat{}, false
 	}
+	ppid, err0 := strconv.Atoi(fields[1])
 	pgrp, err1 := strconv.Atoi(fields[2])
 	utime, err2 := strconv.ParseUint(fields[11], 10, 64)
 	stime, err3 := strconv.ParseUint(fields[12], 10, 64)
 	rss, err4 := strconv.ParseInt(fields[21], 10, 64)
-	if err := errors.Join(err1, err2, err3, err4); err != nil || rss < 0 {
+	if err := errors.Join(err0, err1, err2, err3, err4); err != nil || rss < 0 {
 		return procStat{}, false
 	}
-	return procStat{pgrp: pgrp, utime: utime, stime: stime, rssPages: uint64(rss)}, true
+	return procStat{ppid: ppid, pgrp: pgrp, utime: utime, stime: stime, rssPages: uint64(rss)}, true
 }
 
 // Destroy kills the guest's process group, waits until no member remains, and
@@ -485,6 +519,20 @@ func (d *Driver) Destroy(ctx context.Context, id string) error {
 	g, ok := d.vms[id]
 	d.mu.Unlock()
 	if !ok {
+		return nil
+	}
+	if g.envd {
+		if err := g.destroyEnvd(ctx); err != nil {
+			return fmt.Errorf("guest %q: %w", id, err)
+		}
+		// The root helper removed everything it created; what remains
+		// belongs to the driver.
+		if err := os.Remove(g.dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove guest %q directory: %w", id, err)
+		}
+		d.mu.Lock()
+		delete(d.vms, id)
+		d.mu.Unlock()
 		return nil
 	}
 	pgid := g.pgid()

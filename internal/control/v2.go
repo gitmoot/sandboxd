@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"slices"
@@ -107,8 +108,6 @@ func (request createV2Request) unsupported() string {
 		return "every sandbox requires its envd access token; secure=false is not supported"
 	case !absent(request.AllowInternetAccess), !absent(request.Network):
 		return "network and internet access options are not supported"
-	case len(request.EnvVars) != 0:
-		return "sandbox envVars are not supported yet"
 	case !absent(request.MCP):
 		return "MCP gateways are not supported"
 	case !absent(request.IAM):
@@ -183,6 +182,20 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "sandbox state unavailable")
 		}
+		return
+	}
+	// envd is the guest's entrypoint; until its /init the sandbox has
+	// neither its access token nor its environment, so a failed /init ends
+	// the sandbox. The envVars go to the guest and nowhere else.
+	if err := s.initEnvd(r.Context(), id, request.EnvVars); err != nil {
+		log.Printf("sandbox %s: envd initialization failed, destroying it: %v", id, err)
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workerSlowTimeout)
+		abortErr := s.Abort(abortCtx, id, s.envdToken(id))
+		cancel()
+		if abortErr != nil {
+			log.Printf("sandbox %s: destroy after failed envd initialization: %v", id, abortErr)
+		}
+		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "sandbox envd did not start")
 		return
 	}
 	jsonResponse(w, http.StatusCreated, s.e2bResponse(row))

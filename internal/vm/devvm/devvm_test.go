@@ -19,7 +19,7 @@ import (
 
 func newDriver(t *testing.T) *Driver {
 	t.Helper()
-	driver, err := New(filepath.Join(t.TempDir(), "guests"))
+	driver, err := New(filepath.Join(t.TempDir(), "guests"), Envd{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,10 +59,10 @@ func TestNewRefusesStateFromAnEarlierRun(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "sandboxd-stale"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(root); err == nil {
+	if _, err := New(root, Envd{}); err == nil {
 		t.Fatal("non-empty state directory accepted")
 	}
-	if _, err := New("relative/guests"); err == nil {
+	if _, err := New("relative/guests", Envd{}); err == nil {
 		t.Fatal("relative state directory accepted")
 	}
 }
@@ -229,7 +229,7 @@ func TestMapGuestHomeMatchesWholePathWords(t *testing.T) {
 func TestStatFieldsHandlesParenthesesInCommandNames(t *testing.T) {
 	raw := "1234 (a) b (c)) S 1 4321 4321 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 1 0 100 1000000 42 18446744073709551615"
 	got, ok := statFields(raw)
-	if !ok || got != (procStat{pgrp: 4321, utime: 7, stime: 3, rssPages: 42}) {
+	if !ok || got != (procStat{ppid: 1, pgrp: 4321, utime: 7, stime: 3, rssPages: 42}) {
 		t.Fatalf("statFields = %+v, %v", got, ok)
 	}
 }

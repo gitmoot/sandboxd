@@ -25,44 +25,44 @@ sandboxd. ⚪ means a cell has only such tests.
 | Area | Operation | Python e2b | JS e2b | Python code-interpreter | JS code-interpreter | Gitmoot client |
 | --- | --- | --- | --- | --- | --- | --- |
 | Control plane | `Sandbox.create` | 🟡 6/16 | 🟡 2/3 | — | — | — |
-| Control plane | `Sandbox.connect` | 🟡 6/10 (+8 offline) | 🟡 4/5 (+1 offline) | — | — | — |
+| Control plane | `Sandbox.connect` | 🟡 8/10 (+8 offline) | 🟡 4/5 (+1 offline) | — | — | — |
 | Control plane | `Sandbox.kill` | ✅ 6/6 | ✅ 3/3 | — | — | — |
 | Control plane | `Sandbox.get_info` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | Control plane | `Sandbox.list` | 🟡 16/22 | 🟡 13/19 | — | — | — |
 | Control plane | `set_timeout` | ✅ 6/6 | ✅ 3/3 | — | — | — |
 | Control plane | `get_metrics` | ✅ 4/4 | ✅ 2/2 | — | — | — |
-| Control plane | secure envd access token | ✅ 4/4 | ❌ 0/2 (+3 offline) | — | — | — |
+| Control plane | secure envd access token | ✅ 4/4 | 🟡 1/2 (+3 offline) | — | — | — |
 | Control plane | `get_host` / guest ports | ❌ 0/2 | ❌ 0/2 | — | — | — |
 | Control plane | pause, resume, snapshots | ❌ 0/28 | ❌ 0/23 (+8 offline) | — | — | — |
 | Control plane | lifecycle options (autoPause, onTimeout) | — | ❌ 0/12 (+13 offline) | — | — | — |
 | Control plane | `fork` | 🟡 2/8 | 🟡 1/4 | — | — | — |
-| Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | 🟡 1/33 (+27 offline) | — | — | — |
+| Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | ❌ 0/33 (+27 offline) | — | — | — |
 | Control plane | IAM | — | ❌ 0/6 (+11 offline) | — | — | — |
 | Control plane | client config and request plumbing | ❌ 0/2 (+6 offline) | ❌ 0/11 (+58 offline) | — | — | — |
-| Commands | `commands.run` | ❌ 0/13 | ✅ 6/6 (+13 offline) | — | — | — |
-| Commands | `commands.run` envs | ❌ 0/8 | 🟡 2/3 | — | — | — |
-| Commands | `commands.connect` | ❌ 0/4 | 🟡 1/2 | — | — | — |
-| Commands | `commands.kill` | ❌ 0/4 | ❌ 0/2 | — | — | — |
-| Commands | `commands.list` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| Commands | `commands.send_stdin` | ❌ 0/12 | ❌ 0/7 | — | — | — |
-| Commands | sandbox killed during a command | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| Files | `files.write` | ❌ 0/20 | 🟡 1/12 | — | — | — |
-| Files | `files.read` | ❌ 0/18 | ❌ 0/6 | — | — | — |
-| Files | `files.list` | ❌ 0/10 | ❌ 0/5 | — | — | — |
-| Files | `files.exists` | ❌ 0/2 | ❌ 0/2 | — | — | — |
-| Files | `files.get_info` | ❌ 0/10 | ❌ 0/5 (+2 offline) | — | — | — |
-| Files | `files.make_dir` | ❌ 0/6 | ❌ 0/3 | — | — | — |
-| Files | `files.remove` | ❌ 0/4 | ❌ 0/2 | — | — | — |
-| Files | `files.rename` | ❌ 0/4 | ❌ 0/2 | — | — | — |
-| Files | `files.watch_dir` | ❌ 0/17 | ❌ 0/7 (+4 offline) | — | — | — |
-| Files | file metadata | ❌ 0/18 | ❌ 0/9 | — | — | — |
-| Files | content encoding (gzip) | ❌ 0/8 | ❌ 0/4 | — | — | — |
+| Commands | `commands.run` | ✅ 13/13 | ✅ 6/6 (+13 offline) | — | — | — |
+| Commands | `commands.run` envs | ✅ 8/8 | ✅ 3/3 | — | — | — |
+| Commands | `commands.connect` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| Commands | `commands.kill` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| Commands | `commands.list` | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| Commands | `commands.send_stdin` | ✅ 12/12 | ✅ 7/7 | — | — | — |
+| Commands | sandbox killed during a command | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| Files | `files.write` | ✅ 20/20 | ✅ 12/12 | — | — | — |
+| Files | `files.read` | ✅ 18/18 | ✅ 6/6 | — | — | — |
+| Files | `files.list` | ✅ 10/10 | ✅ 5/5 | — | — | — |
+| Files | `files.exists` | ✅ 2/2 | ✅ 2/2 | — | — | — |
+| Files | `files.get_info` | ✅ 10/10 | ✅ 5/5 (+2 offline) | — | — | — |
+| Files | `files.make_dir` | ✅ 6/6 | ✅ 3/3 | — | — | — |
+| Files | `files.remove` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| Files | `files.rename` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| Files | `files.watch_dir` | ✅ 17/17 | ✅ 7/7 (+4 offline) | — | — | — |
+| Files | file metadata | ✅ 18/18 | ✅ 9/9 | — | — | — |
+| Files | content encoding (gzip) | ✅ 8/8 | ✅ 4/4 | — | — | — |
 | Files | signed upload/download URLs | ❌ 0/6 | 🟡 1/7 | — | — | — |
-| PTY | `pty.create` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| PTY | `pty.connect` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| PTY | `pty.kill` | ❌ 0/4 | ❌ 0/2 | — | — | — |
-| PTY | `pty.resize` | ❌ 0/2 | ❌ 0/1 | — | — | — |
-| PTY | `pty.send_input` | ❌ 0/2 | ❌ 0/1 | — | — | — |
+| PTY | `pty.create` | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| PTY | `pty.connect` | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| PTY | `pty.kill` | ✅ 4/4 | ✅ 2/2 | — | — | — |
+| PTY | `pty.resize` | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| PTY | `pty.send_input` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | Templates, volumes, secrets | template build API | 🟡 2/33 (+136 offline) | ❌ 0/56 (+28 offline) | — | — | — |
 | Templates, volumes, secrets | volumes | ⚪ (+92 offline, 2 skip) | ❌ 0/52 (+4 offline, 1 skip) | — | — | — |
 | Templates, volumes, secrets | secrets | ⚪ (+30 offline) | ❌ 0/9 (+6 offline) | — | — | — |
@@ -81,8 +81,8 @@ sandboxd. ⚪ means a cell has only such tests.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 96 pass against sandboxd, 621 pass offline,
-794 expected failures, 3 skipped.
+Totals: 347 pass against sandboxd, 621 pass offline,
+543 expected failures, 3 skipped.
 
 ## Expected failures
 
@@ -105,12 +105,10 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Control plane: `Sandbox.connect` (5)</summary>
+<details><summary>Control plane: `Sandbox.connect` (3)</summary>
 
 - Python e2b: `async/sandbox_async/test_connect.py::test_connect_to_paused_sandbox_resumes`
-- Python e2b: `async/sandbox_async/test_connect.py::test_connect_with_secure`
 - Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_to_paused_sandbox_resumes`
-- Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_with_secure`
 - JS e2b: `sandbox/connect.test.ts > connect resumes paused sandbox`
 
 </details>
@@ -132,10 +130,9 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Control plane: secure envd access token (2)</summary>
+<details><summary>Control plane: secure envd access token (1)</summary>
 
 - JS e2b: `sandbox/secure.test.ts > secure sandbox > test access file with signing`
-- JS e2b: `sandbox/secure.test.ts > secure sandbox > try to re-connect to sandbox`
 
 </details>
 
@@ -235,7 +232,7 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Control plane: network, internet access, egress proxy (60)</summary>
+<details><summary>Control plane: network, internet access, egress proxy (61)</summary>
 
 - Python e2b: `async/sandbox_async/test_internet_access.py::test_internet_access_default`
 - Python e2b: `async/sandbox_async/test_internet_access.py::test_internet_access_disabled`
@@ -278,6 +275,7 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/egressProxy.test.ts > getInfo reports no egress proxy when the API returns omitted`
 - JS e2b: `sandbox/egressProxy.test.ts > getInfo reports the active egress proxy without the password`
 - JS e2b: `sandbox/egressProxy.test.ts > updateNetwork sets the egress proxy on a running sandbox`
+- JS e2b: `sandbox/internetAccess.test.ts > internet access default > internet access default`
 - JS e2b: `sandbox/internetAccess.test.ts > internet access disabled > internet access disabled`
 - JS e2b: `sandbox/internetAccess.test.ts > internet access enabled > internet access enabled`
 - JS e2b: `sandbox/network.test.ts > allow only 1.1.1.1 > allow specific IP with deny all traffic`
@@ -329,327 +327,6 @@ A later milestone turns a cell green by making these pass and recording them.
 
 </details>
 
-<details><summary>Commands: `commands.run` (13)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run`
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_broken_utf8`
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_multiline_string`
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_special_characters`
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_timeout`
-- Python e2b: `async/sandbox_async/commands/test_run.py::test_run_with_too_short_timeout`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_broken_utf8`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_multiline_string`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_special_characters`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_timeout`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_too_short_timeout`
-- Python e2b: `sync/sandbox_sync/commands/test_run.py::test_run_with_too_short_timeout_iterating`
-
-</details>
-
-<details><summary>Commands: `commands.run` envs (9)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_bash_command_scoped_env_vars`
-- Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_command_envs`
-- Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_python_command_scoped_env_vars`
-- Python e2b: `async/sandbox_async/commands/test_env_vars.py::test_sandbox_envs`
-- Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_bash_command_scoped_env_vars`
-- Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_command_envs`
-- Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_python_command_scoped_env_vars`
-- Python e2b: `sync/sandbox_sync/commands/test_env_vars.py::test_sandbox_envs`
-- JS e2b: `sandbox/commands/envVars.test.ts > sandbox global env vars > sandbox global env vars`
-
-</details>
-
-<details><summary>Commands: `commands.connect` (5)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_cmd_connect.py::test_connect_to_non_existing_process`
-- Python e2b: `async/sandbox_async/commands/test_cmd_connect.py::test_connect_to_process`
-- Python e2b: `sync/sandbox_sync/commands/test_cmd_connect.py::test_connect_to_non_existing_process`
-- Python e2b: `sync/sandbox_sync/commands/test_cmd_connect.py::test_connect_to_process`
-- JS e2b: `sandbox/commands/connect.test.ts > connect to process`
-
-</details>
-
-<details><summary>Commands: `commands.kill` (6)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_cmd_kill.py::test_kill_non_existing_process`
-- Python e2b: `async/sandbox_async/commands/test_cmd_kill.py::test_kill_process`
-- Python e2b: `sync/sandbox_sync/commands/test_cmd_kill.py::test_kill_non_existing_process`
-- Python e2b: `sync/sandbox_sync/commands/test_cmd_kill.py::test_kill_process`
-- JS e2b: `sandbox/commands/kill.test.ts > kill non-existing process`
-- JS e2b: `sandbox/commands/kill.test.ts > kill process`
-
-</details>
-
-<details><summary>Commands: `commands.list` (3)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_cmd_list.py::test_kill_process`
-- Python e2b: `sync/sandbox_sync/commands/test_cmd_list.py::test_kill_process`
-- JS e2b: `sandbox/commands/list.test.ts > list processes`
-
-</details>
-
-<details><summary>Commands: `commands.send_stdin` (19)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_close_stdin_via_command_handle`
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_send_bytes_stdin_to_process`
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_send_multiline_string_to_process`
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_send_special_characters_to_process`
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_send_stdin_to_process`
-- Python e2b: `async/sandbox_async/commands/test_send_stdin.py::test_send_stdin_via_command_handle`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_close_stdin_via_command_handle`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_send_bytes_stdin_to_process`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_send_multiline_string_to_process`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_send_special_characters_to_process`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_send_stdin_to_process`
-- Python e2b: `sync/sandbox_sync/commands/test_send_stdin.py::test_send_stdin_via_command_handle`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > close stdin via command handle`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send Uint8Array stdin to process`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send empty stdin to process`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send multiline string to stdin`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send special characters to stdin`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send stdin to process`
-- JS e2b: `sandbox/commands/sendStdin.test.ts > send stdin via command handle`
-
-</details>
-
-<details><summary>Commands: sandbox killed during a command (3)</summary>
-
-- Python e2b: `async/sandbox_async/commands/test_sandbox_killed_during_run.py::test_kill_sandbox_while_command_is_running`
-- Python e2b: `sync/sandbox_sync/commands/test_sandbox_killed_during_run.py::test_kill_sandbox_while_command_is_running`
-- JS e2b: `sandbox/commands/sandboxKilledDuringRun.test.ts > killing the sandbox while a command is running throws an actionable error`
-
-</details>
-
-<details><summary>Files: `files.write` (31)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_write.py::test_overwrite_file`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_binary_file`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_files_with_different_data_types`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_io_with_octet_stream`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_io_with_octet_stream_and_gzip`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_multiple_files`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_text_file`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_text_io_with_octet_stream`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_to_non_existing_directory`
-- Python e2b: `async/sandbox_async/files/test_write.py::test_write_with_secured_envd`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_overwrite_file`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_binary_file`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_files_with_different_data_types`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_io_with_octet_stream`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_io_with_octet_stream_and_gzip`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_multiple_files`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_text_file`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_text_io_with_octet_stream`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_to_non_existing_directory`
-- Python e2b: `sync/sandbox_sync/files/test_write.py::test_write_with_secured_envd`
-- JS e2b: `sandbox/files/write.test.ts > overwrite file`
-- JS e2b: `sandbox/files/write.test.ts > write ReadableStream with octet stream upload`
-- JS e2b: `sandbox/files/write.test.ts > write ReadableStream with octet stream upload and gzip`
-- JS e2b: `sandbox/files/write.test.ts > write file`
-- JS e2b: `sandbox/files/write.test.ts > write file #2`
-- JS e2b: `sandbox/files/write.test.ts > write multiple files`
-- JS e2b: `sandbox/files/write.test.ts > write to non-existing directory`
-- JS e2b: `sandbox/files/write.test.ts > writeFiles creates parent directories`
-- JS e2b: `sandbox/files/write.test.ts > writeFiles overwrites existing files`
-- JS e2b: `sandbox/files/write.test.ts > writeFiles with different data types`
-- JS e2b: `sandbox/files/write.test.ts > writeFiles with multiple files`
-
-</details>
-
-<details><summary>Files: `files.read` (24)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_empty_file`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_file`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_file_as_stream`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_file_as_stream_context_manager`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_file_as_stream_partial_then_close`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_file_as_stream_with_gzip`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_non_existing_file`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_non_existing_file_as_stream`
-- Python e2b: `async/sandbox_async/files/test_read.py::test_read_non_existing_file_catches_with_deprecated_not_found_exception`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_empty_file`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_file`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_file_as_stream`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_file_as_stream_context_manager`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_file_as_stream_partial_then_close`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_file_as_stream_with_gzip`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_non_existing_file`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_non_existing_file_as_stream`
-- Python e2b: `sync/sandbox_sync/files/test_read.py::test_read_non_existing_file_catches_with_deprecated_not_found_exception`
-- JS e2b: `sandbox/files/read.test.ts > read empty file in all formats`
-- JS e2b: `sandbox/files/read.test.ts > read file`
-- JS e2b: `sandbox/files/read.test.ts > read file as stream`
-- JS e2b: `sandbox/files/read.test.ts > read non-existing file`
-- JS e2b: `sandbox/files/read.test.ts > read non-existing file as stream`
-- JS e2b: `sandbox/files/read.test.ts > read non-existing file catches with deprecated NotFoundError`
-
-</details>
-
-<details><summary>Files: `files.list` (15)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_files_list.py::test_directory_entry_details`
-- Python e2b: `async/sandbox_async/files/test_files_list.py::test_file_entry_details`
-- Python e2b: `async/sandbox_async/files/test_files_list.py::test_list_directory`
-- Python e2b: `async/sandbox_async/files/test_files_list.py::test_list_directory_error_cases`
-- Python e2b: `async/sandbox_async/files/test_files_list.py::test_mixed_entries`
-- Python e2b: `sync/sandbox_sync/files/test_files_list.py::test_directory_entry_details`
-- Python e2b: `sync/sandbox_sync/files/test_files_list.py::test_file_entry_details`
-- Python e2b: `sync/sandbox_sync/files/test_files_list.py::test_list_directory`
-- Python e2b: `sync/sandbox_sync/files/test_files_list.py::test_list_directory_error_cases`
-- Python e2b: `sync/sandbox_sync/files/test_files_list.py::test_mixed_entries`
-- JS e2b: `sandbox/files/list.test.ts > directory entry details`
-- JS e2b: `sandbox/files/list.test.ts > file entry details`
-- JS e2b: `sandbox/files/list.test.ts > list directory`
-- JS e2b: `sandbox/files/list.test.ts > list directory with invalid depth`
-- JS e2b: `sandbox/files/list.test.ts > mixed entries (files and directories)`
-
-</details>
-
-<details><summary>Files: `files.exists` (4)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_exists.py::test_exists`
-- Python e2b: `sync/sandbox_sync/files/test_exists.py::test_exists`
-- JS e2b: `sandbox/files/exists.test.ts > file does not exist`
-- JS e2b: `sandbox/files/exists.test.ts > file exists`
-
-</details>
-
-<details><summary>Files: `files.get_info` (15)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_info.py::test_file_symlink`
-- Python e2b: `async/sandbox_async/files/test_info.py::test_get_info_of_directory`
-- Python e2b: `async/sandbox_async/files/test_info.py::test_get_info_of_file`
-- Python e2b: `async/sandbox_async/files/test_info.py::test_get_info_of_nonexistent_directory`
-- Python e2b: `async/sandbox_async/files/test_info.py::test_get_info_of_nonexistent_file`
-- Python e2b: `sync/sandbox_sync/files/test_info.py::test_file_symlink`
-- Python e2b: `sync/sandbox_sync/files/test_info.py::test_get_info_of_directory`
-- Python e2b: `sync/sandbox_sync/files/test_info.py::test_get_info_of_file`
-- Python e2b: `sync/sandbox_sync/files/test_info.py::test_get_info_of_nonexistent_directory`
-- Python e2b: `sync/sandbox_sync/files/test_info.py::test_get_info_of_nonexistent_file`
-- JS e2b: `sandbox/files/info.test.ts > get info of a directory`
-- JS e2b: `sandbox/files/info.test.ts > get info of a directory that does not exist`
-- JS e2b: `sandbox/files/info.test.ts > get info of a file`
-- JS e2b: `sandbox/files/info.test.ts > get info of a file that does not exist`
-- JS e2b: `sandbox/files/info.test.ts > get info of a symlink`
-
-</details>
-
-<details><summary>Files: `files.make_dir` (9)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_make_dir.py::test_make_directory`
-- Python e2b: `async/sandbox_async/files/test_make_dir.py::test_make_directory_already_exists`
-- Python e2b: `async/sandbox_async/files/test_make_dir.py::test_make_nested_directory`
-- Python e2b: `sync/sandbox_sync/files/test_make_dir.py::test_make_directory`
-- Python e2b: `sync/sandbox_sync/files/test_make_dir.py::test_make_directory_already_exists`
-- Python e2b: `sync/sandbox_sync/files/test_make_dir.py::test_make_nested_directory`
-- JS e2b: `sandbox/files/makeDir.test.ts > make directory`
-- JS e2b: `sandbox/files/makeDir.test.ts > make existing directory`
-- JS e2b: `sandbox/files/makeDir.test.ts > make nested directory`
-
-</details>
-
-<details><summary>Files: `files.remove` (6)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_remove.py::test_remove_file`
-- Python e2b: `async/sandbox_async/files/test_remove.py::test_remove_non_existing_file`
-- Python e2b: `sync/sandbox_sync/files/test_remove.py::test_remove_file`
-- Python e2b: `sync/sandbox_sync/files/test_remove.py::test_remove_non_existing_file`
-- JS e2b: `sandbox/files/remove.test.ts > remove file`
-- JS e2b: `sandbox/files/remove.test.ts > remove non-existing file`
-
-</details>
-
-<details><summary>Files: `files.rename` (6)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_rename.py::test_rename_file`
-- Python e2b: `async/sandbox_async/files/test_rename.py::test_rename_non_existing_file`
-- Python e2b: `sync/sandbox_sync/files/test_rename.py::test_rename_file`
-- Python e2b: `sync/sandbox_sync/files/test_rename.py::test_rename_non_existing_file`
-- JS e2b: `sandbox/files/rename.test.ts > rename file`
-- JS e2b: `sandbox/files/rename.test.ts > rename non-existing file`
-
-</details>
-
-<details><summary>Files: `files.watch_dir` (24)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_directory_changes`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_directory_changes_with_entry_info`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_directory_changes_with_network_mounts_allowed`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_file`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_file_with_secured_envd`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_non_existing_directory`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_recursive_directory_after_nested_folder_addition`
-- Python e2b: `async/sandbox_async/files/test_watch.py::test_watch_recursive_directory_changes`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_directory_changes`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_directory_changes_with_entry_info`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_directory_changes_with_network_mounts_allowed`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_file`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_file_with_secured_envd`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_iterated`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_non_existing_directory`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_recursive_directory_after_nested_folder_addition`
-- Python e2b: `sync/sandbox_sync/files/test_watch.py::test_watch_recursive_directory_changes`
-- JS e2b: `sandbox/files/watch.test.ts > watch directory changes`
-- JS e2b: `sandbox/files/watch.test.ts > watch directory changes with entry info`
-- JS e2b: `sandbox/files/watch.test.ts > watch directory changes with network mounts allowed`
-- JS e2b: `sandbox/files/watch.test.ts > watch file`
-- JS e2b: `sandbox/files/watch.test.ts > watch non-existing directory`
-- JS e2b: `sandbox/files/watch.test.ts > watch recursive directory after nested folder addition`
-- JS e2b: `sandbox/files/watch.test.ts > watch recursive directory changes`
-
-</details>
-
-<details><summary>Files: file metadata (27)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_metadata_set_via_xattrs_surfaced_in_get_info`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_metadata_surfaced_after_rename`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_metadata_surfaced_when_listing`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_overwriting_clears_stale_metadata`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_write_file_with_metadata`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_write_file_with_metadata_octet_stream`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_write_file_without_metadata`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_write_files_applies_metadata_to_every_file`
-- Python e2b: `async/sandbox_async/files/test_metadata.py::test_write_rejects_invalid_metadata`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_metadata_set_via_xattrs_surfaced_in_get_info`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_metadata_surfaced_after_rename`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_metadata_surfaced_when_listing`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_overwriting_clears_stale_metadata`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_write_file_with_metadata`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_write_file_with_metadata_octet_stream`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_write_file_without_metadata`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_write_files_applies_metadata_to_every_file`
-- Python e2b: `sync/sandbox_sync/files/test_metadata.py::test_write_rejects_invalid_metadata`
-- JS e2b: `sandbox/files/metadata.test.ts > metadata is surfaced after rename`
-- JS e2b: `sandbox/files/metadata.test.ts > metadata is surfaced when listing`
-- JS e2b: `sandbox/files/metadata.test.ts > metadata set via xattrs is surfaced in getInfo`
-- JS e2b: `sandbox/files/metadata.test.ts > overwriting a file clears stale metadata`
-- JS e2b: `sandbox/files/metadata.test.ts > rejects invalid metadata`
-- JS e2b: `sandbox/files/metadata.test.ts > write file with metadata`
-- JS e2b: `sandbox/files/metadata.test.ts > write file with metadata using octet-stream`
-- JS e2b: `sandbox/files/metadata.test.ts > write file without metadata`
-- JS e2b: `sandbox/files/metadata.test.ts > writeFiles applies metadata to every file`
-
-</details>
-
-<details><summary>Files: content encoding (gzip) (12)</summary>
-
-- Python e2b: `async/sandbox_async/files/test_content_encoding.py::test_read_bytes_with_gzip`
-- Python e2b: `async/sandbox_async/files/test_content_encoding.py::test_write_and_read_with_gzip`
-- Python e2b: `async/sandbox_async/files/test_content_encoding.py::test_write_files_with_gzip`
-- Python e2b: `async/sandbox_async/files/test_content_encoding.py::test_write_gzip_read_plain`
-- Python e2b: `sync/sandbox_sync/files/test_content_encoding.py::test_read_bytes_with_gzip`
-- Python e2b: `sync/sandbox_sync/files/test_content_encoding.py::test_write_and_read_with_gzip`
-- Python e2b: `sync/sandbox_sync/files/test_content_encoding.py::test_write_files_with_gzip`
-- Python e2b: `sync/sandbox_sync/files/test_content_encoding.py::test_write_gzip_read_plain`
-- JS e2b: `sandbox/files/contentEncoding.test.ts > read file as bytes with gzip content encoding`
-- JS e2b: `sandbox/files/contentEncoding.test.ts > write and read file with gzip content encoding`
-- JS e2b: `sandbox/files/contentEncoding.test.ts > write with gzip and read without encoding`
-- JS e2b: `sandbox/files/contentEncoding.test.ts > writeFiles with gzip content encoding`
-
-</details>
-
 <details><summary>Files: signed upload/download URLs (12)</summary>
 
 - Python e2b: `async/sandbox_async/files/test_secured.py::test_download_url_with_expired_signing`
@@ -664,49 +341,6 @@ A later milestone turns a cell green by making these pass and recording them.
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with invalid signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing`
 - JS e2b: `sandbox/files/signing.test.ts > file signing > test upload file with valid signing as root user`
-
-</details>
-
-<details><summary>PTY: `pty.create` (3)</summary>
-
-- Python e2b: `async/sandbox_async/pty/test_pty_create.py::test_pty_create`
-- Python e2b: `sync/sandbox_sync/pty/test_pty.py::test_pty`
-- JS e2b: `sandbox/pty/ptyCreate.test.ts > create PTY`
-
-</details>
-
-<details><summary>PTY: `pty.connect` (3)</summary>
-
-- Python e2b: `async/sandbox_async/pty/test_pty_connect.py::test_connect_to_pty`
-- Python e2b: `sync/sandbox_sync/pty/test_pty_connect.py::test_connect_to_pty`
-- JS e2b: `sandbox/pty/ptyConnect.test.ts > pty connect/reconnect`
-
-</details>
-
-<details><summary>PTY: `pty.kill` (6)</summary>
-
-- Python e2b: `async/sandbox_async/pty/test_pty_kill.py::test_kill_non_existing_pty`
-- Python e2b: `async/sandbox_async/pty/test_pty_kill.py::test_kill_pty`
-- Python e2b: `sync/sandbox_sync/pty/test_pty_kill.py::test_kill_non_existing_pty`
-- Python e2b: `sync/sandbox_sync/pty/test_pty_kill.py::test_kill_pty`
-- JS e2b: `sandbox/pty/kill.test.ts > kill PTY`
-- JS e2b: `sandbox/pty/kill.test.ts > kill non-existing PTY`
-
-</details>
-
-<details><summary>PTY: `pty.resize` (3)</summary>
-
-- Python e2b: `async/sandbox_async/pty/test_resize.py::test_resize`
-- Python e2b: `sync/sandbox_sync/pty/test_resize.py::test_resize`
-- JS e2b: `sandbox/pty/resize.test.ts > resize`
-
-</details>
-
-<details><summary>PTY: `pty.send_input` (3)</summary>
-
-- Python e2b: `async/sandbox_async/pty/test_send_input.py::test_send_input`
-- Python e2b: `sync/sandbox_sync/pty/test_send_input.py::test_send_input`
-- JS e2b: `sandbox/pty/sendInput.test.ts > send input`
 
 </details>
 
