@@ -48,6 +48,20 @@ type Server struct {
 	next atomic.Int64
 }
 
+// SocketConn wraps an accepted connection socket for ServeConn. The socket
+// is switched to non-blocking mode so the runtime poller owns it: Close then
+// interrupts a pending Read and closes the socket at once. A blocking socket
+// defers close(2) until a pending read(2) returns, so an OpDial bridge whose
+// guest port closed would keep the host's stream open until the host wrote to
+// it again.
+func SocketConn(fd int, name string) (*os.File, error) {
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), name), nil
+}
+
 // ServeConn handles exactly one request and closes conn.
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer conn.Close()

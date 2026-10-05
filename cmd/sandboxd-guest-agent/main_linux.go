@@ -330,6 +330,11 @@ func serve(envd bool) error {
 			}
 			return err
 		}
-		go server.ServeConn(os.NewFile(uintptr(conn), "vsock"))
+		file, err := guestagent.SocketConn(conn, "vsock")
+		if err != nil {
+			log.Printf("vsock connection: %v", err)
+			continue
+		}
+		go server.ServeConn(file)
 	}
 }
