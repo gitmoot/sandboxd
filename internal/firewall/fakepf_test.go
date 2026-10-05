@@ -24,6 +24,8 @@ type fakePF struct {
 	loadedText []string // policy files handed to pfctl -f
 	route      string   // default route interface; "" for none
 	forwarding bool
+	// forwardingWrites counts sysctl -w calls.
+	forwardingWrites int
 }
 
 func newFakePF() *fakePF {
@@ -51,9 +53,19 @@ func (f *fakePF) run(_ context.Context, name string, args ...string) ([]byte, er
 		}
 		return []byte("   route to: default\ndestination: default\n       mask: default\n    gateway: 192.168.1.1\n  interface: " +
 			f.route + "\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n"), nil
+	case "/usr/sbin/sysctl -n net.inet.ip.forwarding":
+		if f.forwarding {
+			return []byte("1\n"), nil
+		}
+		return []byte("0\n"), nil
 	case "/usr/sbin/sysctl -w net.inet.ip.forwarding=1":
+		f.forwardingWrites++
 		f.forwarding = true
 		return []byte("net.inet.ip.forwarding: 0 -> 1\n"), nil
+	case "/usr/sbin/sysctl -w net.inet.ip.forwarding=0":
+		f.forwardingWrites++
+		f.forwarding = false
+		return []byte("net.inet.ip.forwarding: 1 -> 0\n"), nil
 	}
 	return nil, fmt.Errorf("unexpected command %s %v", name, args)
 }

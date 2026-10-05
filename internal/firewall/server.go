@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -62,6 +63,8 @@ type Server struct {
 	container  func(context.Context, ...string) ([]byte, error)
 	// run executes a fixed system tool (route, sysctl).
 	run func(ctx context.Context, name string, args ...string) ([]byte, error)
+	// mu serializes requests with the background host table refresh.
+	mu sync.Mutex
 }
 
 func NewServer(cfg Config) (*Server, error) {
@@ -260,15 +263,24 @@ func (s *Server) egressInterface(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("the Mac has no default route interface for guest NAT; set --egress-interface")
 }
 
-// hostAddrs is every address of the Mac on every interface (LAN, Tailscale,
-// bridges, loopback, public), each as a single-address prefix. IPv6
-// link-local addresses are scoped and left out: guest IPv6 is dropped whole.
+// hostAddrs is every IPv4 and IPv6 destination the Mac itself receives on:
+// each address on every interface (LAN, Tailscale, bridges, loopback,
+// public) as a single-address prefix, each IPv4 subnet's broadcast address,
+// 255.255.255.255 and IPv4 multicast. Guests are denied all of it; on every
+// other interface IPv4 may reach only it, so forwarding serves only guests.
+// IPv6 link-local addresses are scoped and left out: guest IPv6 is dropped
+// whole and the helper never enables IPv6 forwarding.
 func (s *Server) hostAddrs() ([]netip.Prefix, error) {
 	interfaces, err := s.interfaces()
 	if err != nil {
 		return nil, fmt.Errorf("enumerate Mac interfaces: %w", err)
 	}
-	var addrs []netip.Prefix
+	addrs := []netip.Prefix{netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("255.255.255.255/32")}
+	add := func(prefix netip.Prefix) {
+		if !slices.Contains(addrs, prefix) {
+			addrs = append(addrs, prefix)
+		}
+	}
 	for _, iface := range interfaces {
 		ifaceAddrs, err := s.addrs(iface)
 		if err != nil {
@@ -283,13 +295,22 @@ func (s *Server) hostAddrs() ([]netip.Prefix, error) {
 			if ip.Is6() && ip.IsLinkLocalUnicast() {
 				continue
 			}
-			host := netip.PrefixFrom(ip, ip.BitLen())
-			if !slices.Contains(addrs, host) {
-				addrs = append(addrs, host)
+			add(netip.PrefixFrom(ip, ip.BitLen()))
+			if ip.Is4() && prefix.Bits() < 31 {
+				broadcast := prefix.Masked().Addr().As4()
+				for i := prefix.Bits(); i < 32; i++ {
+					broadcast[i/8] |= 0x80 >> (i % 8)
+				}
+				add(netip.PrefixFrom(netip.AddrFrom4(broadcast), 32))
 			}
 		}
 	}
-	slices.SortFunc(addrs, func(a, b netip.Prefix) int { return a.Addr().Compare(b.Addr()) })
+	slices.SortFunc(addrs, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return a.Bits() - b.Bits()
+	})
 	return addrs, nil
 }
 
@@ -334,6 +355,13 @@ func (s *Server) verifyTables(ctx context.Context) error {
 	if !exact {
 		return fmt.Errorf("PF tables %s and %s do not hold exactly the configured prefixes", denyTable, guestsTable)
 	}
+	return s.syncHostTable(ctx)
+}
+
+// syncHostTable replaces the host table when the Mac's addresses changed.
+// The anchor's last rule only lets IPv4 in for the addresses in it, so a
+// stale table would also refuse the Mac's own new address.
+func (s *Server) syncHostTable(ctx context.Context) error {
 	want, err := s.hostAddrs()
 	if err != nil {
 		return err
@@ -520,15 +548,83 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	return s.route(ctx, bridges)
 }
 
-// route turns on IPv4 forwarding, which guest NAT needs (as Apple's own
-// vmnet NAT networks do), once the anchor is loaded: from then on its last
-// rule keeps guest subnets unreachable from every other interface. Then it
-// clears the bridges' states and checks.
+// forwardingSysctl must be on for guest NAT, as Apple's own vmnet NAT
+// networks need. The anchor lets only guest bridges' traffic be forwarded:
+// on every other interface IPv4 may only reach the Mac itself.
+const forwardingSysctl = "net.inet.ip.forwarding"
+
+// forwardingState records the value forwarding had before this helper first
+// turned it on, so disarm restores it. It lives beside the socket under
+// /var/run, which macOS clears at boot just as it resets the sysctl.
+func (s *Server) forwardingState() string {
+	return filepath.Join(filepath.Dir(s.config.SocketPath), "ip-forwarding-before-arm")
+}
+
+// route turns on IPv4 forwarding once the anchor is loaded, first recording
+// its previous value unless an earlier arm already did. Then it clears the
+// bridges' states and checks.
 func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
-	if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", "net.inet.ip.forwarding=1"); err != nil {
-		return "", fmt.Errorf("enable IPv4 forwarding for guest NAT: %w", err)
+	out, err := s.run(ctx, "/usr/sbin/sysctl", "-n", forwardingSysctl)
+	if err != nil {
+		return "", fmt.Errorf("read IPv4 forwarding: %w", err)
+	}
+	current := strings.TrimSpace(string(out))
+	if current != "0" && current != "1" {
+		return "", fmt.Errorf("unexpected %s value %q", forwardingSysctl, current)
+	}
+	if _, err := os.Lstat(s.forwardingState()); errors.Is(err, os.ErrNotExist) {
+		if err := writeState(s.forwardingState(), current+"\n"); err != nil {
+			return "", fmt.Errorf("record IPv4 forwarding before arm: %w", err)
+		}
+	} else if err != nil {
+		return "", err
+	}
+	if current == "0" {
+		if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=1"); err != nil {
+			return "", fmt.Errorf("enable IPv4 forwarding for guest NAT: %w", err)
+		}
 	}
 	return s.clearBridgeStates(ctx, bridges)
+}
+
+// restoreForwarding turns forwarding off again only if it was off before
+// this helper's first arm; if someone else had it on, it stays on.
+func (s *Server) restoreForwarding(ctx context.Context) error {
+	data, err := os.ReadFile(s.forwardingState())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	switch strings.TrimSpace(string(data)) {
+	case "0":
+		if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
+			return fmt.Errorf("restore IPv4 forwarding: %w", err)
+		}
+	case "1":
+	default:
+		return fmt.Errorf("unreadable IPv4 forwarding state in %s", s.forwardingState())
+	}
+	return os.Remove(s.forwardingState())
+}
+
+// writeState writes a root-only file by rename, so a crash never leaves it
+// partly written.
+func writeState(path, text string) error {
+	file, err := os.CreateTemp(filepath.Dir(path), ".state-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := io.WriteString(file, text); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
 }
 
 // Arm clears only states on the attested slot bridges. An old state can
@@ -560,11 +656,16 @@ func (s *Server) disarm(ctx context.Context) error {
 		return err
 	}
 	if filter == "" && nat == "" {
-		return nil
+		return s.restoreForwarding(ctx)
 	}
 	loaded, ok := filterBridges(filter, len(s.config.Slots))
 	if !ok || !s.known(loaded, filter, nat) {
 		return fmt.Errorf("refusing to clear an unexpected PF anchor")
+	}
+	// Drained guests need no forwarding; turn it back off while the anchor
+	// still guards every interface.
+	if err := s.restoreForwarding(ctx); err != nil {
+		return err
 	}
 	for _, what := range []string{"rules", "nat", "Tables"} {
 		if _, err := s.pf(ctx, "-a", anchor, "-F", what); err != nil {
@@ -661,6 +762,22 @@ func (s *Server) Serve(ctx context.Context) error {
 		<-ctx.Done()
 		listener.Close()
 	}()
+	go func() {
+		// The Mac's addresses can change while sandboxd is down; keep the
+		// loaded host table current so the Mac stays reachable on them.
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.mu.Lock()
+				s.refreshHostTable(ctx)
+				s.mu.Unlock()
+			}
+		}
+	}()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -669,7 +786,21 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			return err
 		}
+		s.mu.Lock()
 		s.handle(conn)
+		s.mu.Unlock()
+	}
+}
+
+// refreshHostTable syncs the host table if the anchor holds one.
+func (s *Server) refreshHostTable(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	if _, err := s.table(ctx, hostTable); err != nil {
+		return
+	}
+	if err := s.syncHostTable(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "refresh PF table %s: %v\n", hostTable, err)
 	}
 }
 

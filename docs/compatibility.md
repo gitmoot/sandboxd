@@ -397,9 +397,12 @@ holds, in this order:
   100.64/10` (CGNAT and Tailscale), `127/8, 168.63.129.16/32` (Azure
   WireServer), `169.254/16, 172.16/12, 192.168/16, 224/3, ::/127,
   ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8`, plus every
-  `--deny-cidr`; `<sandboxd_host>`, every address of the Mac on every
-  interface (LAN, Tailscale, loopback, bridges, any public address), which
-  each check brings up to date; `<sandboxd_guests>` (const), the slot subnets;
+  `--deny-cidr`; `<sandboxd_host>`, every destination the Mac itself
+  receives on: each address on every interface (LAN, Tailscale, loopback,
+  bridges, any public address), each IPv4 subnet's broadcast,
+  `255.255.255.255` and `224/4`. Each check and, while the anchor is loaded,
+  the helper itself every 5 s bring it up to date; `<sandboxd_guests>`
+  (const), the slot subnets;
 - one `nat on <egress> inet from <slot subnet> to any -> (<egress>)` per slot.
   `<egress>` is `--egress-interface`, or the Mac's default route interface
   when sandboxd arms (restart sandboxd after the default route moves);
@@ -407,14 +410,31 @@ holds, in this order:
   gateway on its one port; block to `<sandboxd_deny>`; block to
   `<sandboxd_host>`; pass from the slot's own subnet to anything else; block
   all other IPv4 and all IPv6;
-- last, block anything arriving on any other interface for a guest subnet.
+- then, for every other interface: block anything for a guest subnet, and
+  `block in quick on ! lo0 inet from any to ! <sandboxd_host>`. Slot bridge
+  packets never get this far, so the only IPv4 the Mac forwards is guest
+  NAT egress: a LAN, VPN or Tailscale host that uses the Mac as its gateway
+  is not routed anywhere.
 
 So a guest never reaches private networks, the Mac (every port except the
 relay's, including its resolver) or another guest, in either direction.
 Guests use the public resolvers `1.1.1.1` and `8.8.8.8` (`container create
---dns`). Arm enables `net.inet.ip.forwarding` after loading the anchor. The
-check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock macOS has
-it), exact filter and NAT readback, and exact deny and guest tables.
+--dns`). The check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock
+macOS has it), exact filter and NAT readback, and exact deny and guest tables.
+
+**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. After
+loading the anchor, the first arm records the previous value in
+`/var/run/sandboxd-pf/ip-forwarding-before-arm` (beside the socket; macOS
+clears it at boot, when the sysctl resets too), then turns forwarding on if
+it was off. Later arms and helper restarts keep that record. Disarm (sandboxd's
+clean shutdown, after its guests are gone) turns forwarding off again only
+if it was off before, and removes the record; if something else (Internet
+Sharing, a VPN or Tailscale subnet router) had it on, it stays on. While the
+anchor is loaded, the last rule above also stops other forwarding on the
+Mac, including Apple's own vmnet NAT networks (such as the default
+`container` network on `bridge100`) and Internet Sharing; stop `sandboxd`
+to give it back. IPv6 forwarding is never touched.
+
 `internal/firewall/testdata/egress-3slot.*` is the generated ruleset for the
 three-slot Mac. A per-slot deny-all mode exists in the generator for
 `allow_internet_access:false` (M4) but is not reachable from the API yet.
@@ -529,7 +549,11 @@ Stop it until the next boot with
 again with
 `sudo launchctl bootstrap system /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist`.
 Stop `sandboxd` first: without the helper its gate fails and it stops guests.
-To uninstall, stop it, then:
+A clean `sandboxd` stop disarms, which removes the anchor and restores IPv4
+forwarding (above); if `sudo pfctl -a com.apple/gitmoot-sandboxd -sr` still
+shows rules, `cat /var/run/sandboxd-pf/ip-forwarding-before-arm` and, if it
+says `0`, run `sudo sysctl -w net.inet.ip.forwarding=0` after flushing the
+anchor. To uninstall, stop it, then:
 
 ```sh
 sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \

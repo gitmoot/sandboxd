@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -163,7 +164,10 @@ func TestTwoSlotsArmExactMultiBridgePolicy(t *testing.T) {
 			"block drop in quick on bridge111 inet from any to <sandboxd_host>\n", "", 1),
 		"private deny missing": strings.Replace(readback,
 			"block drop in quick on bridge110 inet from any to <sandboxd_deny>\n", "", 1),
-		"guest subnets open from other interfaces": strings.TrimSuffix(readback, "\nblock drop in quick inet from any to <sandboxd_guests>"),
+		"guest subnets open from other interfaces": strings.Replace(readback, "\nblock drop in quick inet from any to <sandboxd_guests>", "", 1),
+		"LAN forwarding open":                      strings.Replace(readback, "\nblock drop in quick on ! lo0 inet from any to ! <sandboxd_host>", "", 1),
+		"forwarding block on lo0 only": strings.Replace(readback, "block drop in quick on ! lo0 inet from any to ! <sandboxd_host>",
+			"block drop in quick on lo0 inet from any to ! <sandboxd_host>", 1),
 		"one slot only": h.s.policyFor([]string{"bridge110"}, "en0", 8443, nil).Filter,
 	} {
 		h.filter = filter
@@ -218,6 +222,16 @@ func TestEgressTablesAreExactAndHostTableFollowsTheMac(t *testing.T) {
 	}
 	if hostTableHas("fe80::1/128") {
 		t.Error("host table holds a scoped link-local address")
+	}
+	// The Mac's own broadcast and multicast destinations stay reachable on
+	// its LAN under the forwarding block.
+	for _, addr := range []string{"192.168.1.255/32", "255.255.255.255/32", "224.0.0.0/4", "127.255.255.255/32"} {
+		if !hostTableHas(addr) {
+			t.Errorf("host table lacks local destination %s", addr)
+		}
+	}
+	if hostTableHas("100.111.92.43/31") || hostTableHas("8.8.8.8/32") {
+		t.Error("host table holds a destination that is not the Mac")
 	}
 
 	// A new Mac address (DHCP, a public address) is denied within one check.
@@ -545,5 +559,98 @@ func TestContainerRunsAsTheWorkerInItsLaunchdSession(t *testing.T) {
 	want := []string{"asuser", "501", "/usr/bin/sudo", "-n", "-H", "-u", "#501", "-g", "#20", "--", "/usr/local/bin/container", "list", "--all"}
 	if name != "/bin/launchctl" || strings.Join(argv, " ") != strings.Join(want, " ") {
 		t.Fatalf("command = %s %q, want /bin/launchctl %q", name, argv, want)
+	}
+}
+
+// Arm records forwarding's previous value once, in the helper's state beside
+// its socket; disarm restores it and never turns off a forwarding that was
+// already on.
+func TestDisarmRestoresIPForwarding(t *testing.T) {
+	ctx := context.Background()
+	for _, before := range []bool{false, true} {
+		h := newTwoSlotHost(t, 0)
+		h.forwarding = before
+		if _, err := h.s.arm(ctx); err != nil || !h.forwarding {
+			t.Fatalf("before=%v: arm did not leave forwarding on: %v", before, err)
+		}
+		if before && h.forwardingWrites != 0 {
+			t.Fatalf("before=%v: arm rewrote a forwarding that was already on", before)
+		}
+		// Re-arm and a helper restart (update) keep the first recorded value.
+		if _, err := h.s.arm(ctx); err != nil {
+			t.Fatal(err)
+		}
+		restarted, err := NewServer(h.s.config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restarted.interfaces, restarted.addrs, restarted.container = h.s.interfaces, h.s.addrs, h.s.container
+		h.s = restarted
+		h.attach(restarted)
+		if _, err := h.s.arm(ctx); err != nil {
+			t.Fatal(err)
+		}
+		h.pins = map[string]bool{}
+		delete(h.bridges, "bridge110")
+		delete(h.bridges, "bridge111")
+		if err := h.s.disarm(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if h.forwarding != before {
+			t.Fatalf("disarm left forwarding %v, was %v before the first arm", h.forwarding, before)
+		}
+		if _, err := os.Stat(h.s.forwardingState()); !os.IsNotExist(err) {
+			t.Fatalf("before=%v: forwarding state not removed: %v", before, err)
+		}
+		// A second disarm with nothing recorded leaves forwarding alone.
+		writes := h.forwardingWrites
+		if err := h.s.disarm(ctx); err != nil || h.forwarding != before || h.forwardingWrites != writes {
+			t.Fatalf("before=%v: disarm without a record changed forwarding: %v", before, err)
+		}
+	}
+}
+
+func TestDisarmLeavesForwardingThatWasOnBeforeArm(t *testing.T) {
+	ctx := context.Background()
+	h := newTwoSlotHost(t, 0)
+	h.forwarding = true // e.g. Internet Sharing
+	if _, err := h.s.arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The anchor was flushed by hand; disarm still settles forwarding.
+	h.setLoaded("", "")
+	h.pins = map[string]bool{}
+	delete(h.bridges, "bridge110")
+	delete(h.bridges, "bridge111")
+	if err := h.s.disarm(ctx); err != nil || !h.forwarding || h.forwardingWrites != 0 {
+		t.Fatalf("disarm turned off forwarding someone else had on: %v writes=%d", err, h.forwardingWrites)
+	}
+	if err := os.WriteFile(h.s.forwardingState(), []byte("maybe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.s.disarm(ctx); err == nil || !h.forwarding {
+		t.Fatal("acted on an unreadable forwarding record")
+	}
+}
+
+func TestBackgroundRefreshKeepsTheMacReachable(t *testing.T) {
+	ctx := context.Background()
+	h := newTwoSlotHost(t, 0)
+	h.s.refreshHostTable(ctx) // no anchor: nothing to do
+	if len(h.tables) != 0 {
+		t.Fatal("refresh created a host table without an anchor")
+	}
+	if _, err := h.s.arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.bridges["en0"] = []net.Addr{ipNet("192.168.7.40/24")}
+	h.s.refreshHostTable(ctx)
+	for _, addr := range []string{"192.168.7.40/32", "192.168.7.255/32"} {
+		if !slices.Contains(h.tables[hostTable], netip.MustParsePrefix(addr)) {
+			t.Errorf("refresh did not admit the Mac's new destination %s", addr)
+		}
+	}
+	if slices.Contains(h.tables[hostTable], netip.MustParsePrefix("192.168.1.20/32")) {
+		t.Error("refresh kept the Mac's old address")
 	}
 }

@@ -41,6 +41,9 @@ var (
 		netip.MustParsePrefix("192.168.1.20/32"), netip.MustParsePrefix("192.168.128.1/32"),
 		netip.MustParsePrefix("192.168.130.1/32"), netip.MustParsePrefix("192.168.131.1/32"),
 		netip.MustParsePrefix("::1/128"), netip.MustParsePrefix("fd7a:115c:a1e0::4e01:5c2b/128"),
+		// local broadcast and multicast, which hostAddrs adds
+		netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("255.255.255.255/32"),
+		netip.MustParsePrefix("192.168.1.255/32"), netip.MustParsePrefix("127.255.255.255/32"),
 	}
 )
 
@@ -142,8 +145,19 @@ func TestEveryDeniedRangeAndHostAddressIsInTheAnchor(t *testing.T) {
 			}
 		}
 	}
-	if lines[len(lines)-1] != "block drop in quick inet from any to <"+guestsTable+">" {
+	if lines[len(lines)-2] != "block drop in quick inet from any to <"+guestsTable+">" {
 		t.Errorf("guest subnets are reachable from other interfaces:\n%s", p.Filter)
+	}
+	// Forwarding serves only guests: on every interface but loopback (slot
+	// bridges never get here), IPv4 not for the Mac is dropped, so a LAN host
+	// using the Mac as its gateway is not routed anywhere.
+	if lines[len(lines)-1] != "block drop in quick on ! lo0 inet from any to ! <"+hostTable+">" {
+		t.Errorf("forwarded LAN traffic is not blocked:\n%s", p.Filter)
+	}
+	for _, bridge := range threeBridges {
+		if last := slices.Index(lines, "block drop in quick on "+bridge+" inet6 all"); last > len(lines)-3 {
+			t.Errorf("%s rules do not all precede the other-interface rules", bridge)
+		}
 	}
 	if strings.Contains(p.Filter, "pass in quick on bridge102 inet6") || strings.Count(p.Filter, "inet6") != len(threeBridges) {
 		t.Errorf("guest IPv6 is not dropped whole:\n%s", p.Filter)
