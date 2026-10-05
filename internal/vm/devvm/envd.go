@@ -30,9 +30,10 @@ import (
 // itself, directly when already root or behind "sudo -n" otherwise.
 //
 // An envd guest is NOT isolated either: it shares the host filesystem, except
-// that /home (with /home/user), /root, /run and /tmp are private and
-// /etc/passwd and /etc/group name only root and user (1000:1000). Its network
-// namespace holds only loopback, so envd is never reachable from the host
+// that /home (with /home/user), /root, /run and /tmp are private,
+// /etc/passwd and /etc/group name only root and user (1000:1000), and
+// /etc/sudoers gives user passwordless sudo as E2B's base template does. Its
+// network namespace holds only loopback (no internet, unlike a real guest), so envd is never reachable from the host
 // network; the driver reaches it through a Unix socket the helper bridges to
 // envd's port, the dev stand-in for the Firecracker vsock channel.
 type Envd struct {
@@ -59,7 +60,7 @@ const (
 
 // envdGuestLayout lists what the helper creates in the guest directory, all
 // removed by the helper itself (root owns them) before it exits.
-var envdGuestLayout = []string{"home", "tmp", "root", "passwd", "group", envdSocket, envdSocket + ".pending"}
+var envdGuestLayout = []string{"home", "tmp", "root", "passwd", "group", "sudoers", "hosts", "shadow", envdSocket, envdSocket + ".pending"}
 
 func (e Envd) validate() error {
 	if e.Binary == "" {
@@ -126,8 +127,15 @@ func (d *Driver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
 	if !g.envd {
 		return nil, fmt.Errorf("guest %q runs no envd", id)
 	}
+	// Through a directory descriptor: a deep state directory would exceed
+	// sun_path.
+	dirFD, err := unix.Open(g.dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer unix.Close(dirFD)
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "unix", filepath.Join(g.dir, envdSocket))
+	return dialer.DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d/%s", dirFD, envdSocket))
 }
 
 // destroyEnvd closes the helper's lifeline: it kills every process of the
@@ -199,26 +207,31 @@ func envdInit(args []string) error {
 	}
 	// The socket is bound before the mounts below can hide dir; the driver
 	// waits for it to appear only once setup is done (its rename).
-	pending := filepath.Join(dir, envdSocket+".pending")
-	listener, err := net.Listen("unix", pending)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	if err := errors.Join(os.Chown(pending, uid, gid), os.Chmod(pending, 0o600)); err != nil {
-		return err
-	}
 	dirFD, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(dirFD)
+	// Through the directory descriptor: a deep dir would exceed sun_path.
+	pending := fmt.Sprintf("/proc/self/fd/%d/%s", dirFD, envdSocket+".pending")
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: pending, Net: "unix"})
+	if err != nil {
+		return err
+	}
+	listener.SetUnlinkOnClose(false)
+	defer listener.Close()
+	if err := errors.Join(unix.Fchownat(dirFD, envdSocket+".pending", uid, gid, unix.AT_SYMLINK_NOFOLLOW),
+		os.Chmod(filepath.Join(dir, envdSocket+".pending"), 0o600)); err != nil {
+		return err
+	}
 	// Likewise the envd binary, executed through its descriptor.
 	envdFD, err := unix.Open(binary, unix.O_PATH|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return err
 	}
 	defer unix.Close(envdFD)
+	// A guest's default umask, as in E2B's guests.
+	unix.Umask(0o022)
 	if err := setupEnvdGuest(dir); err != nil {
 		return err
 	}
@@ -288,11 +301,23 @@ func setupEnvdGuest(dir string) error {
 		}
 	}
 	files := map[string]string{
+		// As E2B's base template: user has passwordless sudo.
+		"sudoers": "Defaults env_reset\nroot ALL=(ALL:ALL) ALL\nuser ALL=(ALL:ALL) NOPASSWD: ALL\n",
+		"hosts":   "127.0.0.1\tlocalhost sandbox\n::1\tlocalhost\n",
+		// PAM's account check needs a (locked, password-less) shadow entry.
+		"shadow": "root:*:20000:0:99999:7:::\nuser:*:20000:0:99999:7:::\nnobody:*:20000:0:99999:7:::\n",
 		"passwd": "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000::/home/user:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n",
 		"group":  "root:x:0:\nuser:x:1000:\nnogroup:x:65534:\n",
 	}
 	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		mode := os.FileMode(0o644)
+		switch name {
+		case "sudoers":
+			mode = 0o440
+		case "shadow":
+			mode = 0o600
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), mode); err != nil {
 			return err
 		}
 	}
@@ -301,6 +326,8 @@ func setupEnvdGuest(dir string) error {
 	binds := [][2]string{
 		{filepath.Join(dir, "home"), "/home/user"}, {filepath.Join(dir, "tmp"), "/tmp"}, {filepath.Join(dir, "root"), "/root"},
 		{filepath.Join(dir, "passwd"), "/etc/passwd"}, {filepath.Join(dir, "group"), "/etc/group"},
+		{filepath.Join(dir, "sudoers"), "/etc/sudoers"}, {filepath.Join(dir, "hosts"), "/etc/hosts"},
+		{filepath.Join(dir, "shadow"), "/etc/shadow"},
 	}
 	sources := make([]int, len(binds))
 	for i, bind := range binds {
