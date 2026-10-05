@@ -12,7 +12,7 @@ worker, for the same Gitmoot review profile. Tracking: [#29](https://github.com/
 | Host identity | Slot *i* runs its VMM as UID/GID `fc-uid-base + i` and its NAT as `fc-uid-base + 1000 + i`. Each VM gets its own chroot under `<fc-root>/jail/firecracker/<id>/root` |
 | Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (home disk size) and `nofile=256` |
 | Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk. The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
-| Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
+| Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
 | Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk |
 
 CPU and memory come from `-cpus` and `-memory-mib`, the same flags the Apple
@@ -39,15 +39,23 @@ Docker, Tailscale or iptables chain, stays untouched.
   UIDs (`meta skuid`) it rejects every host-local, broadcast, multicast and
   anycast destination (`fib daddr type`, which covers all host interfaces:
   public, Docker bridges, Tailscale, loopback aliases). It also rejects
-  `0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.168/16, 224/3`
-  and `::/127, ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8`.
-  All other sockets on the host are unaffected.
+  `0/8, 10/8, 100.64/10, 127/8, 168.63.129.16/32 (Azure WireServer),
+  169.254/16, 172.16/12, 192.168/16, 224/3` and
+  `::/127, ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8`,
+  plus every `-fc-deny-cidr`. All other sockets on the host are unaffected.
 - **Other guests.** Every guest has the same private address in its own
   namespace, and no route to any other.
 - **DNS.** The image's `/etc/resolv.conf` points at public resolvers
   (1.1.1.1, 8.8.8.8), reached through the NAT. The host resolver
   (127.0.0.53) is deliberately unreachable.
 - **IPv6.** Disabled in the namespace; guests get IPv4 internet only.
+- **Cloud metadata on public addresses.** Guests can reach the public
+  internet. Metadata services on link-local addresses (169.254.169.254 on
+  AWS, GCP, Azure IMDS and most others) and Azure's WireServer are denied
+  above. If the deployment host runs on a cloud that serves metadata,
+  credentials or other host-scoped services on a public address, list each
+  one with a repeatable `-fc-deny-cidr <prefix>`. It is added to both the
+  host and the namespace tables.
 
 The daemon installs the table atomically before admitting guests (`Arm`),
 re-checks it (`nft -s list table inet sbx_fc`) before every create and every
@@ -116,7 +124,9 @@ driver rejects them. The other `-fc-*` flags are listed in `sandboxd -h`.
 - `go test ./internal/vm ./internal/guestagent ./cmd/sandboxd`: driver
   logic against a fake host, with no KVM needed. It covers jail layout,
   jailer limits, the disk floor, cleanup after failed creates, restart
-  reconciliation, firewall loss, the rulesets and the guest agent protocol.
+  reconciliation, firewall loss, the rulesets, the symlink-safe vsock dial
+  (a replaced socket or run directory never reaches another listener) and
+  the guest agent protocol.
 - `sudo SANDBOXD_FC_KVM=1 go test ./internal/vm -run TestFirecrackerKVM`:
   boots two real VMs from the install above. It checks exec, exit codes,
   CopyIn, cross-guest isolation, host and private probes against a host

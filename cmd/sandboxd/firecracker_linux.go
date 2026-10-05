@@ -29,7 +29,7 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, image string, slo
 	driver, err := vm.NewFirecrackerDriver(vm.FirecrackerConfig{
 		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: []string{image}, Slots: slots,
 		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
-		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog,
+		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny,
 	})
 	if err != nil {
 		return nil, nil, err

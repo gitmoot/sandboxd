@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -40,21 +41,23 @@ const (
 	fcVMMPids      = 64
 	fcNetMemoryMax = 256 << 20
 	fcNetPids      = 16
-	fcVsockPath    = "/run/v.sock"
+	fcVsockDir     = "run"
+	fcVsockName    = "v.sock"
+	fcVsockPath    = "/" + fcVsockDir + "/" + fcVsockName
 	fcConfigPath   = "/vm.json"
 	fcMaxCPUs      = 32
 	fcMinMemoryMiB = 128
 	fcMaxMemoryMiB = 256 << 10
-	// The jailer's chroot root, relative to Root, plus the longest jail path
-	// suffix "/<firecracker>/<id>/root/run/v.sock" must fit sun_path (108).
-	fcMaxSocketPath = 107
 )
 
 // fcDenyIPv4 and fcDenyIPv6 are never reachable from a guest: private,
-// carrier-grade NAT, link-local, loopback and non-unicast ranges. Host
-// addresses on every interface are denied separately (fib daddr type local).
+// carrier-grade NAT, link-local, loopback and non-unicast ranges, plus the
+// one well-known cloud metadata service on a public address (Azure
+// WireServer). Host addresses on every interface are denied separately (fib
+// daddr type local). Other providers' public metadata endpoints must be added
+// per deployment (docs/firecracker.md).
 var fcDenyIPv4 = []string{
-	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "168.63.129.16/32", "169.254.0.0/16",
 	"172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3",
 }
 
@@ -84,6 +87,9 @@ type FirecrackerConfig struct {
 	// ConsoleLog keeps the guest serial console in <jail>/console.log for
 	// debugging. Off by default; the log is bounded by the VMM's fsize limit.
 	ConsoleLog bool
+	// DenyCIDRs extends both guest deny lists, for example with a cloud
+	// provider's metadata endpoints on public addresses.
+	DenyCIDRs []netip.Prefix
 }
 
 // FirecrackerDriver runs one Firecracker microVM per sandbox under the jailer:
@@ -93,9 +99,10 @@ type FirecrackerConfig struct {
 // by the sandboxd-owned nftables table. The host reaches the guest agent only
 // over vsock.
 type FirecrackerDriver struct {
-	cfg    FirecrackerConfig
-	images map[string]struct{}
-	host   fcHost
+	cfg          FirecrackerConfig
+	images       map[string]struct{}
+	deny4, deny6 []string
+	host         fcHost
 
 	mu    sync.Mutex
 	armed string
@@ -134,7 +141,9 @@ type fcHost interface {
 	DeleteNetns(ctx context.Context, name string) error
 
 	StartVMM(ctx context.Context, jailer string, args []string, console string) error
-	Dial(ctx context.Context, path string) (net.Conn, error)
+	// Dial connects to the VMM's vsock socket <chroot>/run/v.sock, which
+	// must be a socket owned by owner, without following symlinks.
+	Dial(ctx context.Context, chroot string, owner int) (net.Conn, error)
 }
 
 // fcNetwork is one VM's private network: a namespace owned by a user
@@ -178,9 +187,6 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	if !strings.Contains(filepath.Base(cfg.Firecracker), "firecracker") {
 		return nil, errors.New("the jailer requires a Firecracker binary whose name contains \"firecracker\"")
 	}
-	if len(cfg.Root)+len("/jail/")+len(filepath.Base(cfg.Firecracker))+len("/sandboxd-")+32+len("/root")+len(fcVsockPath) > fcMaxSocketPath {
-		return nil, errors.New("Firecracker root path is too long for the vsock socket")
-	}
 	if len(cfg.Images) == 0 {
 		return nil, errors.New("Firecracker image allowlist must not be empty")
 	}
@@ -218,9 +224,21 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 			images[image] = struct{}{}
 		}
 	}
+	deny4, deny6 := slices.Clone(fcDenyIPv4), slices.Clone(fcDenyIPv6)
+	for _, prefix := range cfg.DenyCIDRs {
+		if !prefix.IsValid() || prefix != prefix.Masked() {
+			return nil, fmt.Errorf("invalid Firecracker deny CIDR %q", prefix)
+		}
+		if prefix.Addr().Is4() {
+			deny4 = append(deny4, prefix.String())
+		} else {
+			deny6 = append(deny6, prefix.String())
+		}
+	}
 	cfg.Images = slices.Clone(cfg.Images)
 	cfg.Slots = slices.Clone(cfg.Slots)
-	return &FirecrackerDriver{cfg: cfg, images: images, host: host}, nil
+	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
+	return &FirecrackerDriver{cfg: cfg, images: images, deny4: deny4, deny6: deny6, host: host}, nil
 }
 
 func (d *FirecrackerDriver) runDir() string   { return filepath.Join(d.cfg.Root, "run") }
@@ -235,21 +253,23 @@ func (d *FirecrackerDriver) uidRange() (int, int) {
 	return d.cfg.UIDBase, d.cfg.UIDBase + 2*fcUIDStride - 1
 }
 
-// FirecrackerHostRuleset is the sandboxd-owned host table. Every socket of a
-// VMM or user-mode network stack UID is denied host addresses (on every
-// interface), private and special ranges; everything else is the internet.
-// The output hook only adds drops for those UIDs and never touches other
-// tables, Docker or iptables chains.
-func FirecrackerHostRuleset(uidLow, uidHigh int) string {
+// fcHostRuleset is the sandboxd-owned host table. Every socket of a VMM or
+// user-mode network stack UID is denied host addresses (on every interface),
+// private and special ranges; everything else is the internet. The output
+// hook only adds rejects for those UIDs and never touches other tables,
+// Docker or iptables chains. auto-merge accepts overlapping deny entries.
+func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string) string {
 	return fmt.Sprintf(`table inet %s {
 	set deny4 {
 		type ipv4_addr
 		flags interval
+		auto-merge
 		elements = { %s }
 	}
 	set deny6 {
 		type ipv6_addr
 		flags interval
+		auto-merge
 		elements = { %s }
 	}
 	chain output {
@@ -262,17 +282,18 @@ func FirecrackerHostRuleset(uidLow, uidHigh int) string {
 		ip6 daddr @deny6 counter reject with icmpx type admin-prohibited
 	}
 }
-`, fcHostTable, strings.Join(fcDenyIPv4, ", "), strings.Join(fcDenyIPv6, ", "), uidLow, uidHigh)
+`, fcHostTable, strings.Join(deny4, ", "), strings.Join(deny6, ", "), uidLow, uidHigh)
 }
 
-// firecrackerNetnsRuleset confines the VM's own namespace: the guest may only
-// be forwarded to public addresses through the NAT tap, never to the
-// namespace itself, the NAT's virtual host (10.0.2.2) or its resolver.
-func firecrackerNetnsRuleset() string {
+// fcNetnsRuleset confines the VM's own namespace: the guest may only be
+// forwarded to public addresses through the NAT tap, never to the namespace
+// itself, the NAT's virtual host (10.0.2.2) or its resolver.
+func fcNetnsRuleset(deny4 []string) string {
 	return fmt.Sprintf(`table inet %s {
 	set deny4 {
 		type ipv4_addr
 		flags interval
+		auto-merge
 		elements = { %s }
 	}
 	chain input {
@@ -291,7 +312,7 @@ func firecrackerNetnsRuleset() string {
 		oifname %[4]q masquerade
 	}
 }
-`, fcNetnsTable, strings.Join(fcDenyIPv4, ", "), fcGuestTap, fcSlirpTap)
+`, fcNetnsTable, strings.Join(deny4, ", "), fcGuestTap, fcSlirpTap)
 }
 
 // Arm creates the cgroup parent and atomically (re)installs the host table,
@@ -305,7 +326,7 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 		return err
 	}
 	low, high := d.uidRange()
-	if err := d.host.ApplyFirewall(ctx, FirecrackerHostRuleset(low, high)); err != nil {
+	if err := d.host.ApplyFirewall(ctx, fcHostRuleset(low, high, d.deny4, d.deny6)); err != nil {
 		return err
 	}
 	state, err := d.host.FirewallState(ctx)
@@ -710,7 +731,7 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta) e
 	}
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: fcNetnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
-		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: firecrackerNetnsRuleset(),
+		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: fcNetnsRuleset(d.deny4),
 	}); err != nil {
 		return err
 	}
@@ -768,7 +789,14 @@ func (d *FirecrackerDriver) waitAgent(ctx context.Context, id string) error {
 }
 
 func (d *FirecrackerDriver) dialAgent(ctx context.Context, id string) (net.Conn, error) {
-	conn, err := d.host.Dial(ctx, filepath.Join(d.chroot(id), fcVsockPath))
+	meta, err := d.readMeta(id)
+	if err != nil {
+		return nil, err
+	}
+	if meta == nil {
+		return nil, fmt.Errorf("Firecracker VM %q has no valid ownership record", id)
+	}
+	conn, err := d.host.Dial(ctx, d.chroot(id), meta.VMMUID)
 	if err != nil {
 		return nil, err
 	}

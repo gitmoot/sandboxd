@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,6 +44,9 @@ func TestFirecrackerKVM(t *testing.T) {
 		Kernel: kernels[0], Images: []string{image}, Slots: FirecrackerSlotNames(2),
 		UIDBase: 2900000, HomeDiskMiB: 1024, DiskFloorMiB: 4096, BootTimeout: 60 * time.Second,
 		ConsoleLog: os.Getenv("SANDBOXD_FC_CONSOLE") == "1",
+		// 10.1/16 overlaps 10/8 on purpose: the real tables must accept it.
+		// 1.0.0.1 is public: a configured deny must hold even for the internet.
+		DenyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("1.0.0.1/32")},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -120,7 +124,8 @@ func TestFirecrackerKVM(t *testing.T) {
 		}
 	}()
 	port := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
-	targets := []string{"10.200.0.1:22", "10.0.2.2:" + port, "10.0.2.3:53", "127.0.0.1:" + port, "169.254.169.254:80", "192.168.0.1:80"}
+	targets := []string{"10.200.0.1:22", "10.0.2.2:" + port, "10.0.2.3:53", "127.0.0.1:" + port, "169.254.169.254:80", "192.168.0.1:80",
+		"168.63.129.16:80", "1.0.0.1:443"}
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
 		t.Fatal(err)

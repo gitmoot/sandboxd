@@ -26,6 +26,9 @@ func TestDriverSelectionAndFirecrackerCap(t *testing.T) {
 		// gets as far as reading the API key.
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4"}, "read API key"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-max-vms", "4"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "203.0.113.7/24"}, "is not a network prefix"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "metadata"}, "invalid value"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-deny-cidr", "203.0.113.0/24", "-fc-deny-cidr", "2001:db8::/32"}, "read API key"},
 	} {
 		err := run(context.Background(), append(append([]string(nil), common...), tc.args...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

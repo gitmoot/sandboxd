@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/gitmoot/sandboxd/internal/guestagent"
 )
@@ -38,31 +41,44 @@ func TestMain(m *testing.M) {
 
 // fakeFCHost models the host: namespaces, cgroups and the firewall are in
 // memory; StartVMM "boots" a guest whose agent is a real guestagent.Server
-// serving a per-VM directory standing in for the guest filesystem.
+// listening on a real Unix socket at <chroot>/run/v.sock and serving a per-VM
+// directory standing in for the guest filesystem. Dial is the production
+// symlink-safe dial; the fake's Chown is a no-op, so the VMM UID it expects
+// is the test's own UID (shifted by ownerShift).
 type fakeFCHost struct {
-	mu        sync.Mutex
-	t         *testing.T
-	free      uint64
-	untrusted map[string]bool
-	firewall  string
-	netns     map[string]bool
-	cgroups   map[string]bool // name -> populated
-	parent    bool
-	guests    map[string]string // jail chroot -> guest root dir
-	networks  []fcNetwork
-	vmmArgs   [][]string
-	calls     []string
-	failVMM   error
-	failNet   error
-	bootDies  bool
-	stats     [][3]uint64
+	mu         sync.Mutex
+	t          *testing.T
+	free       uint64
+	untrusted  map[string]bool
+	firewall   string
+	netns      map[string]bool
+	cgroups    map[string]bool // name -> populated
+	parent     bool
+	guests     map[string]string // jail chroot -> guest root dir
+	listeners  map[string]*net.UnixListener
+	networks   []fcNetwork
+	vmmArgs    [][]string
+	calls      []string
+	failVMM    error
+	failNet    error
+	bootDies   bool
+	ownerShift int
+	stats      [][3]uint64
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
-	return &fakeFCHost{
+	h := &fakeFCHost{
 		t: t, free: 100 << 30, untrusted: map[string]bool{}, netns: map[string]bool{},
-		cgroups: map[string]bool{}, guests: map[string]string{},
+		cgroups: map[string]bool{}, guests: map[string]string{}, listeners: map[string]*net.UnixListener{},
 	}
+	t.Cleanup(func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		for _, l := range h.listeners {
+			_ = l.Close()
+		}
+	})
+	return h
 }
 
 func (h *fakeFCHost) record(call string) {
@@ -132,6 +148,10 @@ func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.cgroups, name)
+	if l, ok := h.listeners[name]; ok {
+		_ = l.Close()
+		delete(h.listeners, name)
+	}
 	return nil
 }
 func (h *fakeFCHost) Netns() ([]string, error) {
@@ -179,35 +199,66 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ stri
 	}
 	id := argAfter(args, "--id")
 	h.cgroups[id] = !h.bootDies
+	if h.bootDies {
+		return nil
+	}
 	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), "firecracker", id, "root")
-	h.guests[chroot] = h.t.TempDir()
+	guest := h.t.TempDir()
+	h.guests[chroot] = guest
+	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
+	if err != nil {
+		return err
+	}
+	h.listeners[id] = listener
+	go serveFakeAgent(listener, guest)
 	return nil
 }
 
-// Dial answers the vsock handshake and serves a real guest agent whose
-// filesystem is the VM's guest directory.
-func (h *fakeFCHost) Dial(_ context.Context, path string) (net.Conn, error) {
+func (h *fakeFCHost) Dial(ctx context.Context, chroot string, _ int) (net.Conn, error) {
 	h.mu.Lock()
-	guest, ok := h.guests[filepath.Dir(filepath.Dir(path))]
+	owner := os.Getuid() + h.ownerShift
 	h.mu.Unlock()
-	if !ok || filepath.Base(path) != "v.sock" {
-		return nil, fmt.Errorf("dial %s: no such socket", path)
+	return dialJailSocket(ctx, chroot, owner)
+}
+
+// listenUnixIn binds a Unix socket named name in dir through a directory
+// descriptor, so deep test directories are not limited by sun_path.
+func listenUnixIn(dir, name string) (*net.UnixListener, error) {
+	fd, err := unix.Open(dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
 	}
+	defer unix.Close(fd)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: fmt.Sprintf("/proc/self/fd/%d/%s", fd, name), Net: "unix"})
+	if err != nil {
+		return nil, err
+	}
+	listener.SetUnlinkOnClose(false)
+	return listener, nil
+}
+
+// serveFakeAgent answers Firecracker's vsock handshake on every connection
+// and serves a real guest agent whose filesystem is the guest directory.
+func serveFakeAgent(listener *net.UnixListener, guest string) {
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
 	}
-	host, end := net.Pipe()
-	go func() {
-		line, err := bufio.NewReader(io.LimitReader(end, 13)).ReadString('\n')
-		if err != nil || line != "CONNECT 1024\n" {
-			_ = end.Close()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
 			return
 		}
-		_, _ = io.WriteString(end, "OK 1073741824\n")
-		server.ServeConn(end)
-	}()
-	return host, nil
+		go func() {
+			line, err := bufio.NewReader(io.LimitReader(conn, 13)).ReadString('\n')
+			if err != nil || line != "CONNECT 1024\n" {
+				_ = conn.Close()
+				return
+			}
+			_, _ = io.WriteString(conn, "OK 1073741824\n")
+			server.ServeConn(conn)
+		}()
+	}
 }
 
 func (h *fakeFCHost) guestDir(d *FirecrackerDriver, id string) string {
@@ -223,12 +274,7 @@ const (
 
 func newTestFirecracker(t *testing.T, mutate ...func(*FirecrackerConfig)) (*FirecrackerDriver, *fakeFCHost, FirecrackerConfig) {
 	t.Helper()
-	// Short, like a real install: the jail's vsock path must fit sun_path.
-	root, err := os.MkdirTemp("", "sbxfc")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := t.TempDir()
 	for _, dir := range []string{"bin", "kernel", "images"} {
 		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
@@ -269,7 +315,8 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		"tiny home":         func(c *FirecrackerConfig) { c.HomeDiskMiB = 1 },
 		"no boot timeout":   func(c *FirecrackerConfig) { c.BootTimeout = 0 },
 		"renamed vmm":       func(c *FirecrackerConfig) { c.Firecracker = "/usr/bin/vmm" },
-		"socket path long":  func(c *FirecrackerConfig) { c.Root = "/" + strings.Repeat("r", 60) },
+		"unmasked deny":     func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{netip.MustParsePrefix("203.0.113.7/24")} },
+		"invalid deny":      func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{{}} },
 		"negative floor":    func(c *FirecrackerConfig) { c.DiskFloorMiB = -1 },
 		"relative image":    func(c *FirecrackerConfig) { c.Images = []string{"images/x.ext4"} },
 		"unclean jailer":    func(c *FirecrackerConfig) { c.Jailer = "/usr/bin/../bin/jailer" },
@@ -609,12 +656,20 @@ func TestFirecrackerUsageFromCgroup(t *testing.T) {
 	}
 }
 
-func TestFirecrackerRulesetsDenyPrivateAndHost(t *testing.T) {
-	host := FirecrackerHostRuleset(2900000, 2901999)
+func TestFirecrackerRulesetsDenyPrivateHostAndMetadata(t *testing.T) {
+	d, fake, cfg := newTestFirecracker(t, func(c *FirecrackerConfig) {
+		c.DenyCIDRs = []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("2001:db8::/32")}
+	})
+	// Arm installed the host table; Create hands the namespace table to the host.
+	host := fake.firewall
+	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	netns := fake.networks[0].Ruleset
 	for _, want := range []string{
 		"table inet sbx_fc", "meta skuid 2900000-2901999 jump guest", "fib daddr type { local, broadcast, multicast, anycast }",
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "127.0.0.0/8",
-		"fc00::/7", "fe80::/10", "hook output",
+		"168.63.129.16/32", "203.0.113.0/24", "fc00::/7", "fe80::/10", "2001:db8::/32", "auto-merge", "hook output",
 	} {
 		if !strings.Contains(host, want) {
 			t.Errorf("host ruleset lacks %q", want)
@@ -625,13 +680,110 @@ func TestFirecrackerRulesetsDenyPrivateAndHost(t *testing.T) {
 			t.Errorf("host ruleset contains %q", banned)
 		}
 	}
-	netns := firecrackerNetnsRuleset()
 	for _, want := range []string{
 		"table inet sbx_vm", `iifname "sbxvm0" oifname "sbxsl0" meta nfproto ipv4 ip daddr != @deny4 accept`,
-		`oifname "sbxsl0" masquerade`, "policy drop", "10.0.0.0/8",
+		`oifname "sbxsl0" masquerade`, "policy drop", "10.0.0.0/8", "168.63.129.16/32", "203.0.113.0/24",
 	} {
 		if !strings.Contains(netns, want) {
 			t.Errorf("namespace ruleset lacks %q", want)
 		}
+	}
+}
+
+// The VMM owns <chroot> and <chroot>/run. Whatever it puts there, the root
+// daemon must only ever connect to a socket the VMM UID owns at exactly
+// that place, never follow a symlink to another socket.
+func TestFirecrackerDialRefusesReplacedSocket(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	if _, err := d.Create(ctx, Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	runCommand := func() error {
+		_, err := d.Run(ctx, fcTestID, Command{Args: []string{"true"}}, io.Discard, io.Discard)
+		return err
+	}
+	if err := runCommand(); err != nil {
+		t.Fatalf("baseline run: %v", err)
+	}
+	// Another root-reachable socket that must never see a connection.
+	other := t.TempDir()
+	decoy, err := listenUnixIn(other, fcVsockName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoy.Close()
+	accepted := make(chan struct{}, 4)
+	go func() {
+		for {
+			conn, err := decoy.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_ = conn.Close()
+		}
+	}()
+	src := filepath.Join(t.TempDir(), "src")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := filepath.Join(d.chroot(fcTestID), fcVsockDir)
+	sock := filepath.Join(run, fcVsockName)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, c := range map[string]struct{ replace, restore func() }{
+		"socket symlink": {
+			func() { must(os.Rename(sock, sock+".orig")); must(os.Symlink(filepath.Join(other, fcVsockName), sock)) },
+			func() { must(os.Remove(sock)); must(os.Rename(sock+".orig", sock)) },
+		},
+		"run dir symlink": {
+			func() { must(os.Rename(run, run+".orig")); must(os.Symlink(other, run)) },
+			func() { must(os.Remove(run)); must(os.Rename(run+".orig", run)) },
+		},
+		"regular file": {
+			func() { must(os.Rename(sock, sock+".orig")); must(os.WriteFile(sock, nil, 0o600)) },
+			func() { must(os.Remove(sock)); must(os.Rename(sock+".orig", sock)) },
+		},
+		"foreign owner": {
+			func() { host.mu.Lock(); host.ownerShift = 1; host.mu.Unlock() },
+			func() { host.mu.Lock(); host.ownerShift = 0; host.mu.Unlock() },
+		},
+	} {
+		c.replace()
+		if err := runCommand(); err == nil {
+			t.Errorf("%s: run connected", name)
+		}
+		if err := d.CopyIn(ctx, fcTestID, src, "/home/user/x"); err == nil {
+			t.Errorf("%s: copy-in connected", name)
+		}
+		c.restore()
+		if err := runCommand(); err != nil {
+			t.Fatalf("%s: run after restore: %v", name, err)
+		}
+	}
+	select {
+	case <-accepted:
+		t.Fatal("the decoy socket received a connection")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// Control: a plain path connect, as the daemon did before, follows the
+	// symlink to the decoy.
+	must(os.Rename(sock, sock+".orig"))
+	must(os.Symlink(filepath.Join(other, fcVsockName), sock))
+	fd, err := unix.Open(run, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	must(err)
+	defer unix.Close(fd)
+	conn, err := net.Dial("unix", fmt.Sprintf("/proc/self/fd/%d/%s", fd, fcVsockName))
+	must(err)
+	_ = conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: plain connect did not reach the decoy")
 	}
 }

@@ -439,7 +439,58 @@ func (h *linuxFCHost) StartVMM(ctx context.Context, jailer string, args []string
 	return nil
 }
 
-func (h *linuxFCHost) Dial(ctx context.Context, path string) (net.Conn, error) {
+func (h *linuxFCHost) Dial(ctx context.Context, chroot string, owner int) (net.Conn, error) {
+	return dialJailSocket(ctx, chroot, owner)
+}
+
+// dialJailSocket connects to the VMM's vsock socket <chroot>/run/v.sock
+// without following anything the VMM can replace. The VMM owns <chroot> and
+// <chroot>/run, so each component is opened beneath the root-owned jail
+// directory with O_NOFOLLOW; the run directory and the socket must belong to
+// owner; and the connection goes to the opened socket inode through
+// /proc/self/fd/N, never through a path that is resolved again. This also
+// keeps sun_path short whatever the install directory.
+func dialJailSocket(ctx context.Context, chroot string, owner int) (net.Conn, error) {
+	const flags = unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	dir, err := unix.Open(filepath.Dir(chroot), flags|unix.O_DIRECTORY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open jail: %w", err)
+	}
+	defer unix.Close(dir)
+	for _, name := range []string{filepath.Base(chroot), fcVsockDir} {
+		next, err := unix.Openat(dir, name, flags|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, fmt.Errorf("open jail directory %q: %w", name, err)
+		}
+		defer unix.Close(next)
+		dir = next
+	}
+	if err := checkOwned(dir, unix.S_IFDIR, owner); err != nil {
+		return nil, fmt.Errorf("jail socket directory: %w", err)
+	}
+	sock, err := unix.Openat(dir, fcVsockName, flags, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open jail socket: %w", err)
+	}
+	defer unix.Close(sock)
+	if err := checkOwned(sock, unix.S_IFSOCK, owner); err != nil {
+		return nil, fmt.Errorf("jail socket: %w", err)
+	}
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "unix", path)
+	return dialer.DialContext(ctx, "unix", "/proc/self/fd/"+strconv.Itoa(sock))
+}
+
+// checkOwned requires fd to be of the given file type and owned by owner.
+func checkOwned(fd int, kind uint32, owner int) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return err
+	}
+	if stat.Mode&unix.S_IFMT != kind {
+		return fmt.Errorf("unexpected file type %#o", stat.Mode&unix.S_IFMT)
+	}
+	if int(stat.Uid) != owner {
+		return fmt.Errorf("owned by uid %d, want %d", stat.Uid, owner)
+	}
+	return nil
 }
