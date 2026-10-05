@@ -279,6 +279,9 @@ another guest user.
   and the review image module cache.
 - [Operating the PF helper](docs/compatibility.md#operating-the-pf-helper):
   install, updates, logs and uninstall.
+- [`docs/firecracker.md`](docs/firecracker.md): the Linux/KVM worker
+  (`-driver firecracker`), its isolation and egress model, and how to
+  install and rebuild its artifacts.
 - [`images/linux-arm64/Dockerfile`](images/linux-arm64/Dockerfile): the
   guest image.
 
