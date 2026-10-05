@@ -858,3 +858,70 @@ func TestDefaultClientBoundsTransport(t *testing.T) {
 		t.Fatalf("default worker client transport is unbounded: %+v", client.client.Transport)
 	}
 }
+
+// raceDriver holds a Create inside the driver and a List after its snapshot,
+// so a test can order them exactly.
+type raceDriver struct {
+	*fakeDriver
+	createEntered, createGate chan struct{}
+	listTaken, listGate       chan struct{}
+}
+
+func (d *raceDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) {
+	close(d.createEntered)
+	<-d.createGate
+	return d.fakeDriver.Create(ctx, spec)
+}
+
+func (d *raceDriver) List(ctx context.Context) ([]vm.Instance, error) {
+	snapshot, err := d.fakeDriver.List(ctx)
+	close(d.listTaken)
+	<-d.listGate
+	return snapshot, err
+}
+
+// A Create that starts before Reap's generation snapshot and finishes after
+// Reap's List keeps its end time: Reap saw neither the VM nor its creating
+// mark, but the end time was re-stamped as the Create finished.
+func TestReapKeepsEndTimeOfCreateSpanningInventory(t *testing.T) {
+	driver := &raceDriver{fakeDriver: newFake(), createEntered: make(chan struct{}), createGate: make(chan struct{}),
+		listTaken: make(chan struct{}), listGate: make(chan struct{})}
+	server, ts := serve(t, driver)
+	start := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	server.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	client := enrolled(t, ts.URL, 1)
+	ctx := context.Background()
+
+	created := make(chan error, 1)
+	go func() {
+		_, err := client.CreateUntil(ctx, spec(vmA), start.Add(time.Minute))
+		created <- err
+	}()
+	<-driver.createEntered // end time set, creating marked, VM not yet listed
+	reaped := make(chan error, 1)
+	go func() { reaped <- server.Reap(ctx) }()
+	<-driver.listTaken // snapshot taken after the end time; it misses the VM
+	close(driver.createGate)
+	if err := <-created; err != nil { // creating cleared before Reap prunes
+		t.Fatal(err)
+	}
+	close(driver.listGate)
+	if err := <-reaped; err != nil {
+		t.Fatal(err)
+	}
+
+	driver.listTaken, driver.listGate = make(chan struct{}), make(chan struct{})
+	close(driver.listGate)
+	clock.Store(start.Add(2 * time.Minute).UnixNano())
+	if err := server.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	driver.mu.Lock()
+	_, alive := driver.vms[vmA]
+	driver.mu.Unlock()
+	if alive {
+		t.Fatal("VM outlived the gateway's end time: Reap pruned the end time of a Create that spanned its inventory")
+	}
+}

@@ -267,6 +267,13 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, leaseCtx context
 			CPUs: request.CPUs, MemoryMiB: request.MemoryMiB})
 		s.mu.Lock()
 		delete(s.creating, request.ID)
+		// Re-stamp the end time as the VM becomes visible: a Reap whose
+		// inventory was taken while this Create ran saw neither the VM nor the
+		// creating mark, and must not prune the end time as stale.
+		if _, known := s.ends[request.ID]; known {
+			s.gen++
+			s.endsGen[request.ID] = s.gen
+		}
 		s.mu.Unlock()
 		// A newer gateway enrolled while this Create ran: the caller no longer
 		// owns this worker and must not admit the VM. The new owner's
