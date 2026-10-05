@@ -118,7 +118,7 @@ func TestTwoSlotsArmExactMultiBridgePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := h.s.policyFor([]string{"bridge110", "bridge111"}, "en0", 8443, host)
+	want := h.s.policyFor([]string{"bridge110", "bridge111"}, "en0", 8443, host, true)
 	if len(h.loadedText) != 1 || h.loadedText[0] != want.Load {
 		t.Fatalf("loaded policy is not the exact two-slot egress policy:\n%q", h.loadedText)
 	}
@@ -168,14 +168,14 @@ func TestTwoSlotsArmExactMultiBridgePolicy(t *testing.T) {
 		"LAN forwarding open":                      strings.Replace(readback, "\nblock drop in quick on ! lo0 inet from any to ! <sandboxd_host>", "", 1),
 		"forwarding block on lo0 only": strings.Replace(readback, "block drop in quick on ! lo0 inet from any to ! <sandboxd_host>",
 			"block drop in quick on lo0 inet from any to ! <sandboxd_host>", 1),
-		"one slot only": h.s.policyFor([]string{"bridge110"}, "en0", 8443, nil).Filter,
+		"one slot only": h.s.policyFor([]string{"bridge110"}, "en0", 8443, nil, true).Filter,
 	} {
 		h.filter = filter
 		if _, err := h.s.check(ctx); err == nil {
 			t.Errorf("%s: check accepted it", name)
 		}
 	}
-	h.filter = h.s.policyFor([]string{"bridge110"}, "en0", 8443, nil).Filter
+	h.filter = h.s.policyFor([]string{"bridge110"}, "en0", 8443, nil, true).Filter
 	if _, err := h.s.arm(ctx); err == nil || !strings.Contains(err.Error(), "unexpected firewall policy") {
 		t.Fatalf("replaced an unexpected partial anchor: %v", err)
 	}
@@ -398,10 +398,10 @@ func TestArmReplacesOnlyThisHelpersAnchors(t *testing.T) {
 		"optimizer order": {"block drop in quick on bridge110 inet all\nblock drop in quick on bridge111 inet all\n" +
 			"block drop in quick on bridge110 inet6 all\nblock drop in quick on bridge111 inet6 all", ""},
 		"legacy relay on another port":  {legacyFilter(bridges, other.relayAddress(), other.subnets(), 8080), ""},
-		"egress relay on another port":  {other.policyFor(bridges, "en0", 8080, nil).Filter, other.policyFor(bridges, "en0", 8080, nil).NAT},
+		"egress relay on another port":  {other.policyFor(bridges, "en0", 8080, nil, true).Filter, other.policyFor(bridges, "en0", 8080, nil, true).NAT},
 		"legacy anchor with a NAT rule": {legacyDenyAll, "nat on en0 inet from any to any -> (en0) round-robin"},
-		"egress anchor without NAT":     {current.policyFor(bridges, "en0", 43181, nil).Filter, ""},
-		"egress anchor with foreign NAT": {current.policyFor(bridges, "en0", 43181, nil).Filter,
+		"egress anchor without NAT":     {current.policyFor(bridges, "en0", 43181, nil, true).Filter, ""},
+		"egress anchor with foreign NAT": {current.policyFor(bridges, "en0", 43181, nil, true).Filter,
 			"nat on en0 inet from any to any -> (en0) round-robin\nnat on en0 inet from any to any -> (en0) round-robin"},
 	} {
 		h := newTwoSlotHost(t, 43181)
@@ -417,9 +417,11 @@ func TestArmReplacesOnlyThisHelpersAnchors(t *testing.T) {
 	for name, loaded := range map[string][2]string{
 		"pre-egress deny-all":    {legacyDenyAll, ""},
 		"pre-egress relay":       {legacyRelay, ""},
-		"egress with relay off":  {current.policyFor(bridges, "en0", 0, nil).Filter, current.policyFor(bridges, "en0", 0, nil).NAT},
-		"egress out of en1":      {current.policyFor(bridges, "en1", 43181, nil).Filter, current.policyFor(bridges, "en1", 43181, nil).NAT},
-		"egress with old tables": {current.policyFor(bridges, "en0", 43181, nil).Filter, current.policyFor(bridges, "en0", 43181, nil).NAT},
+		"egress with relay off":  {current.policyFor(bridges, "en0", 0, nil, true).Filter, current.policyFor(bridges, "en0", 0, nil, true).NAT},
+		"egress out of en1":      {current.policyFor(bridges, "en1", 43181, nil, true).Filter, current.policyFor(bridges, "en1", 43181, nil, true).NAT},
+		"egress with old tables": {current.policyFor(bridges, "en0", 43181, nil, true).Filter, current.policyFor(bridges, "en0", 43181, nil, true).NAT},
+		"egress without the forwarding guard": {current.policyFor(bridges, "en0", 43181, nil, false).Filter,
+			current.policyFor(bridges, "en0", 43181, nil, false).NAT},
 	} {
 		h := newTwoSlotHost(t, 43181)
 		h.setLoaded(loaded[0], loaded[1])
@@ -430,7 +432,7 @@ func TestArmReplacesOnlyThisHelpersAnchors(t *testing.T) {
 			t.Errorf("%s: did not replace it: %q %v", name, got, err)
 			continue
 		}
-		want := h.s.policyFor(bridges, "en0", 43181, nil)
+		want := h.s.policyFor(bridges, "en0", 43181, nil, true)
 		if len(h.loadedText) != 1 || h.filter != want.Filter || h.nat != want.NAT || !strings.Contains(h.filter, "to 192.168.130.1 port = 43181") {
 			t.Errorf("%s: not replaced by the egress policy:\n%s\n%s", name, h.filter, h.nat)
 		}
@@ -490,7 +492,7 @@ func TestDisarmClearsOnlyTheExactMultiSlotAnchor(t *testing.T) {
 	if err := h.s.disarm(ctx); err == nil {
 		t.Fatal("cleared an unexpected anchor")
 	}
-	h.filter = h.s.policyFor([]string{"bridge110"}, "en0", 0, nil).Filter
+	h.filter = h.s.policyFor([]string{"bridge110"}, "en0", 0, nil, true).Filter
 	if err := h.s.disarm(ctx); err == nil {
 		t.Fatal("cleared an anchor in a foreign shape")
 	}
@@ -573,6 +575,20 @@ func TestDisarmRestoresIPForwarding(t *testing.T) {
 		if _, err := h.s.arm(ctx); err != nil || !h.forwarding {
 			t.Fatalf("before=%v: arm did not leave forwarding on: %v", before, err)
 		}
+		// Only forwarding the helper turned on is guarded; an exit node's or
+		// OrbStack's routing is left alone.
+		if guarded := strings.Contains(h.filter, "on ! lo0 inet from any to ! <sandboxd_host>"); guarded == before {
+			t.Fatalf("before=%v: forwarding guard present=%v", before, guarded)
+		}
+		if _, err := h.s.check(ctx); err != nil {
+			t.Fatalf("before=%v: check refused the recorded shape: %v", before, err)
+		}
+		armed := h.filter
+		h.filter = h.s.policyFor([]string{"bridge110", "bridge111"}, "en0", 0, nil, before).Filter
+		if _, err := h.s.check(ctx); err == nil {
+			t.Fatalf("before=%v: check accepted the other forwarding shape", before)
+		}
+		h.filter = armed
 		if before && h.forwardingWrites != 0 {
 			t.Fatalf("before=%v: arm rewrote a forwarding that was already on", before)
 		}

@@ -66,25 +66,125 @@ func golden(t *testing.T, name, got string) {
 
 func TestThreeSlotEgressRulesetGolden(t *testing.T) {
 	s := threeSlotServer(t)
-	p := s.policyFor(threeBridges, "en0", 43181, macHost)
-	golden(t, "egress-3slot.pf", p.Load)
-	golden(t, "egress-3slot.readback", "# pfctl -a "+anchor+" -sr\n"+p.Filter+"\n# pfctl -a "+anchor+" -sn\n"+p.NAT+"\n")
+	// guard: forwarding was off before the first arm, so the helper turned it
+	// on and guards it; otherwise the operator's routing is left alone.
+	for name, guard := range map[string]bool{"forwarding-off": true, "forwarding-on": false} {
+		p := s.policyFor(threeBridges, "en0", 43181, macHost, guard)
+		golden(t, "egress-3slot-"+name+".pf", p.Load)
+		golden(t, "egress-3slot-"+name+".readback", "# pfctl -a "+anchor+" -sr\n"+p.Filter+"\n# pfctl -a "+anchor+" -sn\n"+p.NAT+"\n")
 
-	// The helper's prediction of pfctl's readback is what the pfctl model
-	// prints for the loaded text, with and without the optimizer off.
-	filter, nat, tables, err := pfctlLoad(p.Load, false)
-	if err != nil {
-		t.Fatal(err)
+		// The helper's prediction of pfctl's readback is what the pfctl model
+		// prints for the loaded text, with and without the optimizer off.
+		filter, nat, tables, err := pfctlLoad(p.Load, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if filter != p.Filter || nat != p.NAT {
+			t.Fatalf("%s: readback prediction differs from pfctl:\n%s\n%s", name, filter, nat)
+		}
+		if !samePrefixes(tables[denyTable], s.deny) || !samePrefixes(tables[hostTable], macHost) ||
+			!samePrefixes(tables[guestsTable], s.subnets()) {
+			t.Fatalf("%s: loaded tables differ: %v", name, tables)
+		}
+		if optimized, _, _, _ := pfctlLoad(p.Load, true); optimized == p.Filter {
+			t.Fatal("the pfctl model no longer reorders inet6 rules; -o none is untested")
+		}
 	}
-	if filter != p.Filter || nat != p.NAT {
-		t.Fatalf("readback prediction differs from pfctl:\n%s\n%s", filter, nat)
+}
+
+// verdict is the anchor's decision for an IPv4 packet (not TCP to the relay)
+// arriving on iface: "block", "pass" or "" when no rule matches and the
+// Mac's main ruleset (pass by default) decides. It understands exactly the
+// rule shapes render prints.
+func verdict(t *testing.T, filter string, tables map[string][]netip.Prefix, iface, src, dst string) string {
+	t.Helper()
+	from, to := netip.MustParseAddr(src), netip.MustParseAddr(dst)
+	inTable := func(name string, addr netip.Addr) bool {
+		return slices.ContainsFunc(tables[name], func(p netip.Prefix) bool { return p.Contains(addr) })
 	}
-	if !samePrefixes(tables[denyTable], s.deny) || !samePrefixes(tables[hostTable], macHost) ||
-		!samePrefixes(tables[guestsTable], s.subnets()) {
-		t.Fatalf("loaded tables differ: %v", tables)
+	for _, line := range strings.Split(filter, "\n") {
+		action, rest, _ := strings.Cut(line, " in quick ")
+		if strings.Contains(rest, " proto tcp ") || strings.HasSuffix(rest, " inet6 all") {
+			continue
+		}
+		if on, ok := strings.CutPrefix(rest, "on "); ok {
+			name, after, _ := strings.Cut(on, " ")
+			if name == "!" {
+				name, after, _ = strings.Cut(after, " ")
+				if iface == name {
+					continue
+				}
+			} else if iface != name {
+				continue
+			}
+			rest = after
+		}
+		rest = strings.TrimSuffix(strings.TrimPrefix(rest, "inet"), " flags S/SA keep state")
+		match := false
+		switch {
+		case rest == " all":
+			match = true
+		case strings.HasPrefix(rest, " from any to ! <"):
+			match = !inTable(strings.TrimSuffix(strings.TrimPrefix(rest, " from any to ! <"), ">"), to)
+		case strings.HasPrefix(rest, " from any to <"):
+			match = inTable(strings.TrimSuffix(strings.TrimPrefix(rest, " from any to <"), ">"), to)
+		case strings.HasPrefix(rest, " from ") && strings.HasSuffix(rest, " to any"):
+			match = netip.MustParsePrefix(strings.TrimSuffix(strings.TrimPrefix(rest, " from "), " to any")).Contains(from)
+		default:
+			t.Fatalf("verdict does not understand %q", line)
+		}
+		if match {
+			return strings.TrimSuffix(action, " drop")
+		}
 	}
-	if optimized, _, _, _ := pfctlLoad(p.Load, true); optimized == p.Filter {
-		t.Fatal("the pfctl model no longer reorders inet6 rules; -o none is untested")
+	return ""
+}
+
+// Forwarding the helper turned on serves only guests; forwarding the
+// operator already had (a Tailscale exit node, OrbStack) is left alone.
+func TestForwardingGuardFollowsTheRecordedForwarding(t *testing.T) {
+	s := threeSlotServer(t)
+	for _, guard := range []bool{true, false} {
+		p := s.policyFor(threeBridges, "en0", 43181, macHost, guard)
+		_, _, tables, err := pfctlLoad(p.Load, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(p.Filter, "to ! <"+hostTable+">") != guard {
+			t.Fatalf("guard=%v: catch-all presence is wrong:\n%s", guard, p.Filter)
+		}
+		forwarded := map[string]bool{
+			// Exit node: a tailnet peer's internet traffic in on utun, out en0.
+			"exit node utun to internet": verdict(t, p.Filter, tables, "utun3", "100.101.102.103", "1.1.1.1") == "",
+			// A LAN host using the Mac as its gateway into the tailnet.
+			"LAN to tailnet": verdict(t, p.Filter, tables, "en0", "192.168.1.30", "100.101.102.103") == "",
+			// OrbStack's own NAT network reaching the internet.
+			"OrbStack bridge to internet": verdict(t, p.Filter, tables, "bridge100", "192.168.139.2", "1.1.1.1") == "",
+		}
+		for name, open := range forwarded {
+			if open == guard {
+				t.Errorf("guard=%v: %s forwarded=%v", guard, name, open)
+			}
+		}
+		// Either way: guests reach the internet only, the Mac stays reachable,
+		// and no other interface reaches a guest.
+		for _, c := range []struct{ iface, src, dst, want string }{
+			{"bridge103", "192.168.130.5", "1.1.1.1", "pass"},
+			{"bridge103", "192.168.130.5", "192.168.1.20", "block"},
+			{"bridge103", "192.168.130.5", "100.111.92.43", "block"},
+			{"bridge103", "192.168.130.5", "192.168.131.5", "block"},
+			{"en0", "192.168.1.30", "192.168.1.20", ""},
+			{"en0", "192.168.1.30", "224.0.0.251", ""},
+			{"en0", "192.168.1.30", "192.168.1.255", ""},
+			{"utun3", "100.101.102.103", "100.111.92.43", ""},
+			{"lo0", "127.0.0.1", "127.0.0.1", ""},
+			{"en0", "192.168.1.30", "192.168.130.5", "block"},
+			{"utun3", "100.101.102.103", "192.168.128.9", "block"},
+		} {
+			if got := verdict(t, p.Filter, tables, c.iface, c.src, c.dst); got != c.want {
+				t.Errorf("guard=%v: %s %s -> %s = %q, want %q", guard, c.iface, c.src, c.dst, got, c.want)
+			}
+		}
 	}
 }
 
@@ -94,7 +194,7 @@ func TestThreeSlotEgressRulesetGolden(t *testing.T) {
 func TestEveryDeniedRangeAndHostAddressIsInTheAnchor(t *testing.T) {
 	extra := []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("2001:db8::/32")}
 	s := threeSlotServer(t, extra...)
-	p := s.policyFor(threeBridges, "en0", 43181, macHost)
+	p := s.policyFor(threeBridges, "en0", 43181, macHost, true)
 	_, _, tables, err := pfctlLoad(p.Load, false)
 	if err != nil {
 		t.Fatal(err)

@@ -410,11 +410,12 @@ holds, in this order:
   gateway on its one port; block to `<sandboxd_deny>`; block to
   `<sandboxd_host>`; pass from the slot's own subnet to anything else; block
   all other IPv4 and all IPv6;
-- then, for every other interface: block anything for a guest subnet, and
+- then, for every other interface: block anything for a guest subnet, and,
+  only if forwarding was off before the first arm (below),
   `block in quick on ! lo0 inet from any to ! <sandboxd_host>`. Slot bridge
-  packets never get this far, so the only IPv4 the Mac forwards is guest
-  NAT egress: a LAN, VPN or Tailscale host that uses the Mac as its gateway
-  is not routed anywhere.
+  packets never get this far, so then the only IPv4 the Mac forwards is
+  guest NAT egress: a LAN, VPN or Tailscale host that uses the Mac as its
+  gateway is not routed anywhere.
 
 So a guest never reaches private networks, the Mac (every port except the
 relay's, including its resolver) or another guest, in either direction.
@@ -422,22 +423,29 @@ Guests use the public resolvers `1.1.1.1` and `8.8.8.8` (`container create
 --dns`). The check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock
 macOS has it), exact filter and NAT readback, and exact deny and guest tables.
 
-**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. After
-loading the anchor, the first arm records the previous value in
+**IPv4 forwarding.** Guest NAT needs `net.inet.ip.forwarding=1`. Before
+loading the anchor, the first arm records the current value in
 `/var/run/sandboxd-pf/ip-forwarding-before-arm` (beside the socket; macOS
-clears it at boot, when the sysctl resets too), then turns forwarding on if
-it was off. Later arms and helper restarts keep that record. Disarm (sandboxd's
-clean shutdown, after its guests are gone) turns forwarding off again only
-if it was off before, and removes the record; if something else (Internet
-Sharing, a VPN or Tailscale subnet router) had it on, it stays on. While the
-anchor is loaded, the last rule above also stops other forwarding on the
-Mac, including Apple's own vmnet NAT networks (such as the default
-`container` network on `bridge100`) and Internet Sharing; stop `sandboxd`
-to give it back. IPv6 forwarding is never touched.
+clears it at boot, when the sysctl resets too); later arms and helper
+restarts keep that record, and the expected anchor and its check follow it:
 
-`internal/firewall/testdata/egress-3slot.*` is the generated ruleset for the
-three-slot Mac. A per-slot deny-all mode exists in the generator for
-`allow_internet_access:false` (M4) but is not reachable from the API yet.
+- **Off before** (`0`): the helper turns forwarding on and adds the
+  catch-all above, so it creates no routing reach beyond guest NAT.
+- **On before** (`1`): the operator routes on purpose, for example a
+  Tailscale exit node or subnet router, OrbStack or Docker's NAT network
+  (`bridge100`), or Internet Sharing. The anchor has no catch-all, so that
+  routing works exactly as before; every guest rule and the block of other
+  interfaces reaching guest subnets stay.
+
+Disarm (sandboxd's clean shutdown, after its guests are gone) turns
+forwarding off again only if the record says `0`, then removes the record;
+forwarding that was on stays on. IPv6 forwarding is never touched. The host
+table is refreshed in both cases, since guests are denied its addresses.
+
+`internal/firewall/testdata/egress-3slot-forwarding-{off,on}.*` are the
+generated rulesets for the three-slot Mac. A per-slot deny-all mode exists in
+the generator for `allow_internet_access:false` (M4) but is not reachable
+from the API yet.
 
 Guest egress needs a new helper release: the owner installs it with
 `sudo sandboxd-helper-update`, then restarts `sandboxd`. Its first arm

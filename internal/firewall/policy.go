@@ -42,6 +42,10 @@ type policyInput struct {
 	Egress string
 	Deny   []netip.Prefix
 	Host   []netip.Prefix
+	// GuardForwarding adds the catch-all that keeps the Mac from forwarding
+	// anything but guest traffic. Set only when this helper turned IPv4
+	// forwarding on; routing the operator already had is left alone.
+	GuardForwarding bool
 }
 
 // pfPolicy is the anchor file the helper loads and pfctl's readback of it:
@@ -55,11 +59,12 @@ type pfPolicy struct {
 // special ranges (internal/egress) and every Mac address; pass the slot's
 // own subnet to the rest of the internet, NATed out of Egress; drop all
 // other IPv4 and all IPv6. Every slot bridge packet stops there. Then,
-// for every other interface: nothing reaches a guest subnet, and IPv4 that
-// is not for the Mac itself (the host table) is dropped, so the IP
-// forwarding guest NAT needs never routes a LAN or VPN host through the Mac.
-// Loopback is left alone. Guests on another slot are in the private ranges,
-// so they are denied in both directions by each bridge's own rules.
+// for every other interface: nothing reaches a guest subnet, and, with
+// GuardForwarding, IPv4 that is not for the Mac itself (the host table) is
+// dropped, so the forwarding guest NAT needs never routes a LAN or VPN host
+// through the Mac. Loopback is left alone. Guests on another slot are in the
+// private ranges, so they are denied in both directions by each bridge's
+// own rules.
 func render(in policyInput) pfPolicy {
 	var load, filter, nat []string
 	guests := make([]netip.Prefix, len(in.Slots))
@@ -97,10 +102,12 @@ func render(in policyInput) pfPolicy {
 		load = append(load, "block in"+on+" inet from any to any", "block in"+on+" inet6 from any to any")
 		filter = append(filter, "block drop in"+on+" inet all", "block drop in"+on+" inet6 all")
 	}
-	load = append(load, "block in quick inet from any to <"+guestsTable+">",
-		"block in quick on ! lo0 inet from any to ! <"+hostTable+">")
-	filter = append(filter, "block drop in quick inet from any to <"+guestsTable+">",
-		"block drop in quick on ! lo0 inet from any to ! <"+hostTable+">")
+	load = append(load, "block in quick inet from any to <"+guestsTable+">")
+	filter = append(filter, "block drop in quick inet from any to <"+guestsTable+">")
+	if in.GuardForwarding {
+		load = append(load, "block in quick on ! lo0 inet from any to ! <"+hostTable+">")
+		filter = append(filter, "block drop in quick on ! lo0 inet from any to ! <"+hostTable+">")
+	}
 	return pfPolicy{Load: strings.Join(load, "\n") + "\n", Filter: strings.Join(filter, "\n"), NAT: strings.Join(nat, "\n")}
 }
 

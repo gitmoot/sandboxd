@@ -208,14 +208,14 @@ func (s *Server) subnets() []netip.Prefix {
 // policyFor is the anchor for bridges, one per slot in slot order. Every
 // slot has internet egress; render's per-slot deny-all mode is not wired to
 // sandboxes yet. host only fills the loaded host table: the readback does
-// not depend on it.
-func (s *Server) policyFor(bridges []string, egress string, relayPort int, host []netip.Prefix) pfPolicy {
+// not depend on it. guard adds the forwarding guard (guardForwarding).
+func (s *Server) policyFor(bridges []string, egress string, relayPort int, host []netip.Prefix, guard bool) pfPolicy {
 	slots := make([]slotRules, len(bridges))
 	for i, bridge := range bridges {
 		slots[i] = slotRules{Bridge: bridge, Subnet: s.config.Slots[i].IPv4, Internet: true}
 	}
 	return render(policyInput{Slots: slots, RelayAddr: s.relayAddress(), RelayPort: relayPort,
-		Egress: egress, Deny: s.deny, Host: host})
+		Egress: egress, Deny: s.deny, Host: host, GuardForwarding: guard})
 }
 
 // known reports whether the loaded anchor is, for bridges, one this helper
@@ -233,8 +233,10 @@ func (s *Server) known(bridges []string, filter, nat string) bool {
 			return true
 		}
 		if egress != "" {
-			if p := s.policyFor(bridges, egress, port, nil); filter == p.Filter && nat == p.NAT {
-				return true
+			for _, guard := range []bool{true, false} {
+				if p := s.policyFor(bridges, egress, port, nil, guard); filter == p.Filter && nat == p.NAT {
+					return true
+				}
 			}
 		}
 	}
@@ -467,8 +469,12 @@ func (s *Server) check(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	guard, err := s.guardForwarding()
+	if err != nil {
+		return "", err
+	}
 	egress, ok := natEgress(nat)
-	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil)
+	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, guard)
 	if !ok || filter != want.Filter || nat != want.NAT {
 		return "", fmt.Errorf("firewall anchor does not contain the exact scoped policy for %s; pfctl reports %q and NAT %q",
 			strings.Join(bridges, ","), truncate(filter, 600), truncate(nat, 300))
@@ -501,7 +507,11 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, host)
+	guard, err := s.recordForwarding(ctx)
+	if err != nil {
+		return "", err
+	}
+	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, host, guard)
 	filter, nat, err := s.loaded(ctx)
 	if err != nil {
 		return "", err
@@ -549,21 +559,31 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 }
 
 // forwardingSysctl must be on for guest NAT, as Apple's own vmnet NAT
-// networks need. The anchor lets only guest bridges' traffic be forwarded:
-// on every other interface IPv4 may only reach the Mac itself.
+// networks need.
 const forwardingSysctl = "net.inet.ip.forwarding"
 
 // forwardingState records the value forwarding had before this helper first
-// turned it on, so disarm restores it. It lives beside the socket under
-// /var/run, which macOS clears at boot just as it resets the sysctl.
+// armed, so disarm restores it and the anchor knows whether to guard it. It
+// lives beside the socket under /var/run, which macOS clears at boot just
+// as it resets the sysctl.
 func (s *Server) forwardingState() string {
 	return filepath.Join(filepath.Dir(s.config.SocketPath), "ip-forwarding-before-arm")
 }
 
-// route turns on IPv4 forwarding once the anchor is loaded, first recording
-// its previous value unless an earlier arm already did. Then it clears the
-// bridges' states and checks.
-func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
+// forwardingBefore is the recorded value, "0" or "1".
+func (s *Server) forwardingBefore() (string, error) {
+	data, err := os.ReadFile(s.forwardingState())
+	if err != nil {
+		return "", err
+	}
+	before := strings.TrimSpace(string(data))
+	if before != "0" && before != "1" {
+		return "", fmt.Errorf("unreadable IPv4 forwarding state in %s", s.forwardingState())
+	}
+	return before, nil
+}
+
+func (s *Server) currentForwarding(ctx context.Context) (string, error) {
 	out, err := s.run(ctx, "/usr/sbin/sysctl", "-n", forwardingSysctl)
 	if err != nil {
 		return "", fmt.Errorf("read IPv4 forwarding: %w", err)
@@ -572,11 +592,41 @@ func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
 	if current != "0" && current != "1" {
 		return "", fmt.Errorf("unexpected %s value %q", forwardingSysctl, current)
 	}
-	if _, err := os.Lstat(s.forwardingState()); errors.Is(err, os.ErrNotExist) {
-		if err := writeState(s.forwardingState(), current+"\n"); err != nil {
-			return "", fmt.Errorf("record IPv4 forwarding before arm: %w", err)
+	return current, nil
+}
+
+// guardForwarding reports whether the anchor must keep non-guest traffic
+// from being forwarded: only when this helper turned forwarding on. If it
+// was already on (a Tailscale exit node, OrbStack, Internet Sharing), the
+// operator routes on purpose and that routing is left as it was.
+func (s *Server) guardForwarding() (bool, error) {
+	before, err := s.forwardingBefore()
+	if err != nil {
+		return false, fmt.Errorf("no usable record of IPv4 forwarding before arm: %w", err)
+	}
+	return before == "0", nil
+}
+
+// recordForwarding records forwarding's current value unless an earlier arm
+// (before a helper restart, too) already did, and returns guardForwarding.
+func (s *Server) recordForwarding(ctx context.Context) (bool, error) {
+	if _, err := s.forwardingBefore(); errors.Is(err, os.ErrNotExist) {
+		current, err := s.currentForwarding(ctx)
+		if err != nil {
+			return false, err
 		}
-	} else if err != nil {
+		if err := writeState(s.forwardingState(), current+"\n"); err != nil {
+			return false, fmt.Errorf("record IPv4 forwarding before arm: %w", err)
+		}
+	}
+	return s.guardForwarding()
+}
+
+// route turns on IPv4 forwarding once the anchor is loaded, then clears the
+// bridges' states and checks.
+func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
+	current, err := s.currentForwarding(ctx)
+	if err != nil {
 		return "", err
 	}
 	if current == "0" {
@@ -590,21 +640,17 @@ func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
 // restoreForwarding turns forwarding off again only if it was off before
 // this helper's first arm; if someone else had it on, it stays on.
 func (s *Server) restoreForwarding(ctx context.Context) error {
-	data, err := os.ReadFile(s.forwardingState())
+	before, err := s.forwardingBefore()
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	switch strings.TrimSpace(string(data)) {
-	case "0":
+	if before == "0" {
 		if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
 			return fmt.Errorf("restore IPv4 forwarding: %w", err)
 		}
-	case "1":
-	default:
-		return fmt.Errorf("unreadable IPv4 forwarding state in %s", s.forwardingState())
 	}
 	return os.Remove(s.forwardingState())
 }
