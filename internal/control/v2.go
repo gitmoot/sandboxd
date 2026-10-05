@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -220,7 +221,7 @@ func (s *Service) connect(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	if request.Timeout != nil {
 		if end := time.Now().UTC().Add(ttl); end.After(row.Ends) {
-			if err := s.extend(r.Context(), id, m, end); err != nil {
+			if err := s.extend(r.Context(), id, m, end, true); err != nil {
 				s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "sandbox state unavailable")
 				return
 			}
@@ -295,7 +296,7 @@ func (s *Service) metricsE2B(w http.ResponseWriter, r *http.Request, row store.R
 // listFilter is the SDK list query: metadata, state, template, startedAfter
 // and order. Gitmoot sends none of them.
 type listFilter struct {
-	metadata     map[string]string
+	metadata     []metadataPair
 	running      bool // the state filter admits running sandboxes
 	template     string
 	startedAfter time.Time
@@ -313,13 +314,20 @@ func single(query url.Values, name string) (string, bool, error) {
 	return values[0], true, nil
 }
 
-// unescapeAgain undoes the JS SDK's second URL-encoding of metadata pairs;
-// values that are not escaped stay as they are.
-func unescapeAgain(value string) string {
-	if unescaped, err := url.QueryUnescape(value); err == nil {
-		return unescaped
+// metadataPair is one metadata filter term. Each side lists the forms it may
+// take: the JS SDK URL-encodes every key and value once more before encoding
+// the whole filter, the Python SDK does not, and neither says which it did.
+// A term matches a row holding any of its key forms with any of its value
+// forms, so a literal value such as "a%20b" still matches itself.
+type metadataPair struct{ keys, values []string }
+
+// encodingForms returns value as sent and, when it is itself well-formed
+// URL encoding of a different string, that string.
+func encodingForms(value string) []string {
+	if unescaped, err := url.QueryUnescape(value); err == nil && unescaped != value {
+		return []string{value, unescaped}
 	}
-	return value
+	return []string{value}
 }
 
 func parseListFilter(query url.Values, templates *registry) (listFilter, error) {
@@ -331,12 +339,11 @@ func parseListFilter(query url.Values, templates *registry) (listFilter, error) 
 		if err != nil {
 			return filter, errors.New("invalid metadata filter")
 		}
-		filter.metadata = make(map[string]string, len(pairs))
 		for key, values := range pairs {
 			if len(values) != 1 {
 				return filter, errors.New("invalid metadata filter")
 			}
-			filter.metadata[unescapeAgain(key)] = unescapeAgain(values[0])
+			filter.metadata = append(filter.metadata, metadataPair{keys: encodingForms(key), values: encodingForms(values[0])})
 		}
 	}
 	if values, ok := query["state"]; ok {
@@ -394,12 +401,21 @@ func (f listFilter) matches(row store.Row) bool {
 	if json.Unmarshal([]byte(row.Metadata), &metadata) != nil {
 		return false
 	}
-	for key, value := range f.metadata {
-		if got, ok := metadata[key]; !ok || got != value {
+	for _, pair := range f.metadata {
+		if !pair.matches(metadata) {
 			return false
 		}
 	}
 	return true
+}
+
+func (p metadataPair) matches(metadata map[string]string) bool {
+	for _, key := range p.keys {
+		if got, ok := metadata[key]; ok && slices.Contains(p.values, got) {
+			return true
+		}
+	}
+	return false
 }
 
 // listOrder returns the list's strict total order. Without an explicit order

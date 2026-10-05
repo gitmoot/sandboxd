@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -281,8 +282,12 @@ func TestStrictOnlyResponsesAreByteIdentical(t *testing.T) {
 	if unrouted := request(t, s, http.MethodDelete, "/sandboxes/nonexistingsandbox", nil); unrouted.Code != http.StatusNotFound || unrouted.Body.String() != "404 page not found\n" {
 		t.Fatalf("strict-only unrouted 404 changed: %d %q", unrouted.Code, unrouted.Body.String())
 	}
-	if v2 := request(t, s, http.MethodPost, "/v2/sandboxes", map[string]any{"templateID": "review-arm64"}); v2.Code != http.StatusBadRequest {
-		t.Fatalf("v2 create of a strict template: %d %s", v2.Code, v2.Body.String())
+	// Without an e2b template the v2 create and connect routes do not exist.
+	for _, path := range []string{"/v2/sandboxes", "/v2/sandboxes/" + ids[0] + "/connect"} {
+		v2 := request(t, s, http.MethodPost, path, map[string]any{"templateID": "review-arm64"})
+		if v2.Code != http.StatusNotFound || v2.Body.String() != "404 page not found\n" || v2.Header().Get("Content-Type") != "text/plain; charset=utf-8" {
+			t.Fatalf("strict-only POST %s changed: %d %q", path, v2.Code, v2.Body.String())
+		}
 	}
 }
 
@@ -460,7 +465,7 @@ func TestMixedInventoryKeepsStrictViewComplete(t *testing.T) {
 	strict2ID := decodeBody[e2bCreated](t, request(t, s, http.MethodPost, "/sandboxes", second2).Body).ID
 	first := createE2B(t, s, map[string]any{"templateID": "base", "metadata": map[string]string{"suite": "x", "n": "1"}})
 	time.Sleep(2 * time.Millisecond)
-	second := createE2B(t, s, map[string]any{"templateID": "sandboxd-base", "metadata": map[string]string{"suite": "x", "n": "2"}})
+	second := createE2B(t, s, map[string]any{"templateID": "sandboxd-base", "metadata": map[string]string{"suite": "x", "n": "2", "literal": "a%20b"}})
 
 	all := request(t, s, http.MethodGet, "/v2/sandboxes?limit=100", nil)
 	if all.Code != http.StatusOK || all.Header().Get("X-Total-Running") != "4" {
@@ -492,6 +497,20 @@ func TestMixedInventoryKeepsStrictViewComplete(t *testing.T) {
 	// The JS SDK encodes each metadata pair twice.
 	if ids, _ := listIDs(t, s, "?metadata="+url.QueryEscape(url.QueryEscape("n")+"="+url.QueryEscape("1"))); !slices.Equal(ids, []string{first.ID}) {
 		t.Fatalf("double-encoded metadata filter: %v", ids)
+	}
+	// A literal value that is itself URL encoding matches as each SDK sends
+	// it: Python URL-encodes the pairs once, JS encodes each key and value
+	// once more first.
+	for name, query := range map[string]string{
+		"python": url.QueryEscape("literal=" + url.QueryEscape("a%20b")),
+		"js":     url.QueryEscape("literal=" + url.QueryEscape(url.QueryEscape("a%20b"))),
+	} {
+		if ids, _ := listIDs(t, s, "?metadata="+query); !slices.Equal(ids, []string{second.ID}) {
+			t.Fatalf("%s literal %%-value filter: %v", name, ids)
+		}
+	}
+	if ids, _ := listIDs(t, s, "?metadata="+url.QueryEscape("literal=a b")); len(ids) != 0 {
+		t.Fatalf("decoded form of a literal %%-value matched: %v", ids)
 	}
 	for _, template := range []string{"base", "sandboxd-base"} {
 		if ids, _ := listIDs(t, s, "?template="+template); len(ids) != 2 || slices.Contains(ids, strictID) || slices.Contains(ids, strict2ID) {
@@ -643,5 +662,78 @@ func TestE2BSandboxesRunOnEnrolledWorkers(t *testing.T) {
 	}
 	if got := request(t, s, http.MethodDelete, "/sandboxes/"+sdk.ID, nil); got.Code != http.StatusNotFound {
 		t.Fatalf("second kill: %d", got.Code)
+	}
+}
+
+// TestConnectNeverShortensUnderConcurrentExtends: overlapping extensions, in
+// either order, leave the latest end time in the ledger; set_timeout still
+// sets the end time as asked.
+func TestConnectNeverShortensUnderConcurrentExtends(t *testing.T) {
+	driver := &meteredDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+	s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, mixedConfig(e2bBase, 1))
+	sdk := createE2B(t, s, map[string]any{"templateID": "base", "timeout": 60})
+	ends := func() time.Time {
+		t.Helper()
+		row, err := s.ledger.Get(context.Background(), sdk.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row.Ends
+	}
+	_, m, err := s.live(context.Background(), sdk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC()
+	later, earlier := base.Add(50*time.Minute), base.Add(20*time.Minute)
+	// Both callers read the row before either extended it, as two connects
+	// racing between their guard and their update would.
+	if err := s.extend(context.Background(), sdk.ID, m, later, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.extend(context.Background(), sdk.ID, m, earlier, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := ends(); !got.Equal(later) {
+		t.Fatalf("a later extension was undone: ends %v, want %v", got, later)
+	}
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := s.extend(context.Background(), sdk.ID, m, base.Add(time.Duration(30+i)*time.Minute), true); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := ends(); !got.Equal(later) {
+		t.Fatalf("concurrent shorter extensions moved the end: %v, want %v", got, later)
+	}
+	newest := base.Add(55 * time.Minute)
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			end := base.Add(time.Duration(51+i%4) * time.Minute)
+			if i == 7 {
+				end = newest
+			}
+			if err := s.extend(context.Background(), sdk.ID, m, end, true); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := ends(); !got.Equal(newest) {
+		t.Fatalf("overlapping extensions: ends %v, want the latest %v", got, newest)
+	}
+	// set_timeout (E2B semantics) may shorten.
+	if got := request(t, s, http.MethodPost, "/sandboxes/"+sdk.ID+"/timeout", map[string]any{"timeout": 30}); got.Code != http.StatusNoContent {
+		t.Fatalf("set_timeout: %d %s", got.Code, got.Body.String())
+	}
+	if got := ends(); !got.Before(base.Add(time.Minute)) {
+		t.Fatalf("set_timeout did not shorten: %v", got)
 	}
 }

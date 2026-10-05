@@ -425,7 +425,15 @@ func (s *Store) Adopt(ctx context.Context, id string, lease int64) error {
 	return err
 }
 
+// Extend sets a running row's end time, earlier or later (E2B set_timeout).
 func (s *Store) Extend(ctx context.Context, id string, end time.Time) error {
 	_, err := s.db.ExecContext(ctx, "UPDATE sandboxes SET ends_ns=? WHERE id=? AND state='running'", end.UnixNano(), id)
+	return err
+}
+
+// ExtendAtLeast moves a running row's end time to end only if that is later:
+// it never shortens a lifetime, whatever the order of concurrent callers.
+func (s *Store) ExtendAtLeast(ctx context.Context, id string, end time.Time) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE sandboxes SET ends_ns=MAX(ends_ns, ?) WHERE id=? AND state='running'", end.UnixNano(), id)
 	return err
 }

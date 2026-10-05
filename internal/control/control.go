@@ -328,11 +328,13 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if path == "/v2/sandboxes" && r.Method == http.MethodPost {
+	// Without an e2b template the v2 create and connect routes do not exist,
+	// exactly as before profiles: every such request is the plain route miss.
+	if path == "/v2/sandboxes" && r.Method == http.MethodPost && s.templates.e2b {
 		s.createV2(w, r)
 		return
 	}
-	if rest, ok := strings.CutPrefix(path, "/v2/sandboxes/"); ok {
+	if rest, ok := strings.CutPrefix(path, "/v2/sandboxes/"); ok && s.templates.e2b {
 		id, action, _ := strings.Cut(rest, "/")
 		if validID(id) && action == "connect" && r.Method == http.MethodPost {
 			s.connect(w, r, id)
@@ -817,7 +819,7 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
 		return
 	}
-	if err := s.extend(r.Context(), id, m, time.Now().UTC().Add(ttl)); err != nil {
+	if err := s.extend(r.Context(), id, m, time.Now().UTC().Add(ttl), false); err != nil {
 		s.fail(w, rowProfile(row.Profile), http.StatusServiceUnavailable, "sandbox state unavailable")
 		return
 	}
@@ -828,18 +830,38 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 // own; it must learn the new one before the ledger promises it. m.expiry keeps
 // a concurrent reconciliation from re-sending the older end time; it is held
 // only for this one bounded call, never across the worker's reconciliation.
-func (s *Service) extend(ctx context.Context, id string, m *member, ends time.Time) error {
+//
+// With onlyLater (connect), the end time only ever moves later: every end
+// time update for m's sandboxes holds m.expiry, so the ledger's end time read
+// under it is current, and neither the worker nor the ledger is sent an
+// earlier one by a caller that read the row before a concurrent extension.
+// Without it (set_timeout) the end time is set as asked, as on E2B.
+func (s *Service) extend(ctx context.Context, id string, m *member, ends time.Time, onlyLater bool) error {
 	callCtx, cancel := context.WithTimeout(ctx, workerTimeout)
 	defer cancel()
 	if err := m.expiry.lock(callCtx); err != nil {
 		return err
 	}
 	defer m.expiry.unlock()
+	if onlyLater {
+		s.mu.Lock()
+		row, err := s.ledger.Get(ctx, id)
+		s.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !ends.After(row.Ends) {
+			return nil
+		}
+	}
 	if err := m.api.Expire(callCtx, id, ends); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if onlyLater {
+		return s.ledger.ExtendAtLeast(ctx, id, ends)
+	}
 	return s.ledger.Extend(ctx, id, ends)
 }
 

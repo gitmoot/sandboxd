@@ -86,7 +86,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 			"a gateway (no -worker-key-file) also needs db, api-key-file, domain and gateway-host")
 	}
 	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0 || *tokenSecretFile != "") {
-		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and cannot enroll workers or register templates")
+		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and takes no -enroll, -template-arch or -token-secret-file")
 	}
 	if !local && len(enrolls) == 0 {
 		return fmt.Errorf("the none driver runs no VMs; it needs at least one -enroll worker")
