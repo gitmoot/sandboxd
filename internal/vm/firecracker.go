@@ -92,6 +92,11 @@ type FirecrackerDriver struct {
 
 	mu    sync.Mutex
 	armed string
+
+	// firewall is the one monitor that re-checks the host table for every
+	// running command and open envd stream, every firewallEvery.
+	firewall      fcFirewallMonitor
+	firewallEvery time.Duration
 }
 
 var (
@@ -229,7 +234,8 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	cfg.Images = slices.Clone(cfg.Images)
 	cfg.Slots = slices.Clone(cfg.Slots)
 	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
-	return &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host}, nil
+	return &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host,
+		firewallEvery: time.Second}, nil
 }
 
 func prefixStrings(prefixes []netip.Prefix) []string {
@@ -339,22 +345,43 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 	return nil
 }
 
+// errFirewallLost is a check that observed the host table missing or
+// changed, as opposed to one that could not complete.
+var errFirewallLost = errors.New("host firewall lost")
+
 // Ready confirms the host table is still exactly as armed.
 func (d *FirecrackerDriver) Ready(ctx context.Context) error {
 	d.mu.Lock()
 	armed := d.armed
 	d.mu.Unlock()
 	if armed == "" {
-		return errors.New("host firewall is not armed")
+		return fmt.Errorf("%w: host firewall is not armed", errFirewallLost)
 	}
 	state, err := d.host.FirewallState(ctx)
 	if err != nil {
+		d.firewall.confirmed("")
 		return fmt.Errorf("host firewall check failed: %w", err)
 	}
 	if state != armed {
-		return errors.New("host firewall table changed since it was armed")
+		d.firewall.confirmed("")
+		return fmt.Errorf("%w: host firewall table changed since it was armed", errFirewallLost)
 	}
+	d.firewall.confirmed(armed)
 	return nil
+}
+
+// firewallReady is Ready, answered from the monitor's latest check when that
+// confirmed the current table less than one check interval ago: dials and
+// commands then cost no extra nft run. A table lost since is caught by the
+// monitor within the interval, which destroys every watched VM.
+func (d *FirecrackerDriver) firewallReady(ctx context.Context) error {
+	d.mu.Lock()
+	armed := d.armed
+	d.mu.Unlock()
+	if armed != "" && d.firewall.fresh(armed, d.firewallEvery) {
+		return nil
+	}
+	return d.Ready(ctx)
 }
 
 // Disarm removes the host table and cgroup parent once no VM remains.
@@ -892,7 +919,7 @@ func (d *FirecrackerDriver) CopyIn(ctx context.Context, id, source, destination 
 // re-checks the host firewall every second and destroys the VM if it was
 // lost. OnStart receives the agent's correlation ID, not a guest PID.
 func (d *FirecrackerDriver) Run(ctx context.Context, id string, command Command, stdout, stderr io.Writer) (int, error) {
-	if err := d.Ready(ctx); err != nil {
+	if err := d.firewallReady(ctx); err != nil {
 		return 0, fmt.Errorf("firewall is not armed before guest execution: %w", err)
 	}
 	if len(command.Args) == 0 || command.Args[0] == "" {
@@ -925,39 +952,18 @@ func (d *FirecrackerDriver) Run(ctx context.Context, id string, command Command,
 	}
 	defer conn.Close()
 	failed := make(chan error, 1)
-	done := make(chan struct{})
-	monitorDone := make(chan struct{})
-	go func() {
-		defer close(monitorDone)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				checkCtx, stop := context.WithTimeout(runCtx, 5*time.Second)
-				checkErr := d.Ready(checkCtx)
-				stop()
-				if checkErr != nil {
-					failed <- checkErr
-					cancel()
-					return
-				}
-			}
-		}
-	}()
+	unwatch := d.watchFirewall(id, func(err error) {
+		failed <- err
+		cancel()
+	})
 	code, err := guestagent.Exec(runCtx, conn, guestagent.Request{Args: command.Args, Dir: command.Dir, Env: command.Env}, stdout, stderr, command.OnStart)
-	close(done)
-	<-monitorDone
+	unwatch()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return 0, ctxErr
 	}
 	select {
 	case gateErr := <-failed:
-		cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
-		defer stop()
-		return 0, errors.Join(fmt.Errorf("firewall lost during guest execution: %w", gateErr), d.Destroy(cleanupCtx, id))
+		return 0, fmt.Errorf("firewall lost during guest execution: %w", gateErr)
 	default:
 	}
 	if err != nil {
@@ -970,7 +976,9 @@ func (d *FirecrackerDriver) Run(ctx context.Context, id string, command Command,
 // the cgroup limit (guest RAM plus VMM overhead), and page cache from the
 // file-backed bytes of its memory.stat. Disk use is the guest's own report
 // on its writable filesystem (the home disk, or an e2b guest's root), over
-// the agent's vsock channel.
+// the agent's vsock channel. A guest that cannot report disk use (an image
+// whose agent predates the disk operation) still gets its CPU and memory
+// sample, marked not Detailed.
 func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error) {
 	if err := d.running(id); err != nil {
 		return Usage{}, err
@@ -980,14 +988,12 @@ func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error)
 		return Usage{}, err
 	}
 	started := time.Now()
-	conn, err := d.dialAgent(ctx, id)
-	if err != nil {
-		return Usage{}, err
-	}
-	diskTotal, diskUsed, err := guestagent.Disk(ctx, conn)
-	_ = conn.Close()
-	if err != nil {
-		return Usage{}, fmt.Errorf("guest disk usage of %q: %w", id, err)
+	var diskTotal, diskUsed uint64
+	detailed := false
+	if conn, err := d.dialAgent(ctx, id); err == nil {
+		diskTotal, diskUsed, err = guestagent.Disk(ctx, conn)
+		_ = conn.Close()
+		detailed = err == nil
 	}
 	select {
 	case <-ctx.Done():
@@ -1001,23 +1007,24 @@ func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error)
 	if second.CPUUsec < first.CPUUsec || second.MemoryMax == 0 || second.Memory > second.MemoryMax || second.File > second.Memory {
 		return Usage{}, fmt.Errorf("inconsistent VM resource sample for %q", id)
 	}
-	return Usage{
+	usage := Usage{
 		CPUUsedPct:       float64(second.CPUUsec-first.CPUUsec) / float64(time.Since(started).Microseconds()) * 100,
 		MemoryUsedBytes:  second.Memory,
 		MemoryLimitBytes: second.MemoryMax,
-		Detailed:         true,
-		MemoryCacheBytes: second.File,
-		DiskUsedBytes:    diskUsed,
-		DiskTotalBytes:   diskTotal,
-	}, nil
+	}
+	if detailed {
+		usage.Detailed, usage.MemoryCacheBytes = true, second.File
+		usage.DiskUsedBytes, usage.DiskTotalBytes = diskUsed, diskTotal
+	}
+	return usage, nil
 }
 
 // DialEnvd opens a host-initiated stream to an e2b guest's envd: a fresh
 // vsock connection to the guest agent, which bridges it to envd on the guest
-// loopback. As during Run, the host firewall is re-checked every second while
-// the stream is open; losing it closes the stream and destroys the VM.
+// loopback. While it is open the stream is watched by the driver's firewall
+// monitor, as Run is; losing the firewall destroys the VM and ends it.
 func (d *FirecrackerDriver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
-	if err := d.Ready(ctx); err != nil {
+	if err := d.firewallReady(ctx); err != nil {
 		return nil, fmt.Errorf("firewall is not armed before guest access: %w", err)
 	}
 	if err := d.running(id); err != nil {
@@ -1037,44 +1044,22 @@ func (d *FirecrackerDriver) DialEnvd(ctx context.Context, id string) (net.Conn, 
 	if err := guestagent.OpenEnvd(ctx, conn); err != nil {
 		return nil, fmt.Errorf("envd of %q: %w", id, err)
 	}
-	guarded := &fcEnvdConn{Conn: conn, closed: make(chan struct{})}
-	go d.guardEnvd(id, guarded)
+	guarded := &fcEnvdConn{Conn: conn}
+	guarded.unwatch = d.watchFirewall(id, func(error) { _ = conn.Close() })
 	return guarded, nil
 }
 
-// fcEnvdConn is an envd stream whose Close also stops its firewall guard.
+// fcEnvdConn is an envd stream whose Close also ends its firewall watch.
 type fcEnvdConn struct {
 	net.Conn
-	once   sync.Once
-	closed chan struct{}
+	once    sync.Once
+	unwatch func()
 }
 
 func (c *fcEnvdConn) Close() error {
-	c.once.Do(func() { close(c.closed) })
-	return c.Conn.Close()
-}
-
-func (d *FirecrackerDriver) guardEnvd(id string, conn *fcEnvdConn) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-conn.closed:
-			return
-		case <-ticker.C:
-		}
-		checkCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
-		err := d.Ready(checkCtx)
-		stop()
-		if err != nil {
-			// The VM goes first, so the stream ends only once it is gone.
-			cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
-			_ = d.Destroy(cleanupCtx, id)
-			stop()
-			_ = conn.Close()
-			return
-		}
-	}
+	err := c.Conn.Close()
+	c.once.Do(c.unwatch)
+	return err
 }
 
 // Destroy kills the VMM and network stack, deletes the namespace (and with it

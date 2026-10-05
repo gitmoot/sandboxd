@@ -171,3 +171,29 @@ func TestConnectStreamEndsBrokenStreamsAsUnavailable(t *testing.T) {
 		t.Fatal("a truncated message ended cleanly")
 	}
 }
+
+// Only identifier method names reach envd, judged on the path as sent:
+// dot segments and percent-encoded bytes never do.
+func TestProxyRejectsDotAndEncodedRoutes(t *testing.T) {
+	routes, fake, _ := newProxyFixture(t)
+	for _, path := range []string{
+		"/process.Process/..", "/process.Process/.", "/filesystem.Filesystem/..",
+		"/process.Process/%2e%2e", "/process.Process/%2E", "/filesystem.Filesystem/%2e%2e",
+		"/process.Process/%53tart", "/filesystem.Filesystem/List%44ir", "/process.Process/Start%2f..",
+		"/fil%65s", "/h%65alth", "/process.Process/start", "/process.Process/Start_x", "/process.Process/Start.",
+	} {
+		before := fake.dials
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, envdRequest(http.MethodPost, path, e2bID, e2bToken))
+		if fake.dials != before || strings.Contains(w.Body.String(), `"envd"`) || w.Code == http.StatusOK {
+			t.Errorf("%s reached envd: %d %s", path, w.Code, w.Body)
+		}
+	}
+	for _, path := range []string{"/process.Process/SendInput", "/filesystem.Filesystem/CreateWatcher"} {
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, envdRequest(http.MethodPost, path, e2bID, e2bToken))
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: %d", path, w.Code)
+		}
+	}
+}

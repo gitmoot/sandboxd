@@ -58,8 +58,13 @@ Docker, Tailscale or iptables chain, stays untouched.
   host and the namespace tables.
 
 The daemon installs the table atomically before admitting guests (`Arm`),
-re-checks it (`nft -s list table inet sbx_fc`) before every create and every
-second during exec, and destroys the guest if it changed. On a clean
+re-checks it (`nft -s list table inet sbx_fc`) before every create, and
+destroys the guest if it changed. While any command runs or any envd stream
+is open, one monitor per daemon re-checks the table once a second for all of
+them (commands and envd dials reuse its result from the last second). A
+check that finds the table missing or changed destroys every watched guest at
+once; a check that fails to complete (an `nft` error or timeout) is tolerated
+once, and a second consecutive failure counts as a loss. On a clean
 shutdown the daemon destroys every guest, then removes the table and the
 cgroup parent.
 

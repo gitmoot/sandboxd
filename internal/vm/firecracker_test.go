@@ -67,6 +67,11 @@ type fakeFCHost struct {
 	stats      []fcCgroupSample
 	// envdAddr is where a booted guest's agent bridges OpEnvd.
 	envdAddr string
+	// oldAgent boots guests whose agent predates OpDisk.
+	oldAgent bool
+	// stateCalls counts firewall checks; stateFailures makes the next ones
+	// fail to complete, as a timed-out nft run does.
+	stateCalls, stateFailures int
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
@@ -107,6 +112,11 @@ func (h *fakeFCHost) ApplyFirewall(_ context.Context, ruleset string) error {
 func (h *fakeFCHost) FirewallState(context.Context) (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.stateCalls++
+	if h.stateFailures > 0 {
+		h.stateFailures--
+		return "", errors.New("nft timed out")
+	}
 	return h.firewall, nil
 }
 func (h *fakeFCHost) RemoveFirewall(context.Context) error {
@@ -223,7 +233,7 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ stri
 		return err
 	}
 	h.listeners[id] = listener
-	go serveFakeAgent(listener, guest, h.envdAddr)
+	go serveFakeAgent(listener, guest, h.envdAddr, h.oldAgent)
 	return nil
 }
 
@@ -252,7 +262,7 @@ func listenUnixIn(dir, name string) (*net.UnixListener, error) {
 
 // serveFakeAgent answers Firecracker's vsock handshake on every connection
 // and serves a real guest agent whose filesystem is the guest directory.
-func serveFakeAgent(listener *net.UnixListener, guest, envdAddr string) {
+func serveFakeAgent(listener *net.UnixListener, guest, envdAddr string, oldAgent bool) {
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
@@ -270,9 +280,35 @@ func serveFakeAgent(listener *net.UnixListener, guest, envdAddr string) {
 				return
 			}
 			_, _ = io.WriteString(conn, "OK 1073741824\n")
+			if oldAgent {
+				serveOldAgent(server, conn)
+				return
+			}
 			server.ServeConn(conn)
 		}()
 	}
+}
+
+// serveOldAgent answers as an agent built before OpDisk existed.
+func serveOldAgent(server *guestagent.Server, conn net.Conn) {
+	reader := bufio.NewReader(conn)
+	request, err := guestagent.ReadRequest(reader)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	if request.Op == guestagent.OpDisk {
+		_ = guestagent.WriteJSONFrame(conn, guestagent.FrameResult, guestagent.Result{Error: fmt.Sprintf("unknown guest agent operation %q", request.Op)})
+		_ = conn.Close()
+		return
+	}
+	var line bytes.Buffer
+	_ = guestagent.WriteRequest(&line, request)
+	server.ServeConn(struct {
+		io.Reader
+		io.Writer
+		io.Closer
+	}{io.MultiReader(&line, reader), conn, conn})
 }
 
 func (h *fakeFCHost) guestDir(d *FirecrackerDriver, id string) string {
@@ -681,6 +717,124 @@ func TestFirecrackerUsageFromCgroup(t *testing.T) {
 	if !usage.Detailed || usage.MemoryCacheBytes != 20<<20 || usage.DiskTotalBytes != guestFS.Blocks*uint64(guestFS.Bsize) ||
 		usage.DiskUsedBytes == 0 || usage.DiskUsedBytes > usage.DiskTotalBytes {
 		t.Fatalf("detailed usage = %+v", usage)
+	}
+}
+
+// A strict guest from an image whose agent predates OpDisk keeps its CPU and
+// memory sample; it is only not Detailed.
+func TestFirecrackerUsageWithoutGuestDisk(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	host.oldAgent = true
+	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	host.stats = []fcCgroupSample{{CPUUsec: 1_000_000}, {CPUUsec: 1_125_000, Memory: 300 << 20, MemoryMax: 640 << 20, File: 20 << 20}}
+	usage, err := d.Usage(context.Background(), fcTestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.Detailed || usage.MemoryCacheBytes != 0 || usage.DiskTotalBytes != 0 ||
+		usage.MemoryUsedBytes != 300<<20 || usage.MemoryLimitBytes != 640<<20 || usage.CPUUsedPct <= 0 {
+		t.Fatalf("usage = %+v", usage)
+	}
+}
+
+// echoEnvd stands in for every guest's envd: it echoes.
+func echoEnvd(t *testing.T) string {
+	t.Helper()
+	envd, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { envd.Close() })
+	go func() {
+		for {
+			conn, err := envd.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	return envd.Addr().String()
+}
+
+func echoes(conn net.Conn) bool {
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.WriteString(conn, "ping"); err != nil {
+		return false
+	}
+	got := make([]byte, 4)
+	_, err := io.ReadFull(conn, got)
+	return err == nil && string(got) == "ping"
+}
+
+// One monitor checks the firewall for all streams; it tolerates one check
+// that fails to complete, and destroys the VM after two in a row.
+func TestFirecrackerFirewallMonitor(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	d.firewallEvery = 50 * time.Millisecond
+	host.envdAddr = echoEnvd(t)
+	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true}); err != nil {
+		t.Fatal(err)
+	}
+	var streams []net.Conn
+	for range 8 {
+		conn, err := d.DialEnvd(context.Background(), fcTestID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		streams = append(streams, conn)
+	}
+	host.mu.Lock()
+	host.stateCalls = 0
+	host.mu.Unlock()
+	time.Sleep(500 * time.Millisecond)
+	host.mu.Lock()
+	calls := host.stateCalls
+	host.mu.Unlock()
+	if calls < 5 || calls > 12 {
+		t.Fatalf("%d firewall checks in 10 intervals with 8 streams open, want one per interval", calls)
+	}
+	// One failed check is tolerated.
+	host.mu.Lock()
+	host.stateFailures = 1
+	host.mu.Unlock()
+	time.Sleep(300 * time.Millisecond)
+	if !echoes(streams[0]) {
+		t.Fatal("one failed firewall check ended the stream")
+	}
+	host.mu.Lock()
+	_, alive := host.cgroups[fcTestID]
+	host.stateFailures = 2
+	host.mu.Unlock()
+	if !alive {
+		t.Fatal("one failed firewall check destroyed the VM")
+	}
+	// Two in a row destroy the VM, then end every stream.
+	for _, conn := range streams {
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Read(make([]byte, 1)); err == nil {
+			t.Fatal("stream survived two failed firewall checks")
+		}
+	}
+	host.mu.Lock()
+	_, alive = host.cgroups[fcTestID]
+	host.mu.Unlock()
+	if alive {
+		t.Fatal("VM survived two failed firewall checks")
+	}
+	// With nothing left to watch the monitor stops.
+	time.Sleep(200 * time.Millisecond)
+	d.firewall.mu.Lock()
+	running := d.firewall.running
+	d.firewall.mu.Unlock()
+	if running {
+		t.Fatal("firewall monitor still running with no watchers")
 	}
 }
 

@@ -12,6 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -104,14 +106,24 @@ func Transport(dial func(ctx context.Context, id string) (net.Conn, error)) *htt
 	}
 }
 
-// envdRoute reports whether path is an envd route the SDKs use.
-func envdRoute(path string) bool {
+// envdMethod is a Connect procedure name of envd's process and filesystem
+// services (Start, ListDir, ...).
+var envdMethod = regexp.MustCompile(`^[A-Z][A-Za-z0-9]*$`)
+
+// envdRoute reports whether u names an envd route the SDKs use. It judges
+// the path as sent: any percent-encoded byte disqualifies it, so neither
+// "." and ".." segments nor escaped names ever reach envd.
+func envdRoute(u *url.URL) bool {
+	path := u.EscapedPath()
+	if path != u.Path {
+		return false
+	}
 	switch path {
 	case "/health", "/files", "/files/compose", "/envs":
 		return true
 	}
 	for _, service := range []string{"/process.Process/", "/filesystem.Filesystem/"} {
-		if method, ok := strings.CutPrefix(path, service); ok && method != "" && !strings.Contains(method, "/") {
+		if method, ok := strings.CutPrefix(path, service); ok && envdMethod.MatchString(method) {
 			return true
 		}
 	}
@@ -134,7 +146,7 @@ func (p *Proxy) sandboxID(r *http.Request) (string, bool) {
 // serve handles r if it is envd traffic for an e2b sandbox, and reports
 // whether it did.
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
-	if p == nil || !envdRoute(r.URL.Path) {
+	if p == nil || !envdRoute(r.URL) {
 		return false
 	}
 	id, ok := p.sandboxID(r)
