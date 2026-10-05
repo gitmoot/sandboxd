@@ -292,6 +292,9 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, leaseCtx context
 		// owns this worker and must not admit the VM. The new owner's
 		// reconciliation finds it without a ledger row and destroys it.
 		if leaseCtx.Err() != nil {
+			if err != nil {
+				log.Printf("worker driver create failed under a superseded lease: %v", err)
+			}
 			s.mu.Lock()
 			current := s.lease
 			s.mu.Unlock()

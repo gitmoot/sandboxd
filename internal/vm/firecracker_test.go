@@ -65,6 +65,9 @@ type fakeFCHost struct {
 	bootDies   bool
 	ownerShift int
 	stats      []fcCgroupSample
+	// vmmOutput, when set, replaces what the fake VMM writes to its
+	// console, as a VMM that panics at startup does.
+	vmmOutput string
 	// envdPort is the loopback port tests dial through a booted e2b
 	// guest's agent (OpDial).
 	envdPort int
@@ -223,9 +226,15 @@ func argAfter(args []string, flag string) string {
 
 func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, console *os.File) error {
 	h.record("vmm")
-	if console != nil {
+	h.mu.Lock()
+	output := h.vmmOutput
+	h.mu.Unlock()
+	if output == "" {
 		// What the real guest's envd writes to the serial console.
-		if _, err := io.WriteString(console, "boot line\r\n"+`{"level":"info","logger":"envd","message":"fake envd up"}`+"\n"); err != nil {
+		output = "boot line\r\n" + `{"level":"info","logger":"envd","message":"fake envd up"}` + "\n"
+	}
+	if console != nil {
+		if _, err := io.WriteString(console, output); err != nil {
 			return err
 		}
 	}
