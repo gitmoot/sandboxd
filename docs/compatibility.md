@@ -441,24 +441,37 @@ the socket; macOS clears it at boot, when the sysctl resets too):
   restores it at disarm.
 
 While the helper owns forwarding, every arm, every check and the helper's
-own refresh (every 5 s while the anchor is loaded) look for another
-forwarding user: an up `bridge*` interface with an IPv4 address that is not a
-slot bridge (a vmnet shared/NAT network: Apple `container`'s nat network,
-UTM, Lima, OrbStack), or a translation rule in `pfctl -sn` outside an anchor.
-While one exists the catch-all is dropped, and it comes back when the user
-goes; the helper logs each change. Check reloads the anchor in place, so
-sandboxd sees no gap. Disarm (sandboxd's clean shutdown, after its guests are
-gone) turns forwarding off only if the record says `0` and no other user is
-found, logging when it leaves it on, then removes the record. IPv6
-forwarding is never touched.
+own refresh (every 5 s while the anchor is loaded) look for evidence of
+another forwarder: a `nat`, `rdr` or `binat` rule in `pfctl -sn` outside
+the helper's anchor, in the main ruleset or in any anchor it calls, including
+every anchor under `com.apple` (`pfctl -a com.apple -v -s Anchors`, then
+`pfctl -a <anchor> -sn`), where Internet Sharing and vmnet shared (NAT)
+networks put their NAT. A bridge with an IPv4 address is not evidence:
+vmnet host-only networks have one too and forward nothing. With evidence
+the catch-all is dropped, and it comes back when the evidence goes; the
+helper logs each change. Check reloads the anchor in place, so sandboxd sees
+no gap. Disarm (sandboxd's clean shutdown, after its guests are gone) turns
+forwarding off if the record says `0` and there is no evidence, logs when it
+leaves it on, then removes the record. When in doubt (an anchor that cannot
+be read) the helper finds no evidence and keeps the guard: a needless guard
+only costs another forwarder availability, while a missing guard would make
+the Mac an unguarded router. IPv6 forwarding is never touched.
 
-Limits: a service that forwards without a vmnet bridge or a main-ruleset
-translation rule (for example NAT inside its own PF anchor, or a VPN client
-relying on plain routing) is not detected. If it starts after the helper
-took forwarding, the catch-all drops its forwarded traffic, and disarm turns
-forwarding off. Turn forwarding on before starting `sandboxd` (record `1`) to
-keep such routing. The DHCP pass allows any UDP packet from port 67 to port
-68 through the Mac.
+Forwarding follows PF enforcement. The helper turns forwarding on only while
+PF is enabled, the reviewed main ruleset calls `com.apple/*` for filter and
+NAT, and the anchor's filter and NAT read back as one of its own shapes. If
+that stops holding (`pfctl -d`, a replaced main ruleset, a flushed anchor)
+while the helper owns forwarding, the next check or refresh turns forwarding
+off and logs a `SECURITY:` line; check also fails, so sandboxd stops guest
+work. Forwarding the operator had on (record `1`) is never turned off.
+
+Limits: a forwarder that leaves no translation rule (a VPN client relying on
+plain routing, a routing-only setup) is not detected. If it starts after the
+helper took forwarding, the catch-all drops its forwarded traffic, and disarm
+turns forwarding off. Turn forwarding on before starting `sandboxd` (record
+`1`) to keep such routing. The DHCP pass allows any UDP packet from port 67
+to port 68 through the Mac. The refresh reconciles only while every slot
+bridge is up; without them no guest can run.
 
 `internal/firewall/testdata/egress-3slot-forwarding-{off,on}.*` are the
 generated rulesets for the three-slot Mac. A per-slot deny-all mode exists in

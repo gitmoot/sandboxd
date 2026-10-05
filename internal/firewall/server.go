@@ -463,9 +463,8 @@ func (s *Server) check(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.pfReady(ctx, bridges); err != nil {
-		return "", err
-	}
+	// reconcile runs pfReady first and turns off forwarding the helper owns
+	// if PF stopped enforcing the anchor.
 	if err := s.reconcile(ctx, bridges); err != nil {
 		return "", err
 	}
@@ -473,7 +472,7 @@ func (s *Server) check(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	guard, _, err := s.wantGuard(ctx, bridges)
+	guard, _, err := s.wantGuard(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -514,12 +513,12 @@ func (s *Server) arm(ctx context.Context) (string, error) {
 	if err := s.recordForwarding(ctx); err != nil {
 		return "", err
 	}
-	guard, reason, err := s.wantGuard(ctx, bridges)
+	guard, reason, err := s.wantGuard(ctx)
 	if err != nil {
 		return "", err
 	}
 	if reason != "" {
-		log.Printf("no IPv4 forwarding guard: %s uses forwarding", reason)
+		log.Printf("no IPv4 forwarding guard: %s", reason)
 	}
 	want := s.policyFor(bridges, egress, s.config.ModelRelayPort, host, guard)
 	filter, nat, err := s.loaded(ctx)
@@ -641,10 +640,10 @@ func (s *Server) recordForwarding(ctx context.Context) error {
 
 // wantGuard reports whether the anchor must keep non-guest traffic from
 // being forwarded: only while the helper owns forwarding (record 0) and
-// nothing else uses it. Forwarding the operator had on (a Tailscale exit
-// node, OrbStack) is left as it was, and so is a forwarding user that starts
-// later (reason says which).
-func (s *Server) wantGuard(ctx context.Context, bridges []string) (guard bool, reason string, err error) {
+// there is no evidence of another forwarder. Forwarding the operator had on
+// (a Tailscale exit node, OrbStack) is left as it was, and so is a
+// forwarder that starts later (reason says which).
+func (s *Server) wantGuard(ctx context.Context) (guard bool, reason string, err error) {
 	before, err := s.forwardingBefore()
 	if err != nil {
 		return false, "", fmt.Errorf("no usable record of IPv4 forwarding before arm: %w", err)
@@ -652,58 +651,137 @@ func (s *Server) wantGuard(ctx context.Context, bridges []string) (guard bool, r
 	if before == "1" {
 		return false, "", nil
 	}
-	reason, err = s.foreignForwarding(ctx, bridges)
-	return reason == "", reason, err
+	reason = s.foreignForwarding(ctx)
+	return reason == "", reason, nil
 }
 
-// foreignForwarding names another user of IPv4 forwarding, or "": an up
-// bridge with an IPv4 address that is not one of bridges (a vmnet shared/NAT
-// network such as Apple container's nat network, UTM, Lima or OrbStack), or
-// a NAT or redirect rule in the Mac's main ruleset outside its anchors.
-// Services that NAT only inside an anchor are not seen (docs).
-func (s *Server) foreignForwarding(ctx context.Context, bridges []string) (string, error) {
-	interfaces, err := s.interfaces()
+// foreignForwarding names evidence of another IPv4 forwarder, or "": a NAT,
+// redirect or binat rule outside this helper's anchor, in the main ruleset
+// or in any anchor it calls, such as Apple's Internet Sharing and vmnet
+// shared (NAT) networks under com.apple. A bridge with an address proves
+// nothing (vmnet host-only networks have one too). When in doubt there is
+// no evidence: a needless guard costs another forwarder availability, a
+// missing guard makes the Mac a router. Unreadable anchors are logged.
+func (s *Server) foreignForwarding(ctx context.Context) string {
+	main, err := s.pf(ctx, "-sn")
 	if err != nil {
-		return "", fmt.Errorf("enumerate Mac interfaces: %w", err)
+		log.Printf("read PF NAT rules to look for other forwarders: %v", err)
+		return ""
 	}
-	for _, iface := range interfaces {
-		if !bridgeName.MatchString(iface.Name) || iface.Flags&net.FlagUp == 0 || slices.Contains(bridges, iface.Name) {
+	var anchors []string
+	if reason := translation(string(main), "the main ruleset", &anchors); reason != "" {
+		return reason
+	}
+	var names []string
+	for _, name := range anchors {
+		base, wildcard := strings.CutSuffix(name, "/*")
+		if base != anchor && !slices.Contains(names, base) {
+			names = append(names, base)
+		}
+		if !wildcard {
 			continue
 		}
-		addrs, err := s.addrs(iface)
+		out, err := s.pf(ctx, "-a", base, "-v", "-s", "Anchors")
 		if err != nil {
-			return "", fmt.Errorf("read %s addresses: %w", iface.Name, err)
+			log.Printf("list PF anchors under %s to look for other forwarders: %v", base, err)
+			continue
 		}
-		for _, addr := range addrs {
-			if prefix, err := netip.ParsePrefix(addr.String()); err == nil && prefix.Addr().Unmap().Is4() {
-				return "the vmnet network on " + iface.Name, nil
+		for _, line := range strings.Split(string(out), "\n") {
+			if child := strings.TrimSpace(line); child != "" && child != anchor && !slices.Contains(names, child) {
+				names = append(names, child)
 			}
 		}
 	}
-	out, err := s.pf(ctx, "-sn")
-	if err != nil {
-		return "", err
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "nat-anchor ") && !strings.HasPrefix(line, "rdr-anchor ") &&
-			!strings.HasPrefix(line, "binat-anchor ") {
-			return "PF translation outside the helper's anchor (" + truncate(line, 120) + ")", nil
+	for _, name := range names {
+		out, err := s.pf(ctx, "-a", name, "-sn")
+		if err != nil {
+			continue // an anchor with no NAT rules reports an error on macOS
+		}
+		if reason := translation(string(out), "anchor "+name, nil); reason != "" {
+			return reason
 		}
 	}
-	return "", nil
+	return ""
 }
 
-// enableForwarding turns forwarding on if it is off.
-func (s *Server) enableForwarding(ctx context.Context) error {
+// translation names the first translation rule in pfctl -sn output, or "";
+// anchor calls go to anchors when it is not nil.
+func translation(out, where string, anchors *[]string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		kind, rest, _ := strings.Cut(line, " ")
+		switch kind {
+		case "nat-anchor", "rdr-anchor", "binat-anchor":
+			if name, _, ok := strings.Cut(strings.TrimPrefix(rest, `"`), `"`); ok && anchors != nil && !slices.Contains(*anchors, name) {
+				*anchors = append(*anchors, name)
+			}
+		case "nat", "rdr", "binat":
+			return "a PF translation rule in " + where + " (" + truncate(line, 120) + ")"
+		}
+	}
+	return ""
+}
+
+// enforcing requires PF to evaluate this helper's anchor for bridges: PF
+// enabled with the reviewed main ruleset calling it, and the anchor's
+// filter and NAT reading back as one of the shapes this helper loads.
+// Forwarding is turned on only while it holds.
+func (s *Server) enforcing(ctx context.Context, bridges []string) error {
+	if err := s.pfReady(ctx, bridges); err != nil {
+		return err
+	}
+	filter, nat, err := s.loaded(ctx)
+	if err != nil {
+		return err
+	}
+	if egress, ok := natEgress(nat); ok && egress != "" {
+		for _, guard := range []bool{true, false} {
+			if p := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, guard); filter == p.Filter && nat == p.NAT {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("the guest egress anchor is not loaded for %s", strings.Join(bridges, ","))
+}
+
+// stopUnenforced turns off forwarding the helper owns when PF no longer
+// enforces the anchor, so guests are never routed unfiltered. It returns
+// the enforcement error, or nil.
+func (s *Server) stopUnenforced(ctx context.Context, bridges []string) error {
+	unenforced := s.enforcing(ctx, bridges)
+	if unenforced == nil {
+		return nil
+	}
+	if before, err := s.forwardingBefore(); err == nil && before == "0" {
+		if current, err := s.currentForwarding(ctx); err == nil && current == "1" {
+			log.Printf("SECURITY: PF no longer enforces the guest egress anchor (%v); turning off IPv4 forwarding the helper turned on", unenforced)
+			if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
+				log.Printf("SECURITY: could not turn off IPv4 forwarding: %v", err)
+				return errors.Join(unenforced, err)
+			}
+		}
+	}
+	return unenforced
+}
+
+// enableForwarding turns forwarding on if it is off, only while PF enforces
+// the anchor for bridges.
+func (s *Server) enableForwarding(ctx context.Context, bridges []string) error {
 	current, err := s.currentForwarding(ctx)
 	if err != nil {
 		return err
 	}
-	if current == "0" {
-		if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=1"); err != nil {
-			return fmt.Errorf("enable IPv4 forwarding for guest NAT: %w", err)
-		}
+	if current == "1" {
+		return nil
+	}
+	if err := s.enforcing(ctx, bridges); err != nil {
+		return fmt.Errorf("not enabling IPv4 forwarding: %w", err)
+	}
+	if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=1"); err != nil {
+		return fmt.Errorf("enable IPv4 forwarding for guest NAT: %w", err)
 	}
 	return nil
 }
@@ -711,7 +789,7 @@ func (s *Server) enableForwarding(ctx context.Context) error {
 // route turns on IPv4 forwarding once the anchor is loaded, then clears the
 // bridges' states and checks.
 func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
-	if err := s.enableForwarding(ctx); err != nil {
+	if err := s.enableForwarding(ctx, bridges); err != nil {
 		return "", err
 	}
 	return s.clearBridgeStates(ctx, bridges)
@@ -719,28 +797,20 @@ func (s *Server) route(ctx context.Context, bridges []string) (string, error) {
 
 // reconcile keeps a loaded anchor of this helper's in step with forwarding
 // as it is now; arm decides first, then every check and the helper's own
-// refresh. Forwarding found off is the helper's from then on: it is turned
-// back on once the guard is loaded. Another forwarding user drops the guard
-// and its leaving brings it back. Any other anchor is left for check to
-// refuse.
+// refresh. If PF stops enforcing the anchor, forwarding the helper owns is
+// turned off and nothing else changes. Forwarding found off is the helper's
+// from then on: it is turned back on once the guard is loaded. Evidence of
+// another forwarder drops the guard and its leaving brings it back.
 func (s *Server) reconcile(ctx context.Context, bridges []string) error {
+	if err := s.stopUnenforced(ctx, bridges); err != nil {
+		return err
+	}
 	filter, nat, err := s.loaded(ctx)
 	if err != nil {
 		return err
 	}
-	egress, ok := natEgress(nat)
-	if !ok || egress == "" {
-		return nil
-	}
-	loadedGuard, ours := false, false
-	for _, guard := range []bool{true, false} {
-		if p := s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, guard); filter == p.Filter && nat == p.NAT {
-			loadedGuard, ours = guard, true
-		}
-	}
-	if !ours {
-		return nil
-	}
+	egress, _ := natEgress(nat)
+	loadedGuard := filter == s.policyFor(bridges, egress, s.config.ModelRelayPort, nil, true).Filter
 	current, err := s.currentForwarding(ctx)
 	if err != nil {
 		return err
@@ -750,7 +820,7 @@ func (s *Server) reconcile(ctx context.Context, bridges []string) error {
 			return err
 		}
 	}
-	guard, reason, err := s.wantGuard(ctx, bridges)
+	guard, reason, err := s.wantGuard(ctx)
 	if err != nil {
 		return err
 	}
@@ -760,23 +830,20 @@ func (s *Server) reconcile(ctx context.Context, bridges []string) error {
 			return err
 		}
 		if guard {
-			log.Printf("loading the IPv4 forwarding guard: the helper owns forwarding and nothing else uses it")
+			log.Printf("loading the IPv4 forwarding guard: the helper owns forwarding and no other forwarder is evident")
 		} else {
-			log.Printf("dropping the IPv4 forwarding guard: %s uses forwarding", reason)
+			log.Printf("dropping the IPv4 forwarding guard: %s", reason)
 		}
 		if err := s.load(ctx, s.policyFor(bridges, egress, s.config.ModelRelayPort, host, guard).Load); err != nil {
 			return err
 		}
 	}
-	if current == "0" {
-		return s.enableForwarding(ctx)
-	}
-	return nil
+	return s.enableForwarding(ctx, bridges)
 }
 
-// restoreForwarding turns forwarding off again only if the helper owns it
-// and nothing else uses it now; if someone else had it on or needs it, it
-// stays on.
+// restoreForwarding turns forwarding off again if the helper owns it and
+// there is no evidence of another forwarder; if someone else had it on or
+// evidently uses it, it stays on.
 func (s *Server) restoreForwarding(ctx context.Context) error {
 	before, err := s.forwardingBefore()
 	if errors.Is(err, os.ErrNotExist) {
@@ -786,12 +853,8 @@ func (s *Server) restoreForwarding(ctx context.Context) error {
 		return err
 	}
 	if before == "0" {
-		reason, err := s.foreignForwarding(ctx, nil)
-		if err != nil {
-			return err
-		}
-		if reason != "" {
-			log.Printf("leaving IPv4 forwarding on: %s uses it", reason)
+		if reason := s.foreignForwarding(ctx); reason != "" {
+			log.Printf("leaving IPv4 forwarding on: %s", reason)
 		} else if _, err := s.run(ctx, "/usr/sbin/sysctl", "-w", forwardingSysctl+"=0"); err != nil {
 			return fmt.Errorf("restore IPv4 forwarding: %w", err)
 		}

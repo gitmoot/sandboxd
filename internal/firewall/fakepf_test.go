@@ -16,6 +16,9 @@ const testMainNAT = "nat-anchor \"com.apple/*\" all\nrdr-anchor \"com.apple/*\" 
 type fakePF struct {
 	enabled    bool
 	mainNAT    string
+	// anchors are other anchors under com.apple and their pfctl -sn output,
+	// such as Internet Sharing's NAT.
+	anchors map[string]string
 	skipped    map[string]bool
 	filter     string // pfctl -a <anchor> -sr
 	nat        string // pfctl -a <anchor> -sn
@@ -92,6 +95,14 @@ func (f *fakePF) pf(_ context.Context, args ...string) ([]byte, error) {
 		return []byte(f.filter), nil
 	case command == "-a "+anchor+" -sn":
 		return []byte(f.nat), nil
+	case command == "-a com.apple -v -s Anchors":
+		out := "  " + anchor + "\n"
+		for name := range f.anchors {
+			out += "  " + name + "\n"
+		}
+		return []byte(out), nil
+	case len(args) == 3 && args[0] == "-a" && args[2] == "-sn" && (args[1] == "com.apple" || f.anchors[args[1]] != ""):
+		return []byte(f.anchors[args[1]]), nil
 	case command == "-a "+anchor+" -F rules":
 		f.filter = ""
 		return nil, nil

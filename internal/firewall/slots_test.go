@@ -722,23 +722,35 @@ func TestHelperOwnsForwardingItHadToTurnOn(t *testing.T) {
 	}
 }
 
-// Another forwarding user that starts after the first arm keeps working:
-// the guard drops at the next check or refresh, comes back when it leaves,
-// and disarm leaves forwarding on while it runs.
+// Another forwarder that starts after the first arm keeps working: with
+// evidence of it (a translation rule outside the helper's anchor) the guard
+// drops at the next check or refresh, comes back when it leaves, and disarm
+// leaves forwarding on while it runs.
 func TestAnotherForwardingUserKeepsForwarding(t *testing.T) {
 	ctx := context.Background()
+	const shareNAT = "nat on en0 inet from 192.168.2.0/24 to any -> (en0) round-robin\n"
 	users := map[string]func(h *twoSlotHost, on bool){
-		"vmnet NAT bridge": func(h *twoSlotHost, on bool) {
+		// vmnet shared mode and Internet Sharing NAT through an anchor
+		// under com.apple (bridge100 alone proves nothing).
+		"vmnet shared network": func(h *twoSlotHost, on bool) {
+			h.anchors = nil
+			delete(h.bridges, "bridge100")
 			if on {
 				h.bridges["bridge100"] = slotAddrs("192.168.64.1", "fd9a::1")
-			} else {
-				delete(h.bridges, "bridge100")
+				h.anchors = map[string]string{"com.apple/internet-sharing/base_v4": shareNAT}
 			}
 		},
-		"PF NAT outside the anchor": func(h *twoSlotHost, on bool) {
+		"PF NAT in the main ruleset": func(h *twoSlotHost, on bool) {
 			h.mainNAT = testMainNAT
 			if on {
-				h.mainNAT += "nat on en0 inet from 192.168.2.0/24 to any -> (en0) round-robin\n"
+				h.mainNAT += shareNAT
+			}
+		},
+		"PF NAT in another top-level anchor": func(h *twoSlotHost, on bool) {
+			h.mainNAT, h.anchors = testMainNAT, nil
+			if on {
+				h.mainNAT += "nat-anchor \"vpn\" all\n"
+				h.anchors = map[string]string{"vpn": shareNAT}
 			}
 		},
 	}
@@ -775,10 +787,93 @@ func TestAnotherForwardingUserKeepsForwarding(t *testing.T) {
 			t.Fatalf("%s: forwarding record left behind: %v", name, err)
 		}
 	}
-	// A bridge without IPv4 (a host-only network not in use) is not a user.
+}
+
+// A vmnet host-only bridge with an IPv4 address (Apple container's
+// host-only networks, OrbStack's bridge without NAT) is no evidence of a
+// forwarder: the guard stays and disarm turns forwarding back off. So do
+// anchors that only filter or that cannot be read.
+func TestHostOnlyBridgeKeepsTheGuard(t *testing.T) {
+	ctx := context.Background()
 	h := newTwoSlotHost(t, 0)
-	h.bridges["bridge100"] = []net.Addr{ipNet("fd9a::1/64")}
+	h.bridges["bridge100"] = slotAddrs("192.168.64.1", "fd9a::1")
+	h.bridges["bridge101"] = slotAddrs("192.168.139.1", "fd9b::1")
+	h.anchors = map[string]string{"com.apple/250.ApplicationFirewall": "", "com.apple/200.AirDrop/Bonjour": "\n"}
 	if _, err := h.s.arm(ctx); err != nil || !h.guarded() {
-		t.Fatalf("an IPv6-only bridge dropped the guard: %v", err)
+		t.Fatalf("a host-only bridge dropped the guard: %v", err)
+	}
+	h.s.refresh(ctx)
+	if _, err := h.s.check(ctx); err != nil || !h.guarded() {
+		t.Fatalf("check or refresh dropped the guard for a host-only bridge: %v", err)
+	}
+	h.drain()
+	if err := h.s.disarm(ctx); err != nil || h.forwarding {
+		t.Fatalf("disarm left the helper's forwarding on for a host-only bridge: %v", err)
+	}
+}
+
+// Forwarding is never turned on while PF does not enforce the anchor, and
+// forwarding the helper owns is turned off as soon as PF stops enforcing it.
+func TestForwardingFollowsPFEnforcement(t *testing.T) {
+	ctx := context.Background()
+	stops := map[string]func(h *twoSlotHost, stop bool){
+		"PF disabled": func(h *twoSlotHost, stop bool) { h.enabled = !stop },
+		"main rules no longer call the NAT anchor": func(h *twoSlotHost, stop bool) {
+			h.mainNAT = testMainNAT
+			if stop {
+				h.mainNAT = "rdr-anchor \"com.apple/*\" all\n"
+			}
+		},
+		"anchor flushed": func(h *twoSlotHost, stop bool) {
+			if stop {
+				h.filter = ""
+			}
+		},
+	}
+	for name, stop := range stops {
+		for _, via := range []string{"refresh", "check"} {
+			h := newTwoSlotHost(t, 0)
+			if _, err := h.s.arm(ctx); err != nil || !h.forwarding {
+				t.Fatal(err)
+			}
+			armed := h.filter
+			stop(h, true)
+			if via == "refresh" {
+				h.s.refresh(ctx)
+			} else if _, err := h.s.check(ctx); err == nil {
+				t.Fatalf("%s: check accepted an unenforced anchor", name)
+			}
+			if h.forwarding {
+				t.Fatalf("%s via %s: forwarding the helper owns stayed on without PF enforcement", name, via)
+			}
+			// Something turns forwarding off and on again: still nothing
+			// until PF enforces the anchor again.
+			h.s.refresh(ctx)
+			if _, err := h.s.check(ctx); err == nil || h.forwarding {
+				t.Fatalf("%s via %s: forwarding turned on without PF enforcement: %v", name, via, err)
+			}
+			stop(h, false)
+			h.filter = armed
+			if _, err := h.s.check(ctx); err != nil || !h.forwarding {
+				t.Fatalf("%s via %s: forwarding not back once PF enforces again: %v", name, via, err)
+			}
+		}
+	}
+	// The operator's own forwarding (record 1) is never turned off.
+	h := newTwoSlotHost(t, 0)
+	h.forwarding = true
+	if _, err := h.s.arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.enabled = false
+	h.s.refresh(ctx)
+	if !h.forwarding || h.forwardingWrites != 0 {
+		t.Fatal("turned off the operator's forwarding")
+	}
+	// Arm refuses to turn forwarding on when the load did not take.
+	h = newTwoSlotHost(t, 0)
+	h.mainNAT = "rdr-anchor \"com.apple/*\" all\n"
+	if _, err := h.s.arm(ctx); err == nil || h.forwarding {
+		t.Fatalf("armed forwarding without the NAT anchor: %v", err)
 	}
 }
