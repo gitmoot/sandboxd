@@ -14,11 +14,11 @@ const testMainNAT = "nat-anchor \"com.apple/*\" all\nrdr-anchor \"com.apple/*\" 
 // fakePF is pfctl, route and sysctl on a fake Mac. Loads go through
 // pfctlLoad, which models pfctl independently of render.
 type fakePF struct {
-	enabled    bool
-	mainNAT    string
+	enabled bool
+	mainNAT string
 	// anchors are other anchors under com.apple and their pfctl -sn output,
 	// such as Internet Sharing's NAT.
-	anchors map[string]string
+	anchors    map[string]string
 	skipped    map[string]bool
 	filter     string // pfctl -a <anchor> -sr
 	nat        string // pfctl -a <anchor> -sn
