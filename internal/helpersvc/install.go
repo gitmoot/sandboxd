@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,10 @@ type InstallOptions struct {
 	// MainRulesSHA256 overrides the hash of the current pfctl -sr output.
 	MainRulesSHA256 string
 	ModelRelayPort  int
+	// DenyCIDRs and EgressInterface become the service's --deny-cidr and
+	// --egress-interface flags.
+	DenyCIDRs       []netip.Prefix
+	EgressInterface string
 }
 
 // Install makes this binary the helper's launchd system service. It must run
@@ -57,7 +62,7 @@ func (h *Host) Install(ctx context.Context, opts InstallOptions, version string)
 		SocketPath: h.Socket, WorkerUID: worker.UID, WorkerGID: worker.GID,
 		WorkerHome: worker.Home, WorkerID: opts.WorkerID, ContainerCLI: opts.ContainerCLI,
 		Slots: slots, PinImage: opts.PinImage, MainRulesSHA256: mainHash,
-		ModelRelayPort: opts.ModelRelayPort,
+		ModelRelayPort: opts.ModelRelayPort, DenyCIDRs: opts.DenyCIDRs, EgressInterface: opts.EgressInterface,
 	}
 	if _, err := firewall.NewServer(cfg); err != nil {
 		return err
@@ -124,10 +129,17 @@ func (h *Host) helperArgs(cfg firewall.Config) []string {
 	for _, s := range cfg.Slots {
 		args = append(args, "--slot", s.String())
 	}
-	return append(args,
+	args = append(args,
 		"--pin-image", cfg.PinImage,
 		"--main-rules-sha256", cfg.MainRulesSHA256,
 		"--model-relay-port", strconv.Itoa(cfg.ModelRelayPort))
+	for _, prefix := range cfg.DenyCIDRs {
+		args = append(args, "--deny-cidr", prefix.String())
+	}
+	if cfg.EgressInterface != "" {
+		args = append(args, "--egress-interface", cfg.EgressInterface)
+	}
+	return args
 }
 
 // sourceBinaries reads this executable and, if present, the sandboxd next to

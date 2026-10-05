@@ -386,6 +386,46 @@ from a `vX.Y.Z` tag on `main`. Each release page lists the SHA-256 of
 `sandboxd-<tag>-darwin-arm64.tar.gz`, which holds `sandboxd` and
 `sandboxd-pf-helper`.
 
+### Guest egress
+
+Guests reach the public internet over IPv4, like E2B; the Linux worker does
+the same (docs/firecracker.md). The helper's anchor `com.apple/gitmoot-sandboxd`
+holds, in this order:
+
+- three tables: `<sandboxd_deny>` (const), the shared Go list in
+  `internal/egress` that the Firecracker driver also uses: `0/8, 10/8,
+  100.64/10` (CGNAT and Tailscale), `127/8, 168.63.129.16/32` (Azure
+  WireServer), `169.254/16, 172.16/12, 192.168/16, 224/3, ::/127,
+  ::ffff:0:0/96, 64:ff9b::/96, fc00::/7, fe80::/10, ff00::/8`, plus every
+  `--deny-cidr`; `<sandboxd_host>`, every address of the Mac on every
+  interface (LAN, Tailscale, loopback, bridges, any public address), which
+  each check brings up to date; `<sandboxd_guests>` (const), the slot subnets;
+- one `nat on <egress> inet from <slot subnet> to any -> (<egress>)` per slot.
+  `<egress>` is `--egress-interface`, or the Mac's default route interface
+  when sandboxd arms (restart sandboxd after the default route moves);
+- per slot bridge: the model relay pass (if enabled) to the first slot's
+  gateway on its one port; block to `<sandboxd_deny>`; block to
+  `<sandboxd_host>`; pass from the slot's own subnet to anything else; block
+  all other IPv4 and all IPv6;
+- last, block anything arriving on any other interface for a guest subnet.
+
+So a guest never reaches private networks, the Mac (every port except the
+relay's, including its resolver) or another guest, in either direction.
+Guests use the public resolvers `1.1.1.1` and `8.8.8.8` (`container create
+--dns`). Arm enables `net.inet.ip.forwarding` after loading the anchor. The
+check requires `nat-anchor "com.apple/*"` in `pfctl -sn` (stock macOS has
+it), exact filter and NAT readback, and exact deny and guest tables.
+`internal/firewall/testdata/egress-3slot.*` is the generated ruleset for the
+three-slot Mac. A per-slot deny-all mode exists in the generator for
+`allow_internet_access:false` (M4) but is not reachable from the API yet.
+
+Guest egress needs a new helper release: the owner installs it with
+`sudo sandboxd-helper-update`, then restarts `sandboxd`. Its first arm
+replaces the old deny-all anchor in one `pfctl` load. To add a deny prefix
+(e.g. a provider's metadata endpoint on a public address) or pin the NAT
+interface, rerun `install` with `--deny-cidr <prefix>` or
+`--egress-interface <if>`.
+
 ### First install
 
 Create the slot networks first (above). Open the release page in your own
@@ -409,7 +449,8 @@ the worker. It then:
   main ruleset. Compare the printed hash with the reviewed one, or pass
   `--main-rules-sha256 <hash>`; other flags: `--worker-id` (default
   `mac-local`), `--pin-image` (default the reviewed Alpine digest),
-  `--container-cli`, `--model-relay-port` (default `0`, deny-only);
+  `--container-cli`, `--model-relay-port` (default `0`, no relay exception),
+  `--deny-cidr` (repeatable) and `--egress-interface` (see Guest egress);
 - stops a helper started by hand from a Terminal
   (`/usr/local/libexec/sandboxd-pf-helper-<commit>`); that Terminal can be
   closed afterwards;

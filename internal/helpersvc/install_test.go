@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io/fs"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -141,7 +142,8 @@ func TestInstallRefusesSettingsTheHelperWouldRefuse(t *testing.T) {
 func TestInstallUsesTheGivenMainRulesHashAndSettings(t *testing.T) {
 	m := newFakeMac(t)
 	err := m.install(InstallOptions{MainRulesSHA256: testHash, WorkerID: "mac-2", ModelRelayPort: 8443,
-		PinImage: "example/pin@sha256:" + strings.Repeat("a", 64)})
+		PinImage:  "example/pin@sha256:" + strings.Repeat("a", 64),
+		DenyCIDRs: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}, EgressInterface: "en1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +152,7 @@ func TestInstallUsesTheGivenMainRulesHashAndSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	for flag, want := range map[string]string{"--main-rules-sha256": testHash, "--worker-id": "mac-2", "--model-relay-port": "8443",
-		"--pin-image": "example/pin@sha256:" + strings.Repeat("a", 64)} {
+		"--pin-image": "example/pin@sha256:" + strings.Repeat("a", 64), "--deny-cidr": "203.0.113.0/24", "--egress-interface": "en1"} {
 		if got, err := flagValue(args, flag); err != nil || got != want {
 			t.Fatalf("%s = %q (%v), want %q", flag, got, err, want)
 		}

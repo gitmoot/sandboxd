@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/firewall"
 )
 
@@ -365,14 +366,19 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if strings.TrimSpace(string(out)) != spec.ID {
 		return Instance{}, errors.Join(fmt.Errorf("volume create returned unexpected ID %q", strings.TrimSpace(string(out))), d.cleanupCreated(spec.ID))
 	}
-	out, err = d.output(ctx, "create", "--name", spec.ID,
-		"--label", appleOwnerLabel, "--label", appleWorkerLabel+"="+d.workerID,
+	// Public resolvers, reached through the helper's NAT: the Mac's own
+	// resolver on the gateway is denied like every other host address.
+	args := []string{"create", "--name", spec.ID,
+		"--label", appleOwnerLabel, "--label", appleWorkerLabel + "=" + d.workerID,
 		"--network", spec.Network, "--platform", "linux/arm64",
-		"--cpus", strconv.Itoa(spec.CPUs), "--memory", strconv.Itoa(spec.MemoryMiB)+"M",
-		"--read-only", "--mount", "type=volume,source="+spec.ID+",target=/home/user",
-		"--tmpfs", "/tmp:size=512M,mode=1777", "--tmpfs", "/var/tmp:size=256M,mode=1777",
-		"--uid", "1000", "--gid", "1000", "--entrypoint", "/bin/sleep",
-		spec.Image, "2147483647")
+		"--cpus", strconv.Itoa(spec.CPUs), "--memory", strconv.Itoa(spec.MemoryMiB) + "M",
+		"--read-only", "--mount", "type=volume,source=" + spec.ID + ",target=/home/user",
+		"--tmpfs", "/tmp:size=512M,mode=1777", "--tmpfs", "/var/tmp:size=256M,mode=1777"}
+	for _, resolver := range egress.PublicResolvers {
+		args = append(args, "--dns", resolver)
+	}
+	out, err = d.output(ctx, append(args, "--uid", "1000", "--gid", "1000", "--entrypoint", "/bin/sleep",
+		spec.Image, "2147483647")...)
 	if err != nil {
 		// A failed create can still have persisted a container. Only clean up
 		// when a fresh inventory positively confirms our ownership label.

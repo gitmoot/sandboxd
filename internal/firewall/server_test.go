@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -73,18 +72,16 @@ func testContainer(s *Server) *bool {
 	return &pinPresent
 }
 
-func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
-	s, err := NewServer(testConfig(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	pinPresent := testContainer(s)
-	bridge := "bridge102"
+// oneSlotHost points s at a fake Mac with one slot bridge (bridge102) and
+// returns the switches the tests flip.
+func oneSlotHost(s *Server) (pinPresent *bool, bridge *string, pf *fakePF) {
+	pinPresent = testContainer(s)
+	name := "bridge102"
 	s.interfaces = func() ([]net.Interface, error) {
-		if bridge == "" {
+		if name == "" {
 			return nil, nil
 		}
-		return []net.Interface{{Name: bridge, Flags: net.FlagUp}}, nil
+		return []net.Interface{{Name: name, Flags: net.FlagUp}}, nil
 	}
 	s.addrs = func(net.Interface) ([]net.Addr, error) {
 		return []net.Addr{
@@ -93,51 +90,15 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 			&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
 		}, nil
 	}
-	enabled := true
-	skipped := false
-	var loaded string
-	stateFlushes := 0
-	s.pf = func(_ context.Context, args ...string) ([]byte, error) {
-		switch strings.Join(args, " ") {
-		case "-s info":
-			if enabled {
-				return []byte("Status: Enabled for 0 days\n"), nil
-			}
-			return []byte("Status: Disabled\n"), nil
-		case "-sr":
-			return []byte("anchor \"com.apple/*\" all\n"), nil
-		case "-s Interfaces -v -i bridge102":
-			if skipped {
-				return []byte("bridge102 (skip)\n"), nil
-			}
-			return []byte("bridge102\n"), nil
-		case "-a " + anchor + " -sr":
-			return []byte(loaded), nil
-		case "-a " + anchor + " -F rules":
-			loaded = ""
-			return []byte("rules cleared\n"), nil
-		case "-F states -i bridge102":
-			stateFlushes++
-			return nil, nil
-		}
-		if len(args) == 6 && args[0] == "-a" && args[1] == anchor && args[2] == "-o" && args[3] == "none" &&
-			(args[4] == "-nf" || args[4] == "-f") {
-			input, err := os.ReadFile(args[5])
-			if err != nil {
-				return nil, err
-			}
-			const denyOnly = "block in quick on bridge102 inet from any to any\n" +
-				"block in quick on bridge102 inet6 from any to any\n"
-			if string(input) != denyOnly {
-				return nil, fmt.Errorf("default policy is not deny-only: %s", input)
-			}
-			if args[4] == "-f" {
-				loaded = s.canonicalPolicy([]string{bridge})
-			}
-			return nil, nil
-		}
-		return nil, fmt.Errorf("unexpected PF command %v", args)
+	return pinPresent, &name, newFakePF().attach(s)
+}
+
+func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
+	s, err := NewServer(testConfig(t))
+	if err != nil {
+		t.Fatal(err)
 	}
+	pinPresent, bridge, pf := oneSlotHost(s)
 	ctx := context.Background()
 	if err := s.disarm(ctx); err == nil {
 		t.Fatal("cleared anchor while the bridge was present")
@@ -148,8 +109,8 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 	if got, err := s.arm(ctx); err != nil || got != "bridge102" {
 		t.Fatalf("failed to install exact bridge policy: %q %v", got, err)
 	}
-	if stateFlushes != 1 {
-		t.Fatalf("arm did not flush stale bridge states: %d", stateFlushes)
+	if pf.flushes["bridge102"] != 1 {
+		t.Fatalf("arm did not flush stale bridge states: %d", pf.flushes["bridge102"])
 	}
 	originalContainer := s.container
 	s.container = func(ctx context.Context, args ...string) ([]byte, error) {
@@ -162,8 +123,8 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 		t.Fatal("armed while another VM was attached before protection")
 	}
 	s.container = originalContainer
-	if got, err := s.arm(ctx); err != nil || got != "bridge102" || stateFlushes != 2 {
-		t.Fatalf("rearm did not clear old bridge states: %q %v, flushes=%d", got, err, stateFlushes)
+	if got, err := s.arm(ctx); err != nil || got != "bridge102" || pf.flushes["bridge102"] != 2 {
+		t.Fatalf("rearm did not clear old bridge states: %q %v, flushes=%d", got, err, pf.flushes["bridge102"])
 	}
 	if _, err := s.check(ctx); err != nil {
 		t.Fatalf("rejected installed policy: %v", err)
@@ -178,35 +139,36 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 		t.Fatal("accepted a trusted pin with a host mount")
 	}
 	s.container = originalContainer
-	skipped = true
+	pf.skipped["bridge102"] = true
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted a deny anchor on a PF-skipped bridge")
 	}
-	skipped = false
+	pf.skipped["bridge102"] = false
 	*pinPresent = false
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted firewall policy without the trusted pin VM")
 	}
 	*pinPresent = true
-	enabled = false
+	pf.enabled = false
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted policy with PF disabled")
 	}
-	enabled = true
+	pf.enabled = true
 	s.mainHash[0] ^= 1
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted an unreviewed Mac PF main ruleset")
 	}
 	s.mainHash[0] ^= 1
-	loaded = "pass in quick on bridge102 inet all"
+	armed, armedNAT, tables := pf.filter, pf.nat, pf.tables
+	pf.setLoaded("pass in quick on bridge102 inet all", "")
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted altered policy")
 	}
 	if _, err := s.arm(ctx); err == nil {
 		t.Fatal("overwrote unexpected existing policy")
 	}
-	loaded = s.canonicalPolicy([]string{"bridge102"})
-	bridge = ""
+	pf.filter, pf.nat, pf.tables = armed, armedNAT, tables
+	*bridge = ""
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("accepted policy after bridge vanished")
 	}
@@ -214,8 +176,8 @@ func TestFirewallGateRequiresExactPinnedBridgeAndRules(t *testing.T) {
 		t.Fatal("cleared PF while trusted pin still uses the network")
 	}
 	*pinPresent = false
-	if err := s.disarm(ctx); err != nil || loaded != "" {
-		t.Fatalf("failed to clear owned anchor after bridge disappeared: %q %v", loaded, err)
+	if err := s.disarm(ctx); err != nil || pf.filter != "" || pf.nat != "" {
+		t.Fatalf("failed to clear owned anchor after bridge disappeared: %q %v", pf.filter, err)
 	}
 }
 
@@ -232,87 +194,34 @@ func TestModelRelayPolicyOnlyPassesPinnedGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const expectedPolicy = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 8443\n" +
-		"block in quick on bridge102 inet from any to any\n" +
-		"block in quick on bridge102 inet6 from any to any\n"
-	if got := s.policy([]string{"bridge102"}); got != expectedPolicy {
-		t.Fatalf("model exception is not confined to the fixed guest gateway:\n%s", got)
-	}
-	const expectedReadback = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port = 8443 flags S/SA keep state\n" +
-		"block drop in quick on bridge102 inet all\n" +
-		"block drop in quick on bridge102 inet6 all"
-	if got := s.canonicalPolicy([]string{"bridge102"}); got != expectedReadback {
-		t.Fatalf("unexpected Mac PF policy readback:\n%s", got)
-	}
-
-	pinPresent := testContainer(s)
-	bridge := "bridge102"
-	s.interfaces = func() ([]net.Interface, error) {
-		if bridge == "" {
-			return nil, nil
-		}
-		return []net.Interface{{Name: bridge, Flags: net.FlagUp}}, nil
-	}
-	s.addrs = func(net.Interface) ([]net.Addr, error) {
-		return []net.Addr{
-			&net.IPNet{IP: net.ParseIP("192.168.128.1"), Mask: net.CIDRMask(24, 32)},
-			&net.IPNet{IP: net.ParseIP("fd1e:68b8:2ef4:5d5a::1"), Mask: net.CIDRMask(64, 128)},
-			&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
-		}, nil
-	}
-	var loaded string
-	flushed := false
-	s.pf = func(_ context.Context, args ...string) ([]byte, error) {
-		switch strings.Join(args, " ") {
-		case "-s info":
-			return []byte("Status: Enabled for 0 days\n"), nil
-		case "-sr":
-			return []byte(testMainRules), nil
-		case "-s Interfaces -v -i bridge102":
-			return []byte("bridge102\n"), nil
-		case "-a " + anchor + " -sr":
-			return []byte(loaded), nil
-		case "-a " + anchor + " -F rules":
-			flushed = true
-			loaded = ""
-			return nil, nil
-		case "-F states -i bridge102":
-			return nil, nil
-		}
-		if len(args) == 6 && args[0] == "-a" && args[1] == anchor && args[2] == "-o" && args[3] == "none" &&
-			(args[4] == "-nf" || args[4] == "-f") {
-			input, err := os.ReadFile(args[5])
-			if err != nil {
-				return nil, err
-			}
-			if string(input) != expectedPolicy {
-				return nil, fmt.Errorf("loaded a broader PF policy: %s", input)
-			}
-			if args[4] == "-f" {
-				loaded = expectedReadback
-			}
-			return nil, nil
-		}
-		return nil, fmt.Errorf("unexpected PF command %v", args)
-	}
+	pinPresent, bridge, pf := oneSlotHost(s)
 	ctx := context.Background()
 	if got, err := s.arm(ctx); err != nil || got != "bridge102" {
 		t.Fatalf("failed to arm narrowly scoped model policy: %q %v", got, err)
 	}
+	const relay = "pass in quick on bridge102 inet proto tcp from 192.168.128.0/24 to 192.168.128.1 port 8443\n"
+	if len(pf.loadedText) != 1 || !strings.Contains(pf.loadedText[0], relay) || strings.Count(pf.loadedText[0], " port ") != 1 {
+		t.Fatalf("model exception is not confined to the fixed guest gateway:\n%s", pf.loadedText)
+	}
+	// The relay pass comes before the host deny: every other Mac port stays denied.
+	if relayAt, hostAt := strings.Index(pf.filter, "port = 8443"), strings.Index(pf.filter, "<sandboxd_host>"); relayAt < 0 || hostAt < relayAt {
+		t.Fatalf("relay pass does not precede the host deny:\n%s", pf.filter)
+	}
 	if _, err := s.check(ctx); err != nil {
 		t.Fatalf("rejected exact model policy: %v", err)
 	}
-	loaded = strings.Replace(expectedReadback, "to 192.168.128.1", "to any", 1)
+	armed := pf.filter
+	pf.filter = strings.Replace(armed, "to 192.168.128.1 port = 8443", "to any port = 8443", 1)
 	if _, err := s.check(ctx); err == nil {
 		t.Fatal("admitted a broadened model pass")
 	}
 	*pinPresent = false
-	bridge = ""
-	if err := s.disarm(ctx); err == nil || flushed {
+	*bridge = ""
+	if err := s.disarm(ctx); err == nil || pf.filter == "" {
 		t.Fatal("cleared an anchor whose model pass was broadened")
 	}
-	loaded = expectedReadback
-	if err := s.disarm(ctx); err != nil || !flushed || loaded != "" {
+	pf.filter = armed
+	if err := s.disarm(ctx); err != nil || pf.filter != "" || pf.nat != "" {
 		t.Fatalf("failed to clear exact owned model policy after bridge drain: %v", err)
 	}
 }
