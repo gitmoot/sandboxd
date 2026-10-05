@@ -349,6 +349,14 @@ systemd or other service with `UMask=0077` and stdin on `/dev/null`. The
 driver sets every jail mode explicitly; the VMM's UID must be able to read
 the root-owned `/vm.json`, kernel and root image in its jail.
 
+A failed create answers `503` with a fixed message and is logged with its
+cause by the worker and by the gateway. Once the jailer has run, the cause
+also carries the quoted first 64 lines (at most 16 KiB) of the jailer's and
+the VMM's stdout and stderr, where Firecracker writes a startup panic; with
+`-fc-console-log` they are read from the jail's `console.log` before the
+failed VM's jail is removed. That output is the guest serial console, so it
+is guest-controlled: it appears only in the log, never in an API response.
+
 To run it as a worker that another sandboxd gateway enrolls (see
 [Multiple workers](compatibility.md#multiple-workers)), replace the gateway
 flags with `-worker-key-file <0600 file>` and keep `-worker-id`. It then

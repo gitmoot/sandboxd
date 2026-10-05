@@ -5,8 +5,10 @@ package vm
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -92,5 +94,42 @@ func TestFirecrackerConsoleDuringDestroyIsNotUnsupported(t *testing.T) {
 	}
 	if _, err := d.Console(ctx, spec.ID); err == nil || errors.Is(err, ErrNoConsole) {
 		t.Fatalf("console after destroy = %v, want a not-found error", err)
+	}
+}
+
+// A VMM that panics at boot leaves its reason in the Create error, which the
+// worker and gateway log: the quoted head of its output, at most
+// fcStartupLines lines, for every console mode.
+func TestFirecrackerCreateErrorKeepsVMMStartupOutput(t *testing.T) {
+	const panicLine = "thread 'main' panicked at src/firecracker/src/main.rs:42:5:\n"
+	output := panicLine
+	for i := range 200 {
+		output += fmt.Sprintf("guest line %d\n", i)
+	}
+	for name, mode := range map[string]struct{ envd, consoleLog bool }{
+		"strict":      {},
+		"envd":        {envd: true},
+		"console log": {consoleLog: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, host, cfg := newTestFirecracker(t, func(c *FirecrackerConfig) { c.ConsoleLog = mode.consoleLog })
+			host.vmmOutput, host.bootDies = output, true
+			_, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: mode.envd})
+			if err == nil {
+				t.Fatal("a VMM that died at boot was created")
+			}
+			got, head := err.Error(), strconv.Quote(panicLine+"guest line 0\n")
+			if !strings.Contains(got, head[1:len(head)-1]) ||
+				!strings.Contains(got, `guest line 62\n"`) || strings.Contains(got, "guest line 63") {
+				t.Fatalf("Create error does not keep the quoted first 64 lines of the VMM's output: %s", got)
+			}
+		})
+	}
+	// One endless line is cut at 16 KiB.
+	d, host, cfg := newTestFirecracker(t)
+	host.vmmOutput, host.bootDies = panicLine+strings.Repeat("x", 1<<20), true
+	_, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512})
+	if err == nil || !strings.Contains(err.Error(), "panicked") || strings.Count(err.Error(), "x") > 16<<10 {
+		t.Fatalf("Create error does not keep at most 16 KiB of VMM output: %.200v", err)
 	}
 }

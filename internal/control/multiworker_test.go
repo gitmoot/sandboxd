@@ -40,6 +40,8 @@ type fileDriver struct {
 	createGate    chan struct{}
 	createEntered chan struct{}
 	runStarted    chan struct{}
+	// createErr, when set, is what Create fails with, allocating nothing.
+	createErr error
 }
 
 func newFileDriver(t *testing.T) *fileDriver {
@@ -61,6 +63,9 @@ func (d *fileDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.createErr != nil {
+		return vm.Instance{}, d.createErr
+	}
 	if err := os.MkdirAll(filepath.Join(d.root, spec.ID), 0o700); err != nil {
 		return vm.Instance{}, err
 	}
@@ -1156,4 +1161,33 @@ func TestStalledWorkerCallsDoNotBlockTheSweep(t *testing.T) {
 		t.Fatal("a black-holed worker kept the other worker from being reconciled")
 	}
 	a.stall.Store(nil)
+}
+
+// A failed Create is logged by the gateway with its cause as the worker
+// reports it, and by the worker with the driver's cause, which can carry a
+// VMM's guest console output; the API response carries none of it.
+func TestCreateFailureIsLoggedNotReturned(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	const guest = "guest-controlled console line"
+	a := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 1)
+	a.driver.createErr = fmt.Errorf("Firecracker VMM exited during boot\nVMM startup output (guest-controlled): %q", guest)
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), a)
+	got := request(t, s, http.MethodPost, "/sandboxes", createFor("review-arm64", "job-1", 1))
+	if got.Code != http.StatusServiceUnavailable || strings.Contains(got.Body.String(), guest) {
+		t.Fatalf("failed create answered %d %q", got.Code, got.Body.String())
+	}
+	var gateway, workerLine string
+	for line := range strings.Lines(logs.String()) {
+		switch {
+		case strings.Contains(line, "create on worker worker-a failed"):
+			gateway = line
+		case strings.Contains(line, guest):
+			workerLine = line
+		}
+	}
+	if !strings.Contains(gateway, "worker driver create failed") || workerLine == "" {
+		t.Fatalf("failed create not logged with its cause by gateway and worker: %q", logs.String())
+	}
 }

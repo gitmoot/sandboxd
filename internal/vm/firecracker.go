@@ -148,8 +148,8 @@ type fcHost interface {
 	CreateNetwork(ctx context.Context, network fcNetwork) error
 	DeleteNetns(ctx context.Context, name string) error
 
-	// StartVMM runs the jailer with console (nil: /dev/null) as the VMM's
-	// stdout and stderr, the guest serial console.
+	// StartVMM runs the jailer with console as its and the VMM's stdout and
+	// stderr, the guest serial console.
 	StartVMM(ctx context.Context, jailer string, args []string, console *os.File) error
 	// Dial connects to the VMM's vsock socket <chroot>/run/v.sock, which
 	// must be a socket owned by owner, without following symlinks.
@@ -821,7 +821,8 @@ func (d *FirecrackerDriver) prepareJail(spec Spec, meta fcMeta) error {
 }
 
 // Create boots one VM on spec.Network's slot. Any failure after the record is
-// written destroys every trace it created.
+// written destroys every trace it created; once the VMM has been started, the
+// error also carries the head of its output (see fcStartup).
 func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if err := validAppleID(spec.ID); err != nil {
 		return Instance{}, err
@@ -875,13 +876,18 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	if err := writeFileExcl(d.metaPath(spec.ID), record, 0o600); err != nil {
 		return Instance{}, err
 	}
-	if err := d.start(ctx, spec, meta); err != nil {
-		return Instance{}, errors.Join(err, d.cleanupCreated(spec.ID))
+	startup := &fcStartup{}
+	if err := d.start(ctx, spec, meta, startup); err != nil {
+		if d.cfg.ConsoleLog {
+			startup.readFile(d.consoleLogPath(spec.ID)) // before cleanup removes the jail
+		}
+		err = errors.Join(err, d.cleanupCreated(spec.ID))
+		return Instance{}, startup.annotate(err)
 	}
 	return Instance{ID: spec.ID, Running: true, Network: spec.Network}, nil
 }
 
-func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta) error {
+func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup) error {
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
@@ -892,23 +898,17 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta) e
 	}); err != nil {
 		return err
 	}
-	console, capture, err := d.consoleSink(spec)
+	console, guest, err := d.consoleSink(spec, startup)
 	if err != nil {
 		return err
 	}
 	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta), console)
-	if console != nil {
-		_ = console.Close() // the VMM holds its own descriptor
-	}
-	if capture != nil {
-		if err != nil {
-			_ = capture.Close()
-		} else {
-			d.captureConsole(spec.ID, capture)
-		}
-	}
+	_ = console.Close() // the VMM holds its own descriptor
 	if err != nil {
 		return err
+	}
+	if guest != nil {
+		d.keepConsole(spec.ID, guest)
 	}
 	if err := d.waitAgent(ctx, spec.ID); err != nil {
 		return err

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"math"
 	"net/http"
@@ -703,6 +704,17 @@ func (s *Service) launch(ctx context.Context, row *store.Row) error {
 	// the VM. A worker that merely blipped keeps this gateway's lease.
 	fenced := m.superseded || m.lease != row.Lease
 	if err != nil || fenced || instance.ID != row.ID || !instance.Running {
+		var cause error
+		switch {
+		case err != nil:
+			cause = err
+		case fenced:
+			cause = errors.New("worker lease superseded during create")
+		default:
+			cause = fmt.Errorf("worker answered VM %q running=%t", instance.ID, instance.Running)
+		}
+		// The cause can carry guest console output; it goes to this log only.
+		log.Printf("sandbox %s: create on worker %s failed or unproven: %v", row.ID, m.id, cause)
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
 		_ = s.setState(context.Background(), row.ID, "unknown")

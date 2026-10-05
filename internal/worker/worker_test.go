@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -769,11 +771,15 @@ type gatedDriver struct {
 	*fakeDriver
 	entered chan struct{}
 	gate    chan struct{}
+	err     error // when set, what Create fails with
 }
 
 func (g *gatedDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) {
 	close(g.entered)
 	<-g.gate
+	if g.err != nil {
+		return vm.Instance{}, g.err
+	}
 	return g.fakeDriver.Create(ctx, spec)
 }
 
@@ -793,6 +799,50 @@ func TestCreateOvertakenByNewerLeaseIsStale(t *testing.T) {
 	close(gated.gate)
 	if err := <-result; !errors.Is(err, ErrStaleLease) {
 		t.Fatalf("overtaken create: %v, want a stale lease", err)
+	}
+}
+
+// A failed Create is logged with its cause, which can carry a VMM's guest
+// console output; the response names only the failed operation. A failed
+// Create that a newer lease overtook is logged too, though it answers stale.
+func TestCreateFailureIsLoggedNotReturned(t *testing.T) {
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	const guest = "guest-controlled console line"
+	cause := fmt.Errorf("Firecracker VMM exited during boot\nVMM startup output (guest-controlled): %q", guest)
+	newGated := func() *gatedDriver {
+		return &gatedDriver{fakeDriver: newFake(), entered: make(chan struct{}), gate: make(chan struct{}), err: cause}
+	}
+
+	failing := newGated()
+	close(failing.gate)
+	_, ts := serve(t, failing)
+	if _, err := enrolled(t, ts.URL, 1).Create(context.Background(), spec(vmA)); err == nil ||
+		strings.Contains(err.Error(), guest) || !strings.Contains(err.Error(), "worker driver create failed") {
+		t.Fatalf("failed create answered %v", err)
+	}
+	if !strings.Contains(logs.String(), guest) {
+		t.Fatalf("failed create not logged with its cause: %q", logs.String())
+	}
+
+	logs.Reset()
+	gated := newGated()
+	_, ts = serve(t, gated)
+	old := enrolled(t, ts.URL, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := old.CreateUntil(context.Background(), spec(vmA), time.Now().Add(time.Hour))
+		result <- err
+	}()
+	<-gated.entered
+	enrolled(t, ts.URL, 2)
+	close(gated.gate)
+	if err := <-result; !errors.Is(err, ErrStaleLease) || strings.Contains(err.Error(), guest) {
+		t.Fatalf("overtaken failed create answered %v", err)
+	}
+	if !strings.Contains(logs.String(), guest) {
+		t.Fatalf("overtaken failed create not logged with its cause: %q", logs.String())
 	}
 }
 
