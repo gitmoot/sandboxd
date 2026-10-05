@@ -350,15 +350,19 @@ func TestProfilesStaySeparate(t *testing.T) {
 	if failure := decodeBody[e2bError](t, unknown.Body); unknown.Code != http.StatusNotFound || failure.Code != http.StatusNotFound || failure.Message == "" {
 		t.Fatalf("unknown template: %d %s", unknown.Code, unknown.Body.String())
 	}
-	for _, option := range []map[string]any{
-		{"templateID": "base", "autoPause": true},
-		{"templateID": "base", "allow_internet_access": true},
-		{"templateID": "base", "secure": false},
-		{"templateID": "base", "brandNewOption": 1},
-		{"templateID": "base", "timeout": 7200},
+	// Unsupported features are refused with 501 and E2B's error; malformed
+	// or out-of-range requests stay 400.
+	for option, status := range map[string]int{
+		`{"templateID":"base","autoPause":true}`:             http.StatusNotImplemented,
+		`{"templateID":"base","allow_internet_access":true}`: http.StatusNotImplemented,
+		`{"templateID":"base","secure":false}`:               http.StatusNotImplemented,
+		`{"templateID":"base","brandNewOption":1}`:           http.StatusBadRequest,
+		`{"templateID":"base","timeout":7200}`:               http.StatusBadRequest,
 	} {
-		if got := request(t, s, http.MethodPost, "/v2/sandboxes", option); got.Code != http.StatusBadRequest {
-			t.Errorf("unsupported option %v: %d", option, got.Code)
+		got := request(t, s, http.MethodPost, "/v2/sandboxes", json.RawMessage(option))
+		if failure := decodeBody[e2bError](t, got.Body); got.Code != status || failure.Code != status ||
+			status == http.StatusNotImplemented && !strings.HasSuffix(failure.Message, "; "+notSupportedDoc) {
+			t.Errorf("unsupported option %s: %d %s", option, got.Code, got.Body.String())
 		}
 	}
 

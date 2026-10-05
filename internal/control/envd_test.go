@@ -187,7 +187,7 @@ func TestE2BTemplateStartReadyAndPorts(t *testing.T) {
 		t.Fatal("only the template's ports are exposed")
 	}
 	for _, network := range []map[string]any{{"allowPublicTraffic": true}, {}, {"allowPublicTraffic": false, "denyOut": []string{"0.0.0.0/0"}}} {
-		if got := request(t, s, http.MethodPost, "/v2/sandboxes", map[string]any{"templateID": "ci", "network": network}); got.Code != http.StatusBadRequest {
+		if got := request(t, s, http.MethodPost, "/v2/sandboxes", map[string]any{"templateID": "ci", "network": network}); got.Code != http.StatusNotImplemented {
 			t.Fatalf("network %v: %d %s", network, got.Code, got.Body)
 		}
 	}

@@ -230,7 +230,9 @@ func startEnvd() int {
 	if err != nil {
 		halt("envd environment: %v", err)
 	}
-	cmd := exec.Command(envdPath, "-isnotfc", "-no-cgroups", "-port", strconv.Itoa(guestagent.EnvdPort))
+	// -verbose writes envd's structured logs to its stdout, the serial
+	// console, which the host keeps for the logs API.
+	cmd := exec.Command(envdPath, "-isnotfc", "-no-cgroups", "-verbose", "-port", strconv.Itoa(guestagent.EnvdPort))
 	// envd takes PATH from its own environment for every process it starts.
 	cmd.Env = []string{"PATH=" + lookupEnv(env, "PATH"), "HOME=/root", "LANG=" + lookupEnv(env, "LANG")}
 	cmd.Dir = "/"

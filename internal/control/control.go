@@ -386,8 +386,38 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 			s.connect(w, r, id)
 			return
 		}
+		if validID(id) && action == "logs" && r.Method == http.MethodGet {
+			s.logs(w, r, id, true)
+			return
+		}
 		s.notFound(w, r)
 		return
+	}
+	// So do the e2b-only routes below: logs, the alias lookup and the
+	// explicit refusals of unsupported E2B features (refusals.go).
+	if s.templates.e2b {
+		if alias, ok := strings.CutPrefix(path, "/templates/aliases/"); ok && r.Method == http.MethodGet && alias != "" && !strings.Contains(alias, "/") {
+			s.templateAlias(w, alias)
+			return
+		}
+		if reason := apiRefusal(r); reason != "" {
+			s.refuse(w, reason)
+			return
+		}
+		if rest, ok := strings.CutPrefix(path, "/sandboxes/"); ok {
+			id, action, _ := strings.Cut(rest, "/")
+			if reason := sandboxRefusal(action); reason != "" {
+				if !s.refusable(w, r, id) {
+					return
+				}
+				s.refuse(w, reason)
+				return
+			}
+			if validID(id) && action == "logs" && r.Method == http.MethodGet {
+				s.logs(w, r, id, false)
+				return
+			}
+		}
 	}
 	if !strings.HasPrefix(path, "/sandboxes/") {
 		s.notFound(w, r)

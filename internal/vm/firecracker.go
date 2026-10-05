@@ -72,6 +72,8 @@ type FirecrackerConfig struct {
 	BootTimeout  time.Duration
 	// ConsoleLog keeps the guest serial console in <jail>/console.log for
 	// debugging. Off by default; the log is bounded by the VMM's fsize limit.
+	// Without it an envd guest's console is kept in memory for the logs API
+	// (Console); with it, it goes only to the file.
 	ConsoleLog bool
 	// DenyCIDRs extends both guest deny lists, for example with a cloud
 	// provider's metadata endpoints on public addresses.
@@ -97,6 +99,11 @@ type FirecrackerDriver struct {
 	// running command and open envd stream, every firewallEvery.
 	firewall      fcFirewallMonitor
 	firewallEvery time.Duration
+
+	// consoles keeps the console output of envd guests started by this
+	// process (see firecracker_console.go).
+	consoleMu sync.Mutex
+	consoles  map[string]*Console
 }
 
 var (
@@ -132,7 +139,9 @@ type fcHost interface {
 	CreateNetwork(ctx context.Context, network fcNetwork) error
 	DeleteNetns(ctx context.Context, name string) error
 
-	StartVMM(ctx context.Context, jailer string, args []string, console string) error
+	// StartVMM runs the jailer with console (nil: /dev/null) as the VMM's
+	// stdout and stderr, the guest serial console.
+	StartVMM(ctx context.Context, jailer string, args []string, console *os.File) error
 	// Dial connects to the VMM's vsock socket <chroot>/run/v.sock, which
 	// must be a socket owned by owner, without following symlinks.
 	Dial(ctx context.Context, chroot string, owner int) (net.Conn, error)
@@ -781,11 +790,22 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta) e
 	}); err != nil {
 		return err
 	}
-	console := os.DevNull
-	if d.cfg.ConsoleLog {
-		console = filepath.Join(d.jailDir(spec.ID), "console.log")
+	console, capture, err := d.consoleSink(spec)
+	if err != nil {
+		return err
 	}
-	if err := d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta), console); err != nil {
+	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta), console)
+	if console != nil {
+		_ = console.Close() // the VMM holds its own descriptor
+	}
+	if capture != nil {
+		if err != nil {
+			_ = capture.Close()
+		} else {
+			d.captureConsole(spec.ID, capture)
+		}
+	}
+	if err != nil {
 		return err
 	}
 	if err := d.waitAgent(ctx, spec.ID); err != nil {
@@ -1075,6 +1095,9 @@ func (d *FirecrackerDriver) Destroy(ctx context.Context, id string) error {
 	if err := validAppleID(id); err != nil {
 		return err
 	}
+	// Keep the console until the VM is gone, so a logs request racing this
+	// delete sees output or "not running", never "keeps no console".
+	defer d.dropConsole(id)
 	vm, found, err := d.lookup(id)
 	if err != nil {
 		return err

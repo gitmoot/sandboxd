@@ -161,6 +161,9 @@ type Member interface {
 	// Expire moves a VM's worker-side end time, for a renewal or after the
 	// gateway re-adopts it.
 	Expire(ctx context.Context, id string, ends time.Time) error
+	// Console returns an envd guest's kept console output (vm.ConsoleReader);
+	// it fails with vm.ErrNoConsole when the worker keeps none for the VM.
+	vm.ConsoleReader
 }
 
 type local struct {

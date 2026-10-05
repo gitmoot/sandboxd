@@ -73,6 +73,9 @@ type fakeFCHost struct {
 	// stateCalls counts firewall checks; stateFailures makes the next ones
 	// fail to complete, as a timed-out nft run does.
 	stateCalls, stateFailures int
+	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
+	// mid-teardown.
+	onKill func(name string)
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
@@ -159,6 +162,9 @@ func (h *fakeFCHost) CgroupStats(string) (fcCgroupSample, error) {
 }
 func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	h.record("kill " + name)
+	if h.onKill != nil {
+		h.onKill(name)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.cgroups, name)
@@ -203,8 +209,14 @@ func argAfter(args []string, flag string) string {
 	return args[i+1]
 }
 
-func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ string) error {
+func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, console *os.File) error {
 	h.record("vmm")
+	if console != nil {
+		// What the real guest's envd writes to the serial console.
+		if _, err := io.WriteString(console, "boot line\r\n"+`{"level":"info","logger":"envd","message":"fake envd up"}`+"\n"); err != nil {
+			return err
+		}
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.vmmArgs = append(h.vmmArgs, args)

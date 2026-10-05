@@ -89,7 +89,11 @@ func (d *Driver) createEnvd(spec vm.Spec, dir string) (*guest, error) {
 	helper := exec.Command(d.envd.Helper[0], args...)
 	helper.Dir = "/"
 	helper.Env = []string{"PATH=" + guestPath}
-	helper.Stdout, helper.Stderr = os.Stderr, os.Stderr
+	// envd's structured logs (its stdout, see envdInit) are the guest's
+	// console; its stderr also stays in the server log.
+	console := vm.NewConsole()
+	helper.Stdout, helper.Stderr = console, io.MultiWriter(os.Stderr, console)
+	helper.WaitDelay = outputDrain
 	// A new session: no controlling terminal, so sudo never allocates a pty
 	// and passes the lifeline pipe straight to the helper.
 	helper.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
@@ -101,7 +105,7 @@ func (d *Driver) createEnvd(spec vm.Spec, dir string) (*guest, error) {
 		return nil, err
 	}
 	g := &guest{network: spec.Network, memoryMiB: spec.MemoryMiB, dir: dir, home: filepath.Join(dir, "home"),
-		holder: helper, exited: make(chan struct{}), envd: true, lifeline: lifeline}
+		holder: helper, exited: make(chan struct{}), envd: true, lifeline: lifeline, console: console}
 	go func() {
 		_ = helper.Wait()
 		close(g.exited)
@@ -261,10 +265,12 @@ func envdInit(args []string) error {
 	}
 	children := make(chan os.Signal, 16)
 	signal.Notify(children, syscall.SIGCHLD)
-	envd := exec.Command(fmt.Sprintf("/proc/self/fd/%d", envdFD), "-isnotfc", "-no-cgroups", "-port", strconv.Itoa(vm.EnvdPort))
+	// -verbose writes envd's structured logs to its stdout: the guest
+	// console the logs API serves.
+	envd := exec.Command(fmt.Sprintf("/proc/self/fd/%d", envdFD), "-isnotfc", "-no-cgroups", "-verbose", "-port", strconv.Itoa(vm.EnvdPort))
 	envd.Dir = "/"
 	envd.Env = []string{"PATH=" + guestPath, "HOME=/root", "LANG=C.UTF-8"}
-	envd.Stdout, envd.Stderr = os.Stderr, os.Stderr
+	envd.Stdout, envd.Stderr = os.Stdout, os.Stderr
 	if err := envd.Start(); err != nil {
 		return err
 	}
