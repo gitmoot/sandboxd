@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -925,5 +926,70 @@ func TestReapKeepsEndTimeOfCreateSpanningInventory(t *testing.T) {
 	driver.mu.Unlock()
 	if alive {
 		t.Fatal("VM outlived the gateway's end time: Reap pruned the end time of a Create that spanned its inventory")
+	}
+}
+
+// envdDriver is a fakeDriver whose guests' envd echoes, and which records
+// the Envd flag of every create.
+type envdDriver struct {
+	*fakeDriver
+	envd []bool
+}
+
+func (d *envdDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) {
+	d.mu.Lock()
+	d.envd = append(d.envd, spec.Envd)
+	d.mu.Unlock()
+	return d.fakeDriver.Create(ctx, spec)
+}
+
+func (d *envdDriver) DialEnvd(_ context.Context, id string) (net.Conn, error) {
+	d.mu.Lock()
+	_, ok := d.vms[id]
+	d.mu.Unlock()
+	if !ok {
+		return nil, errors.New("no such VM")
+	}
+	client, guest := net.Pipe()
+	go func() {
+		defer guest.Close()
+		_, _ = io.Copy(guest, guest)
+	}()
+	return client, nil
+}
+
+func TestEnvdStream(t *testing.T) {
+	driver := &envdDriver{fakeDriver: newFake()}
+	_, ts := serve(t, driver)
+	client := enrolled(t, ts.URL, 1)
+	envdSpec := spec("sandboxd-00000000000000000000000000000e2b")
+	envdSpec.Envd = true
+	if _, err := client.CreateUntil(context.Background(), envdSpec, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if len(driver.envd) != 1 || !driver.envd[0] {
+		t.Fatalf("worker created %v, want one envd guest", driver.envd)
+	}
+	conn, err := client.DialEnvd(context.Background(), "sandboxd-00000000000000000000000000000e2b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	for _, message := range []string{"GET /health HTTP/1.1\r\n\r\n", strings.Repeat("x", 100000)} {
+		if _, err := io.WriteString(conn, message); err != nil {
+			t.Fatal(err)
+		}
+		echoed := make([]byte, len(message))
+		if _, err := io.ReadFull(conn, echoed); err != nil || string(echoed) != message {
+			t.Fatalf("echo = %d bytes, %v", len(echoed), err)
+		}
+	}
+	if _, err := client.DialEnvd(context.Background(), "sandboxd-0000000000000000000000000000dead"); err == nil {
+		t.Fatal("DialEnvd reached a missing VM")
+	}
+	// A driver without envd guests says so.
+	_, plain := serve(t, plainDriver{newFake()})
+	if _, err := enrolled(t, plain.URL, 1).DialEnvd(context.Background(), "sandboxd-00000000000000000000000000000e2b"); !errors.Is(err, vm.ErrNoEnvd) {
+		t.Fatalf("plain driver: %v", err)
 	}
 }

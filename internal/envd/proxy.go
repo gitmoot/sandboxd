@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -55,7 +57,8 @@ func NewProxy(sandboxes E2BSandboxes, domain, gatewayHost string) *Proxy {
 			out.Out.Header.Del("E2b-Sandbox-Id")
 			out.Out.Header.Del("E2b-Sandbox-Port")
 		},
-		Transport: Transport(sandboxes.DialEnvd),
+		Transport:      Transport(sandboxes.DialEnvd),
+		ModifyResponse: endStreams,
 		// Connect streams and process output must reach the client as
 		// envd writes them.
 		FlushInterval: -1,
@@ -198,6 +201,74 @@ func validFileSignature(r *http.Request, token string) bool {
 	expected := "v1_" + base64.RawStdEncoding.EncodeToString(sum[:])
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
 }
+
+// endStreams makes a Connect streaming response whose envd connection breaks
+// at a message boundary (the VM was destroyed) end with an "unavailable"
+// end-of-stream message, as E2B's proxy does, instead of a truncated body.
+func endStreams(response *http.Response) error {
+	if strings.HasPrefix(response.Header.Get("Content-Type"), "application/connect+") {
+		response.Body = &connectStream{body: response.Body}
+	}
+	return nil
+}
+
+// connectStream tracks Connect envelopes (1 flag byte, 4 length bytes,
+// payload) so it knows whether a read error falls between messages.
+type connectStream struct {
+	body    io.ReadCloser
+	header  [5]byte
+	inHead  int    // header bytes seen of the current envelope
+	left    uint32 // payload bytes still due
+	ended   bool   // an end-of-stream envelope was forwarded
+	trailer []byte // the synthesized end-of-stream envelope still to return
+	done    bool
+}
+
+const streamEndFlag = 0x02
+
+func (c *connectStream) Read(p []byte) (int, error) {
+	if c.trailer != nil {
+		n := copy(p, c.trailer)
+		if c.trailer = c.trailer[n:]; len(c.trailer) == 0 {
+			c.trailer, c.done = nil, true
+		}
+		return n, nil
+	}
+	if c.done {
+		return 0, io.EOF
+	}
+	n, err := c.body.Read(p)
+	c.track(p[:n])
+	if err != nil && !errors.Is(err, io.EOF) && n == 0 && !c.ended && c.inHead == 0 && c.left == 0 {
+		payload, _ := json.Marshal(map[string]any{"error": map[string]string{
+			"code": "unavailable", "message": "the sandbox envd connection ended before the stream completed"}})
+		c.trailer = append([]byte{streamEndFlag, 0, 0, 0, 0}, payload...)
+		binary.BigEndian.PutUint32(c.trailer[1:5], uint32(len(payload)))
+		return c.Read(p)
+	}
+	return n, err
+}
+
+func (c *connectStream) track(data []byte) {
+	for len(data) > 0 {
+		if c.left > 0 {
+			step := min(uint32(len(data)), c.left)
+			c.left -= step
+			data = data[step:]
+			continue
+		}
+		c.header[c.inHead] = data[0]
+		c.inHead++
+		data = data[1:]
+		if c.inHead == len(c.header) {
+			c.inHead = 0
+			c.left = binary.BigEndian.Uint32(c.header[1:])
+			c.ended = c.ended || c.header[0]&streamEndFlag != 0
+		}
+	}
+}
+
+func (c *connectStream) Close() error { return c.body.Close() }
 
 // jsonError is envd's error body.
 func jsonError(w http.ResponseWriter, status int, message string) {

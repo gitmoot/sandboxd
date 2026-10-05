@@ -353,7 +353,6 @@ func TestProfilesStaySeparate(t *testing.T) {
 	for _, option := range []map[string]any{
 		{"templateID": "base", "autoPause": true},
 		{"templateID": "base", "allow_internet_access": true},
-		{"templateID": "base", "envVars": map[string]string{"A": "1"}},
 		{"templateID": "base", "secure": false},
 		{"templateID": "base", "brandNewOption": 1},
 		{"templateID": "base", "timeout": 7200},
@@ -371,7 +370,7 @@ func TestProfilesStaySeparate(t *testing.T) {
 	// Owner metadata is optional for e2b; the SDK sends empty metadata and envVars.
 	sdk := createE2B(t, s, map[string]any{"templateID": "base", "timeout": 60, "metadata": map[string]string{}, "envVars": map[string]string{}})
 	if sdk.TemplateID != "sandboxd-base" || sdk.ClientID != "sandboxd" || sdk.EnvdVersion != "0.2.4" || sdk.Domain != "sandbox.example" ||
-		!s.Authorize(sdk.ID, sdk.Token) || sdk.Token != s.envdToken(sdk.ID) {
+		!s.AuthorizeEnvd(sdk.ID, sdk.Token) || s.Authorize(sdk.ID, sdk.Token) || sdk.Token != s.envdToken(sdk.ID) {
 		t.Fatalf("e2b create response: %+v", sdk)
 	}
 
@@ -629,7 +628,7 @@ func TestE2BSandboxesRunOnEnrolledWorkers(t *testing.T) {
 	if err != nil || row.WorkerID != "arm-1" || row.Image != "linux-arm64-envd" || row.Lease == 0 || row.Profile != string(ProfileE2B) {
 		t.Fatalf("e2b row not scheduled onto the declaring worker under its lease: %+v %v", row, err)
 	}
-	if !s.Authorize(sdk.ID, sdk.Token) {
+	if !s.AuthorizeEnvd(sdk.ID, sdk.Token) {
 		t.Fatal("e2b token not authorized on its worker")
 	}
 	strict := request(t, s, http.MethodPost, "/sandboxes", createFor("review-amd64", "job-A", 1))

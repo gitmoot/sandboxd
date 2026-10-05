@@ -163,7 +163,11 @@ func RunEnvdGuest(args []string) error {
 		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC,
 		Pdeathsig:  syscall.SIGKILL,
 	}
-	return init.Run()
+	err = init.Run()
+	// The guest's mounts and processes ended with its namespaces; what it
+	// created in dir is removed here, in the host mount namespace.
+	cleanEnvdGuest(args[0])
+	return err
 }
 
 // RunEnvdGuestInit dispatches the helper's second stage; it reports whether
@@ -193,7 +197,6 @@ func envdInit(args []string) error {
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || !info.IsDir() || int(stat.Uid) != uid {
 		return fmt.Errorf("envd guest directory %s must be a directory owned by uid %d", dir, uid)
 	}
-	defer cleanEnvdGuest(dir)
 	// The socket is bound before the mounts below can hide dir; the driver
 	// waits for it to appear only once setup is done (its rename).
 	pending := filepath.Join(dir, envdSocket+".pending")
@@ -331,9 +334,6 @@ func setupEnvdGuest(dir string) error {
 // cleanEnvdGuest removes what the helper created; the guest's processes are
 // gone by then, so nothing can race the removal.
 func cleanEnvdGuest(dir string) {
-	for _, target := range []string{"/home/user", "/tmp", "/root", "/etc/passwd", "/etc/group"} {
-		_ = unix.Unmount(target, unix.MNT_DETACH)
-	}
 	for _, name := range envdGuestLayout {
 		_ = os.RemoveAll(filepath.Join(dir, name))
 	}

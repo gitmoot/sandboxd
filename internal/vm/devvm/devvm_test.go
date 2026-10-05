@@ -229,7 +229,7 @@ func TestMapGuestHomeMatchesWholePathWords(t *testing.T) {
 func TestStatFieldsHandlesParenthesesInCommandNames(t *testing.T) {
 	raw := "1234 (a) b (c)) S 1 4321 4321 0 -1 4194560 100 0 0 0 7 3 0 0 20 0 1 0 100 1000000 42 18446744073709551615"
 	got, ok := statFields(raw)
-	if !ok || got != (procStat{pgrp: 4321, utime: 7, stime: 3, rssPages: 42}) {
+	if !ok || got != (procStat{ppid: 1, pgrp: 4321, utime: 7, stime: 3, rssPages: 42}) {
 		t.Fatalf("statFields = %+v, %v", got, ok)
 	}
 }

@@ -132,6 +132,29 @@ image carries its license and source note in `/usr/share/doc/envd/`
 envd arm64 SHA-256 `bf346976…d89189`), with envd as its entrypoint; the
 build command is in its header.
 
+### Root inside an e2b guest
+
+An `e2b` guest boots the same way, then the agent formats the per-VM disk,
+mounts an overlay of the read-only image (lower) and that disk (upper) and
+`pivot_root`s into it, so the root filesystem is writable and private to the
+VM; the image file itself is attached read-only and never changes. envd runs
+as root and starts commands as `user` or, when the SDK asks, `root`.
+
+Root inside the guest can do anything to *that VM*: write any file of its
+overlay root, change the guest's network configuration, kill the agent or
+envd (which ends the VM: the agent halts it), load nothing (the kernel has no
+modules) and use only the two virtio disks attached to it (`/dev/vda` is
+read-only at the VMM). It cannot leave the VM: the boundary is KVM plus the
+jailed, unprivileged Firecracker process, the guest has no shared host
+filesystem and no host-side vsock listener (guest-initiated vsock connections
+are reset), and its only network path is the NAT confined by the host and
+namespace tables above, which it cannot change from inside. The probes in
+[#25](https://github.com/gitmoot/sandboxd/issues/25) ran as root in a real
+guest: host addresses on every interface, Docker bridges, Tailscale and
+ZeroTier, the NAT's own host and resolver, metadata and RFC 1918 addresses
+were unreachable, vsock to the host was refused, and the internet was
+reachable.
+
 ## Running
 
 ```sh
