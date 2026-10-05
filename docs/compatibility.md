@@ -119,6 +119,18 @@ bridges.
 ordinary guests on gate failure and only requests anchor removal after every
 VM has been deleted.
 
+### e2b guest ports, `get_host` and signed file URLs (M3, [#26](https://github.com/gitmoot/sandboxd/issues/26))
+
+Guest ports other than envd's are **allowlist-only per template** and **never public** (E2B's `allowPublicTraffic=false`):
+
+- Register the ports with the template: `-register-template id=…,profile=e2b,…,port=49999[,port=…]`. Strict templates cannot expose ports. No other guest port is reachable, and envd's 49983 is never a template port.
+- Every request needs the sandbox's traffic access token (`E2b-Traffic-Access-Token`, returned as `trafficAccessToken` by create and connect, HMAC-derived like the envd token with a different label) or its envd access token (`X-Access-Token`). The traffic token opens the template's ports only, never envd. Refusals use E2B's edge bodies: 403 for a missing or invalid token or a port the template does not expose, 502 for an unknown sandbox or a closed port, 429 past `DefaultMaxPortStreams` (256) concurrent requests per sandbox.
+- Routing: on the gateway host (`-gateway-host`) with the SDKs' `E2b-Sandbox-Id`/`E2b-Sandbox-Port` headers, which the code-interpreter SDKs send when `E2B_SANDBOX_URL` points at the gateway. The bytes reach the guest only over the host-initiated channel (Firecracker vsock → guest agent `OpDial` → guest loopback; the worker API's `POST /vms/<id>/ports/<n>` upgrade for enrolled workers); nothing listens on a host port and the guest network is not involved. HTTP, streaming and WebSocket upgrades pass through; sandboxd's routing and traffic-token headers are stripped.
+- `create` accepts `network: {"allowPublicTraffic": false}` (what sandboxd always does); every other network option is still refused.
+- `get_host(port)` returns `<port>-<id>.<domain>`; the SDKs never apply `E2B_SANDBOX_URL` to it. That form needs wildcard DNS and TLS for `*.<domain>` in front of sandboxd (owner decision D2, deferred), so host routing of guest ports is **off by default** and enabled with `-port-hosts` once an operator has both. The token rules are the same; envd's own `49983-<id>.<domain>` host stays routed as before. For a client on the gateway's own machine, a domain under `localhost` (for example `sbx.localhost:<port>`) resolves without DNS setup on resolvers that implement RFC 6761, but still needs a TLS front.
+- Signed file URLs (`download_url`/`upload_url`) are built from `E2B_SANDBOX_URL` and carry no routing headers. sandboxd routes a `/files` request with a `signature` on the gateway host to the one running e2b sandbox whose envd token made that signature (the signature binds path, operation, user, expiry and token), so no wildcard DNS is needed. An expired signature answers envd's own `401 {"code":401,"message":"signature is already expired"}`.
+- Template start and ready commands: `start-cmd=<command>` runs once per sandbox as root through envd right after `/init`, in the background; `ready-cmd=<command>` then runs as root until it exits 0 (at most 3 minutes) before create returns 201. A sandbox that never becomes ready is destroyed (503). E2B runs the start command at template build time and snapshots the result; sandboxd has no snapshots, so this is a per-create cold start. The `code-interpreter-v1` image and its registration line are in [firecracker.md](firecracker.md#code-interpreter-image).
+
 ### CI conformance gate (dev driver)
 
 Every pull request runs `conformance/run.py` (`.github/workflows/conformance.yml`).
@@ -622,7 +634,7 @@ sudo rm /Library/LaunchDaemons/org.gitmoot.sandboxd-pf-helper.plist \
 Stopping the helper does not by itself remove its PF anchor; inspect it with
 `sudo pfctl -a com.apple/gitmoot-sandboxd -sr`.
 
-Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest hosts without private authentication, guest inbound ports, snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result; both were proven separately on the Mac ([#6], [#8], [#10]).
+Unsupported: template builds, pause/resume, arbitrary E2B envd RPCs, public guest ports (every guest port needs a token and a template allowlist entry; see the e2b guest ports section), snapshots, E2B dollar billing, arbitrary upload paths/users, and executing review policy in the worker. Linux ARM64 OMP upload and scoped model access are separate integration/security requirements, not implied by this HTTP conformance result; both were proven separately on the Mac ([#6], [#8], [#10]).
 
 [#3]: https://github.com/gitmoot/sandboxd/issues/3
 [#6]: https://github.com/gitmoot/sandboxd/issues/6
