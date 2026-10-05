@@ -2,6 +2,8 @@ name: release
 # A tag v* on a reviewed main commit builds the release. The owner installs on
 # the Mac only an archive whose SHA-256 matches this release page, as seen in
 # the owner's own browser; sudo sandboxd-helper-update checks the same page.
+# Linux operators install sandboxd-<tag>-linux-<arch>.tar.gz the same way
+# (docs/firecracker.md).
 on:
   push:
     tags: ["v*"]
@@ -26,13 +28,28 @@ jobs:
         run: |
           set -eu
           tag=${GITHUB_REF_NAME}
-          out=$RUNNER_TEMP/out mac=$RUNNER_TEMP/mac
-          mkdir -p "$out" "$mac"
-          for cmd in sandboxd sandboxd-pf-helper; do
-            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-X main.version=$tag" -o "$mac/$cmd" "./cmd/$cmd"
-          done
-          chmod 755 "$mac/sandboxd" "$mac/sandboxd-pf-helper"
-          tar --owner=0 --group=0 --numeric-owner -czf "$out/sandboxd-$tag-darwin-arm64.tar.gz" -C "$mac" sandboxd sandboxd-pf-helper
+          out=$RUNNER_TEMP/out
+          mkdir -p "$out"
+          # package <goos> <goarch> <cmd>...: one tarball of these commands.
+          package() {
+            goos=$1 goarch=$2
+            shift 2
+            dir=$RUNNER_TEMP/$goos-$goarch
+            mkdir -p "$dir"
+            for cmd in "$@"; do
+              CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags "-X main.version=$tag" -o "$dir/$cmd" "./cmd/$cmd"
+              chmod 755 "$dir/$cmd"
+            done
+            tar --owner=0 --group=0 --numeric-owner -czf "$out/sandboxd-$tag-$goos-$goarch.tar.gz" -C "$dir" "$@"
+          }
+          package darwin arm64 sandboxd sandboxd-pf-helper
+          # The Firecracker worker (x86_64 hosts only): sandboxd, and the
+          # guest agent that the images/*-amd64-fc build scripts take through
+          # SANDBOXD_GUEST_AGENT instead of building it from source.
+          package linux amd64 sandboxd sandboxd-guest-agent
+          # linux/arm64 runs only the gateway (-driver none): no arm64
+          # Firecracker guest exists, so it has no guest agent.
+          package linux arm64 sandboxd
           (cd "$out" && sha256sum * > SHA256SUMS)
           cat "$out/SHA256SUMS"
       - name: Publish
@@ -44,7 +61,7 @@ jobs:
           {
             echo "Built by GitHub Actions from commit \`$GITHUB_SHA\` (run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
             echo
-            echo "Check the SHA-256 below in your own browser before a first install (docs/compatibility.md, Operating the PF helper)."
+            echo "Check the SHA-256 below in your own browser before a first install (Mac: docs/compatibility.md, Operating the PF helper; Linux: docs/firecracker.md, Install)."
             echo
             echo '```'
             cat "$out/SHA256SUMS"

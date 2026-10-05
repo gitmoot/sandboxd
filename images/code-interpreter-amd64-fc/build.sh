@@ -5,6 +5,8 @@
 # contract of images/e2b-amd64-fc.
 # Usage (root, from the repository root):
 #   images/code-interpreter-amd64-fc/build.sh [/var/lib/sandboxd-fc]
+# SANDBOXD_GUEST_AGENT=<file>: use this sandboxd-guest-agent (from the
+# linux-amd64 release tarball of the same tag) instead of building it with Go.
 # Output: <dir>/images/code-interpreter-amd64-<sha256 prefix>.ext4 (0444,
 # root-owned) plus a .sha256 file. The docker image, its containers and the
 # build-cache entries this build created are removed.
@@ -88,8 +90,12 @@ systemd units (systemd/jupyter.service, systemd/code-interpreter.service) are
 replaced by /root/.jupyter/sandboxd-start.sh (sandboxd, gitmoot/sandboxd).
 EOF
 
-(cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags=-s -o "$ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+if [ -n "${SANDBOXD_GUEST_AGENT:-}" ]; then
+    install -m 0755 "$SANDBOXD_GUEST_AGENT" "$ctx/sandboxd-guest-agent"
+else
+    (cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -ldflags=-s -o "$ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+fi
 curl -fsSL --proto '=https' -o "$ctx/envd" "$envd_url"
 printf '%s  %s\n' "$envd_sha256" "$ctx/envd" | sha256sum -c --quiet -
 curl -fsSL --proto '=https' -o "$ctx/doc/envd/LICENSE" "$license_url"

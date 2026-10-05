@@ -2,6 +2,8 @@
 # Builds the read-only Firecracker guest root filesystem (docs/firecracker.md).
 # Usage (root, from the repository root):
 #   images/linux-amd64-fc/build.sh [--go126] [/var/lib/sandboxd-fc]
+# SANDBOXD_GUEST_AGENT=<file>: use this sandboxd-guest-agent (from the
+# linux-amd64 release tarball of the same tag) instead of building it with Go.
 # Output: <dir>/images/review-amd64-<sha256 prefix>.ext4, or with --go126
 # <dir>/images/review-go126-amd64-<sha256 prefix>.ext4 (0444, root-owned)
 # plus a .sha256 file. The docker image and containers it creates are removed.
@@ -49,8 +51,12 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$work/ctx" "$work/root"
 cp "$here/Dockerfile" "$work/ctx/Dockerfile"
-(cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags=-s -o "$work/ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+if [ -n "${SANDBOXD_GUEST_AGENT:-}" ]; then
+    install -m 0755 "$SANDBOXD_GUEST_AGENT" "$work/ctx/sandboxd-guest-agent"
+else
+    (cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -ldflags=-s -o "$work/ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+fi
 if [ "$target" = review ]; then
     cat >"$work/ctx/env" <<'EOF'
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

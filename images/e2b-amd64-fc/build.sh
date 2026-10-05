@@ -3,6 +3,8 @@
 # profile=e2b templates (docs/firecracker.md, "E2B base image").
 # Usage (root, from the repository root):
 #   images/e2b-amd64-fc/build.sh [/var/lib/sandboxd-fc]
+# SANDBOXD_GUEST_AGENT=<file>: use this sandboxd-guest-agent (from the
+# linux-amd64 release tarball of the same tag) instead of building it with Go.
 # Output: <dir>/images/e2b-amd64-<sha256 prefix>.ext4 (0444, root-owned)
 # plus a .sha256 file. The docker image and containers it creates are removed.
 set -eu
@@ -51,8 +53,12 @@ trap cleanup EXIT INT TERM
 mkdir -p "$work/ctx" "$work/root"
 cache_ids >"$work/cache.before"
 cp "$here/Dockerfile" "$work/ctx/Dockerfile"
-(cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-    go build -trimpath -ldflags=-s -o "$work/ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+if [ -n "${SANDBOXD_GUEST_AGENT:-}" ]; then
+    install -m 0755 "$SANDBOXD_GUEST_AGENT" "$work/ctx/sandboxd-guest-agent"
+else
+    (cd "$repo" && env GOTOOLCHAIN="${GOTOOLCHAIN:-go1.26.4}" CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+        go build -trimpath -ldflags=-s -o "$work/ctx/sandboxd-guest-agent" ./cmd/sandboxd-guest-agent)
+fi
 curl -fsSL --proto '=https' -o "$work/ctx/envd" "$envd_url"
 printf '%s  %s\n' "$envd_sha256" "$work/ctx/envd" | sha256sum -c --quiet -
 curl -fsSL --proto '=https' -o "$work/ctx/LICENSE" "$license_url"
