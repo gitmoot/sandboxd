@@ -45,6 +45,18 @@ type Handler struct {
 	MaxOutputBytes int64
 }
 
+// Routes serves the guest data-plane paths with guest and every other path
+// with api, so every sandboxd binary splits its single listener the same way.
+func Routes(guest, api http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/files" || r.URL.Path == "/process.Process/Start" {
+			guest.ServeHTTP(w, r)
+			return
+		}
+		api.ServeHTTP(w, r)
+	})
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h == nil || h.Driver == nil || h.Authorizer == nil {
 		http.Error(w, "guest service unavailable", http.StatusServiceUnavailable)

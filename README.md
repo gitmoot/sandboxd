@@ -59,7 +59,9 @@ each VM behind a PF firewall, and a SQLite ledger tracks every VM it creates.
 ## Compatibility
 
 [`docs/compatibility.md`](docs/compatibility.md) is the authoritative
-description. Summary:
+description. [`docs/conformance-matrix.md`](docs/conformance-matrix.md) records,
+per operation, which stock E2B SDK tests pass today; CI fails when it regresses.
+Summary:
 
 | Area | E2B operation | Status | Notes |
 | --- | --- | :---: | --- |

@@ -135,14 +135,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	defer service.Close()
 	guest := &envd.Handler{Driver: driver, Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
-	api := service.Handler()
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/files" || r.URL.Path == "/process.Process/Start" {
-			guest.ServeHTTP(w, r)
-			return
-		}
-		api.ServeHTTP(w, r)
-	})
+	handler := envd.Routes(guest, service.Handler())
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err

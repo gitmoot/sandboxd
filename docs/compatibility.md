@@ -93,6 +93,38 @@ bridges.
 ordinary guests on gate failure and only requests anchor removal after every
 VM has been deleted.
 
+### CI conformance gate (dev driver)
+
+Every pull request runs `conformance/run.py` (`.github/workflows/conformance.yml`).
+It builds `cmd/sandboxd-dev` with `-tags sandboxd_devdriver` and starts a fresh
+instance per suite on loopback. That binary serves the real `internal/control`
+and `internal/envd` code with `internal/vm/devvm`, a CI-only driver whose
+"VMs" are local process groups in temporary directories: **no isolation**,
+no PF helper, no slots. The build tag keeps it out of `cmd/sandboxd` and the
+PF helper; `cmd/sandboxd/devdriver_guard_test.go` fails if either links it
+or if a dev-driver source builds without the tag.
+
+Against that instance the harness runs, unchanged:
+
+- the upstream Python and JS `e2b` 2.52.0 tests and the code-interpreter
+  Python 2.10.1 and JS 2.8.0 tests, from pinned `e2b-dev/E2B` tag commits,
+  with the stock SDKs configured only by `E2B_API_URL`, `E2B_SANDBOX_URL`,
+  `E2B_API_KEY` and `E2B_DOMAIN`;
+- the pinned Gitmoot package `internal/execbackend/e2b`: its offline
+  fixture tests and `TestSandboxdPinnedClientConformance`, with
+  `SANDBOXD_CONFORMANCE_CANCEL=1`.
+
+The per-test outcomes are recorded in `conformance/expected.json` and rendered
+as [`docs/conformance-matrix.md`](conformance-matrix.md), which lists every
+expected failure. The gate fails when any recorded outcome changes, in either
+direction: a regression fails, and so does an improvement that was not
+recorded. Record intended changes with `python3 conformance/run.py --update`
+and commit both files. Locally the harness needs `git`, `go`, Python 3.11+ and
+Node 22+; it installs the SDKs into a temporary venv and npm directory and
+deletes them afterwards unless `--workdir` is given.
+
+This proves the wire contract only. Isolation is proven on a real worker.
+
 ### Network slots: one host-only network per concurrent guest
 
 Two guests on the same Apple host-only network can reach each other: PF on
