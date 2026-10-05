@@ -239,3 +239,182 @@ func TestSignedFileURLWithoutRoutingHeaders(t *testing.T) {
 	default:
 	}
 }
+
+// countingE2B is fakeE2B that counts signed-URL lookups.
+type countingE2B struct {
+	fakeE2B
+	lookups int
+}
+
+func (f *countingE2B) SignedSandbox(signed func(string) bool) (string, bool) {
+	f.lookups++
+	return f.fakeE2B.SignedSandbox(signed)
+}
+
+// A signed file URL that names no sandbox and cannot be valid (wrong shape,
+// unparsable expiration) or has expired is refused before any sandbox is
+// looked at; only a well-formed, unexpired one is matched.
+func TestUnroutedSignatureRefusedBeforeLookup(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "file") }))
+	t.Cleanup(upstream.Close)
+	fake := &countingE2B{fakeE2B: fakeE2B{upstream: upstream}}
+	strict := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "strict", http.StatusTeapot) })
+	routes := Routes(strict, NewProxy(fake, "sandboxd.test", "gateway.test"), http.NotFoundHandler())
+	future := strconv.FormatInt(time.Now().Add(time.Minute).Unix(), 10)
+	shaped := "v1_" + strings.Repeat("A", 43)
+	for _, refusal := range []struct {
+		name, query string
+		status      int
+	}{
+		{"short signature", "signature=v1_abc&signature_expiration=" + future, http.StatusTeapot},
+		{"wrong version", "signature=v2_" + strings.Repeat("A", 43) + "&signature_expiration=" + future, http.StatusTeapot},
+		{"unparsable expiration", "signature=" + shaped + "&signature_expiration=soon", http.StatusTeapot},
+		{"expired", "signature=" + shaped + "&signature_expiration=1", http.StatusUnauthorized},
+	} {
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://gateway.test/files?path=a.txt&username=user&"+refusal.query, nil))
+		if w.Code != refusal.status || fake.lookups != 0 {
+			t.Fatalf("%s: %d %s after %d lookups", refusal.name, w.Code, w.Body, fake.lookups)
+		}
+	}
+	w := httptest.NewRecorder()
+	routes.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://gateway.test"+signedURL("a.txt", "read", "user", time.Now().Add(time.Minute).Unix()), nil))
+	if w.Code != http.StatusOK || fake.lookups != 1 {
+		t.Fatalf("valid signature: %d %s after %d lookups", w.Code, w.Body, fake.lookups)
+	}
+}
+
+// The guest port and envd proxies never pass sandboxd's routing headers or
+// gateway and client credentials to the guest. A guest port keeps only the
+// envd access token (E2B's code-interpreter server reads it); envd keeps its
+// token and the Basic user in Authorization.
+func TestProxiesStripGatewayCredentials(t *testing.T) {
+	routes, _, seen := newProxyFixture(t)
+	credentials := map[string]string{"X-Api-Key": "control-secret", "Authorization": "Basic cm9vdDo=", "Cookie": "session=secret",
+		"Proxy-Authorization": "Basic cHJveHk6c2VjcmV0"}
+	never := []string{"X-Api-Key", "Cookie", "Proxy-Authorization", trafficTokenHeader, "E2b-Sandbox-Id", "E2b-Sandbox-Port"}
+	check := func(name string, forwarded *http.Request, absent []string, kept map[string]string) {
+		t.Helper()
+		for _, header := range absent {
+			if value := forwarded.Header.Get(header); value != "" {
+				t.Fatalf("%s: the guest saw %s=%q", name, header, value)
+			}
+		}
+		for header, want := range kept {
+			if got := forwarded.Header.Get(header); got != want {
+				t.Fatalf("%s: the guest saw %s=%q, want %q", name, header, got, want)
+			}
+		}
+	}
+	for _, auth := range [][2]string{{trafficTokenHeader, e2bTrafficToken}, {"X-Access-Token", e2bToken}} {
+		r := portRequest("gateway.test", e2bID, exposedPort, auth[0], auth[1])
+		for header, value := range credentials {
+			r.Header.Set(header, value)
+		}
+		r.Header.Set("X-Custom", "app")
+		w := httptest.NewRecorder()
+		routes.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("port via %s: %d %s", auth[0], w.Code, w.Body)
+		}
+		kept := map[string]string{"X-Custom": "app"}
+		if auth[0] == "X-Access-Token" {
+			kept["X-Access-Token"] = e2bToken
+		}
+		check("port via "+auth[0], <-seen, append(slices.Clone(never), "Authorization"), kept)
+	}
+	r := envdRequest(http.MethodPost, "/process.Process/List", e2bID, e2bToken)
+	for header, value := range credentials {
+		r.Header.Set(header, value)
+	}
+	r.Header.Set(trafficTokenHeader, e2bTrafficToken)
+	w := httptest.NewRecorder()
+	routes.ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("envd: %d %s", w.Code, w.Body)
+	}
+	check("envd", <-seen, never, map[string]string{"X-Access-Token": e2bToken, "Authorization": credentials["Authorization"]})
+}
+
+// A WebSocket upgrade through a guest port streams both ways and ends
+// cleanly: the hijacked connection is never flushed or written to again (no
+// server error or panic is logged) and the sandbox's stream is released.
+func TestPortProxyWebSocketUpgrade(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "upgrade required", http.StatusUpgradeRequired)
+			return
+		}
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n")
+		_ = rw.Flush()
+		line, err := rw.ReadString('\n')
+		if err != nil {
+			return
+		}
+		_, _ = rw.WriteString("echo:" + line)
+		_ = rw.Flush()
+	}))
+	t.Cleanup(upstream.Close)
+	proxy := NewProxy(&fakeE2B{upstream: upstream}, "sandboxd.test", "127.0.0.1")
+	var logged strings.Builder
+	var logMu sync.Mutex
+	server := httptest.NewUnstartedServer(Routes(http.NotFoundHandler(), proxy, http.NotFoundHandler()))
+	server.Config.ErrorLog = log.New(writerFunc(func(p []byte) (int, error) {
+		logMu.Lock()
+		defer logMu.Unlock()
+		return logged.Write(p)
+	}), "", 0)
+	server.Start()
+	t.Cleanup(server.Close)
+	conn, err := net.Dial("tcp", server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, err = fmt.Fprintf(conn, "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nE2b-Sandbox-Id: %s\r\nE2b-Sandbox-Port: %d\r\n%s: %s\r\n"+
+		"Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+		e2bID, exposedPort, trafficTokenHeader, e2bTrafficToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil || response.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade: %v %v", response, err)
+	}
+	if _, err := io.WriteString(conn, "hello\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := reader.ReadString('\n'); err != nil || line != "echo:hello\n" {
+		t.Fatalf("echo: %q %v", line, err)
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		t.Fatalf("the stream did not end with the upstream: %v", err)
+	}
+	_ = conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		proxy.streamsMu.Lock()
+		open := len(proxy.streams)
+		proxy.streamsMu.Unlock()
+		if open == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sandbox stream(s) still held after the WebSocket ended", open)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	server.Close()
+	logMu.Lock()
+	defer logMu.Unlock()
+	if logged.Len() != 0 {
+		t.Fatalf("server logged: %s", logged.String())
+	}
+}

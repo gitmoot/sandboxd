@@ -1,6 +1,7 @@
 package envd
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -78,9 +79,10 @@ func NewProxy(sandboxes E2BSandboxes, domain, gatewayHost string) *Proxy {
 			out.Out.URL.Scheme = "http"
 			out.Out.URL.Host = out.In.Context().Value(proxyTarget{}).(string)
 			out.Out.Host = out.Out.URL.Host
-			// Routing headers are sandboxd's, not envd's.
-			out.Out.Header.Del("E2b-Sandbox-Id")
-			out.Out.Header.Del("E2b-Sandbox-Port")
+			// envd needs X-Access-Token (its own token check) and
+			// Authorization (the Basic user a process or file runs as);
+			// sandboxd's routing and credentials are not envd's.
+			stripHeaders(out.Out.Header, gatewayHeaders...)
 		},
 		Transport:      transport,
 		ModifyResponse: endStreams,
@@ -199,6 +201,16 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
 	case !envdRoute(r.URL):
 		return false
 	case !ok && r.URL.Path == "/files" && r.URL.Query().Has("signature") && p.onGateway(r):
+		// Nothing names the sandbox and nothing has proven a token yet, so
+		// a signature that cannot be valid, or one that has expired, is
+		// refused before any sandbox is looked at.
+		switch wellFormed, expired := signatureShape(r); {
+		case !wellFormed:
+			return false
+		case expired:
+			jsonError(w, http.StatusUnauthorized, "signature is already expired")
+			return true
+		}
 		id, ok = p.Sandboxes.SignedSandbox(func(token string) bool {
 			valid, _ := fileSignature(r, token)
 			return valid
@@ -217,30 +229,58 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
 		jsonError(w, status, message)
 		return true
 	}
+	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, EnvdPort))
+	r = r.WithContext(ctx)
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/connect") {
 		// Connect client and bidirectional streams read the request while
 		// the response streams.
-		_ = http.NewResponseController(w).EnableFullDuplex()
-		defer closeFullDuplexBody(w, r)
+		serveFullDuplex(p.proxy, w, r)
+		return true
 	}
-	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, EnvdPort))
-	p.proxy.ServeHTTP(w, r.WithContext(ctx))
+	p.proxy.ServeHTTP(w, r)
 	return true
 }
 
-// closeFullDuplexBody closes the request body of a full-duplex handler
-// before it returns. In full-duplex mode net/http leaves an unread body (an
+// serveFullDuplex runs proxy for r in full-duplex mode (the request body
+// is read while the response streams) and closes the request body before
+// it returns. In full-duplex mode net/http leaves an unread body (an
 // upstream that refused or dropped the request) to its post-handler Close;
 // that Close reads the body to its end, which starts the connection's
 // background read after the server stopped it, and the next request's read
 // then panics ("invalid concurrent Body.Read call") and drops the client's
 // keep-alive connection. Closed here, the server stops that background read
-// as usual. The response is flushed first, as the server would before its
-// Close, so a client never waits on it while its body is drained.
-func closeFullDuplexBody(w http.ResponseWriter, r *http.Request) {
+// as usual; the response is flushed first, as the server would, so a client
+// never waits on it while its body is drained. A hijacked connection (an
+// upgraded stream, such as a WebSocket, which has already ended) belongs to
+// the proxy and is left alone: flushing it would panic.
+func serveFullDuplex(proxy http.Handler, w http.ResponseWriter, r *http.Request) {
+	_ = http.NewResponseController(w).EnableFullDuplex()
+	tracked := &hijackTracker{ResponseWriter: w}
+	proxy.ServeHTTP(tracked, r)
+	if tracked.hijacked {
+		return
+	}
 	_ = http.NewResponseController(w).Flush()
 	_ = r.Body.Close()
 }
+
+// hijackTracker records whether the handler hijacked the connection. It
+// implements Hijack itself, so http.ResponseController reaches it before
+// unwrapping; everything else unwraps to the server's ResponseWriter.
+type hijackTracker struct {
+	http.ResponseWriter
+	hijacked bool
+}
+
+func (h *hijackTracker) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(h.ResponseWriter).Hijack()
+	if err == nil {
+		h.hijacked = true
+	}
+	return conn, rw, err
+}
+
+func (h *hijackTracker) Unwrap() http.ResponseWriter { return h.ResponseWriter }
 
 const unauthorizedEnvd = "unauthorized access, please provide a valid access token or method signing if supported"
 
@@ -271,6 +311,29 @@ func (p *Proxy) authorized(r *http.Request, id string) (int, string) {
 		return http.StatusUnauthorized, unauthorizedEnvd
 	}
 	return 0, ""
+}
+
+// signatureLength is the length of a v1 file URL signature: "v1_" and the
+// unpadded base64 of a SHA-256.
+const signatureLength = len("v1_") + 43
+
+// signatureShape checks a file URL signature without any token: wellFormed
+// reports a v1 signature of the right length with a numeric expiration (if
+// any), expired one whose expiration has passed.
+func signatureShape(r *http.Request) (wellFormed, expired bool) {
+	query := r.URL.Query()
+	signature := query.Get("signature")
+	if len(signature) != signatureLength || !strings.HasPrefix(signature, "v1_") {
+		return false, false
+	}
+	if expiration := query.Get("signature_expiration"); expiration != "" {
+		unix, err := strconv.ParseInt(expiration, 10, 64)
+		if err != nil {
+			return false, false
+		}
+		return true, unix < time.Now().Unix()
+	}
+	return true, false
 }
 
 // fileSignature checks signature=v1_<b64(sha256(path:op:user:token[:exp]))>

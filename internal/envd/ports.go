@@ -19,6 +19,19 @@ const DefaultMaxPortStreams = 256
 // trafficTokenHeader carries an e2b sandbox's traffic access token.
 const trafficTokenHeader = "E2b-Traffic-Access-Token"
 
+// gatewayHeaders are sandboxd's own request headers: routing, and
+// credentials that authenticate to sandboxd (the control API key, the
+// traffic token) or to the client's origin (cookies, proxy credentials).
+// None of them ever reaches a guest, which runs untrusted code.
+var gatewayHeaders = []string{"E2b-Sandbox-Id", "E2b-Sandbox-Port", trafficTokenHeader, "X-Api-Key", "Cookie", "Proxy-Authorization"}
+
+// stripHeaders deletes names from h.
+func stripHeaders(h http.Header, names ...string) {
+	for _, name := range names {
+		h.Del(name)
+	}
+}
+
 // guestError is the JSON body E2B's edge proxy answers guest port requests it
 // refuses with; the SDKs and their tests read these fields.
 type guestError struct {
@@ -35,20 +48,21 @@ func writeGuestError(w http.ResponseWriter, body guestError) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-// newPortProxy forwards an authorized request to a guest port: everything
-// but sandboxd's routing and traffic token headers passes through (the
-// envd access token too: E2B's code-interpreter server reads it), the
-// client's Host included, and responses and upgraded streams (WebSocket)
-// flow back unbuffered.
+// newPortProxy forwards an authorized request to a guest port, the client's
+// Host included, and streams responses and upgraded streams (WebSocket)
+// back unbuffered. The guest port is served by untrusted code, so
+// gatewayHeaders and Authorization never reach it. The envd access token
+// (X-Access-Token) does: E2B's code-interpreter server reads it to call
+// envd's /envs for the sandbox's environment variables, and it only opens
+// that sandbox's own envd, which its guest already controls.
 func newPortProxy(transport http.RoundTripper) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite: func(out *httputil.ProxyRequest) {
 			out.Out.URL.Scheme = "http"
 			out.Out.URL.Host = out.In.Context().Value(proxyTarget{}).(string)
 			out.Out.Host = out.In.Host
-			out.Out.Header.Del("E2b-Sandbox-Id")
-			out.Out.Header.Del("E2b-Sandbox-Port")
-			out.Out.Header.Del(trafficTokenHeader)
+			stripHeaders(out.Out.Header, gatewayHeaders...)
+			out.Out.Header.Del("Authorization")
 		},
 		Transport:     transport,
 		FlushInterval: -1,
@@ -103,11 +117,9 @@ func (p *Proxy) servePort(w http.ResponseWriter, r *http.Request, id string, por
 		return
 	}
 	defer p.releaseStream(id)
-	_ = http.NewResponseController(w).EnableFullDuplex()
-	defer closeFullDuplexBody(w, r)
 	ctx := context.WithValue(r.Context(), proxyTarget{}, guestHost(id, port))
 	ctx = context.WithValue(ctx, portTarget{}, portTarget{id: id, port: port})
-	p.ports.ServeHTTP(w, r.WithContext(ctx))
+	serveFullDuplex(p.ports, w, r.WithContext(ctx))
 }
 
 func (p *Proxy) acquireStream(id string) bool {

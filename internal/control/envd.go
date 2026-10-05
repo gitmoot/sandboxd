@@ -66,22 +66,20 @@ func (s *Service) AuthorizeTraffic(id, token string) bool {
 // SignedSandbox finds the running e2b sandbox whose envd access token signed
 // a file URL that names no sandbox (the SDKs build signed URLs from
 // E2B_SANDBOX_URL, without routing headers). The signature binds exactly one
-// token, so at most one sandbox matches.
+// token, so at most one sandbox matches. Such a request carries no
+// credential yet, so the lookup reads only the in-memory index of running
+// e2b sandboxes, never the ledger or mu, and checks every token (signed
+// compares in constant time) so its timing does not tell which matched.
 func (s *Service) SignedSandbox(signed func(token string) bool) (string, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	s.mu.Lock()
-	rows, err := s.ledger.Active(ctx)
-	s.mu.Unlock()
-	if err != nil {
-		return "", false
-	}
-	for _, row := range rows {
-		if row.State == "running" && rowProfile(row.Profile) == ProfileE2B && signed(s.envdToken(row.ID)) {
-			return row.ID, true
+	s.signersMu.RLock()
+	defer s.signersMu.RUnlock()
+	found := ""
+	for id, token := range s.signers {
+		if signed(token) {
+			found = id
 		}
 	}
-	return "", false
+	return found, found != ""
 }
 
 // Exposes reports whether e2b sandbox id's template exposes guest port.

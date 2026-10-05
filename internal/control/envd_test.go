@@ -196,6 +196,71 @@ func TestE2BTemplateStartReadyAndPorts(t *testing.T) {
 	}
 }
 
+// SignedSandbox answers from the in-memory index of running e2b sandboxes:
+// without the ledger or mu (it answers while mu is held), only for a
+// running sandbox, and again after a restart.
+func TestSignedSandboxIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.sqlite")
+	driver := &fakeDriver{instances: map[string]vm.Instance{}}
+	s, err := Open(context.Background(), path, driver, mixedConfig(e2bBase, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	create := func() (string, string) {
+		got := request(t, s, http.MethodPost, "/v2/sandboxes", map[string]any{"templateID": "base"})
+		if got.Code != http.StatusCreated {
+			t.Fatalf("create: %d %s", got.Code, got.Body)
+		}
+		var created struct {
+			SandboxID       string `json:"sandboxID"`
+			EnvdAccessToken string `json:"envdAccessToken"`
+		}
+		if err := json.Unmarshal(got.Body.Bytes(), &created); err != nil {
+			t.Fatal(err)
+		}
+		return created.SandboxID, created.EnvdAccessToken
+	}
+	signedBy := func(s *Service, token string) (string, bool) {
+		return s.SignedSandbox(func(candidate string) bool { return candidate == token })
+	}
+	kept, keptToken := create()
+	deleted, deletedToken := create()
+	s.mu.Lock()
+	found := make(chan string, 1)
+	go func() {
+		id, _ := signedBy(s, keptToken)
+		found <- id
+	}()
+	select {
+	case id := <-found:
+		if id != kept {
+			t.Fatalf("SignedSandbox = %q, want %q", id, kept)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("SignedSandbox waited for mu")
+	}
+	s.mu.Unlock()
+	if got := request(t, s, http.MethodDelete, "/sandboxes/"+deleted, nil); got.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", got.Code, got.Body)
+	}
+	if id, ok := signedBy(s, deletedToken); ok {
+		t.Fatalf("a deleted sandbox still matches: %q", id)
+	}
+	if id, ok := signedBy(s, "not-a-token"); ok {
+		t.Fatalf("an unknown token matches %q", id)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openAt(t, path, driver, mixedConfig(e2bBase, 3))
+	if id, ok := signedBy(reopened, keptToken); !ok || id != kept {
+		t.Fatalf("after a restart SignedSandbox = %q, %v", id, ok)
+	}
+	if _, ok := signedBy(reopened, deletedToken); ok {
+		t.Fatal("after a restart a deleted sandbox matches")
+	}
+}
+
 // Config.ReadyTimeout (-template-ready-timeout) bounds the ready command
 // polling: a template that never becomes ready fails the create with 503 and
 // its sandbox is destroyed.
