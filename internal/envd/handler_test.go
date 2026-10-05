@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -275,5 +277,72 @@ func TestGuestOutputBudgetAbortsVM(t *testing.T) {
 	flag, terminal := nextFrame(t, frames)
 	if flag != 2 || !bytes.Contains(terminal, []byte("unavailable")) || frames.Len() != 0 {
 		t.Fatalf("overflow returned a successful process stream: %s", terminal)
+	}
+}
+
+// failingGuestFixture starts a process and then fails with err, as a guest
+// router does when the worker hosting the VM drops out mid-call.
+type failingGuestFixture struct {
+	guestFixture
+	err error
+}
+
+func (g *failingGuestFixture) Run(_ context.Context, _ string, command vm.Command, stdout, _ io.Writer) (int, error) {
+	command.OnStart(123)
+	_, _ = stdout.Write([]byte("partial"))
+	return -1, g.err
+}
+
+func (g *failingGuestFixture) CopyIn(context.Context, string, string, string) error { return g.err }
+
+func TestRetryableGuestFailureKeepsVM(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		err   error
+		abort bool
+	}{
+		{"worker unreachable", fmt.Errorf("%w: dial tcp: connection refused", ErrRetryable), false},
+		{"guest failure", errors.New("run failed"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auth := abortRecorder{calls: make(chan string, 2)}
+			h := &Handler{Driver: &failingGuestFixture{err: tc.err}, Authorizer: auth, GatewayHost: "mac.private.test"}
+			send := func(target, contentType string, body []byte) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+				r.Header.Set("X-Access-Token", "job-capability")
+				r.Header.Set("E2b-Sandbox-Id", "sandboxd-a1")
+				r.Header.Set("E2b-Sandbox-Port", "49983")
+				r.Header.Set("Content-Type", contentType)
+				r.Header.Set("connect-protocol-version", "1")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				return w
+			}
+			start := send("http://mac.private.test/process.Process/Start", connectMediaType,
+				framed(0, []byte(`{"process":{"cmd":"/bin/echo","cwd":"/home/user"}}`)))
+			frames := bytes.NewReader(start.Body.Bytes())
+			var terminal []byte
+			for frames.Len() > 0 {
+				var flag byte
+				flag, terminal = nextFrame(t, frames)
+				if flag == 2 {
+					break
+				}
+			}
+			if !bytes.Contains(terminal, []byte("unavailable")) {
+				t.Fatalf("failed run reported %s, want an unavailable error", terminal)
+			}
+			upload := send("http://mac.private.test/files?username=user&path=/home/user/input", "application/octet-stream", []byte("x"))
+			aborts := len(auth.calls)
+			if tc.abort {
+				if aborts != 2 || upload.Code != http.StatusBadGateway {
+					t.Fatalf("guest failure: %d aborts, upload %d; want both calls to abort the VM", aborts, upload.Code)
+				}
+				return
+			}
+			if aborts != 0 || upload.Code != http.StatusServiceUnavailable || !bytes.Contains(terminal, []byte("sandbox kept")) {
+				t.Fatalf("retryable failure: %d aborts, upload %d, terminal %s; want the VM kept and a retryable 503", aborts, upload.Code, terminal)
+			}
+		})
 	}
 }

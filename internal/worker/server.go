@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
@@ -28,22 +30,33 @@ import (
 // the key's SHA-256 digest. Requests other than enrollment must carry the
 // current lease in X-Sandboxd-Lease, and enrolling a newer lease cancels any
 // Run or CopyIn still executing under an older one.
+//
+// The server also enforces every VM's end time on its own (see Reap), so a
+// guest never outlives its TTL because the gateway is unreachable.
 type Server struct {
 	driver    vm.Driver
 	meter     vm.ResourceMeter
 	decl      Declaration
 	keyHash   [sha256.Size]byte
 	maxUpload int64
+	maxTTL    time.Duration
+	now       func() time.Time
 
 	mu          sync.Mutex
 	lease       int64 // highest accepted lease; 0 until the first enrollment
 	leaseCtx    context.Context
 	leaseCancel context.CancelFunc
+	// ends is each known VM's end time. A VM first seen without one (after a
+	// worker restart) gets maxTTL from that moment.
+	ends map[string]time.Time
+	// creating holds VMs whose Create is in flight; they may not be listed yet.
+	creating map[string]bool
 }
 
 // NewServer exposes driver, declared as decl, to a gateway holding key, the
-// per-worker enrollment secret (>= 16 bytes of visible ASCII).
-func NewServer(driver vm.Driver, decl Declaration, key string) (*Server, error) {
+// per-worker enrollment secret (>= 16 bytes of visible ASCII). maxTTL caps
+// every VM's lifetime on this worker, whatever end time the gateway sends.
+func NewServer(driver vm.Driver, decl Declaration, key string, maxTTL time.Duration) (*Server, error) {
 	if driver == nil {
 		return nil, errors.New("worker driver is required")
 	}
@@ -53,7 +66,11 @@ func NewServer(driver vm.Driver, decl Declaration, key string) (*Server, error) 
 	if err := validKey(key); err != nil {
 		return nil, err
 	}
-	s := &Server{driver: driver, decl: decl.clone(), keyHash: sha256.Sum256([]byte(key)), maxUpload: maxUpload}
+	if maxTTL < time.Second {
+		return nil, errors.New("worker max TTL must be at least one second")
+	}
+	s := &Server{driver: driver, decl: decl.clone(), keyHash: sha256.Sum256([]byte(key)), maxUpload: maxUpload,
+		maxTTL: maxTTL, now: time.Now, ends: make(map[string]time.Time), creating: make(map[string]bool)}
 	s.meter, _ = driver.(vm.ResourceMeter)
 	s.leaseCtx, s.leaseCancel = context.WithCancel(context.Background())
 	return s, nil
@@ -103,6 +120,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method, handle = http.MethodPost, s.run
 	case parts[2] == "usage":
 		method, handle = http.MethodGet, s.usage
+	case parts[2] == "expiry":
+		method, handle = http.MethodPut, s.expire
 	default:
 		http.NotFound(w, r)
 		return
@@ -146,8 +165,9 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	if request.Lease < s.lease {
+		current := s.lease
 		s.mu.Unlock()
-		http.Error(w, staleMessage, http.StatusConflict)
+		staleLease(w, current)
 		return
 	}
 	if request.Lease > s.lease {
@@ -160,7 +180,10 @@ func (s *Server) enroll(w http.ResponseWriter, r *http.Request) {
 }
 
 // leased admits a request only under exactly the current lease and hands the
-// handler that lease's context, which is cancelled on re-enrollment.
+// handler that lease's context, which is cancelled on re-enrollment. A lower
+// lease is stale (a newer gateway took over); a higher one, or any lease
+// before the first enrollment, is unenrolled (this worker restarted), and the
+// gateway re-enrolls.
 func (s *Server) leased(w http.ResponseWriter, r *http.Request, handle func(http.ResponseWriter, *http.Request, context.Context)) {
 	values := r.Header.Values(leaseHeader)
 	if len(values) != 1 {
@@ -175,11 +198,21 @@ func (s *Server) leased(w http.ResponseWriter, r *http.Request, handle func(http
 	s.mu.Lock()
 	current, leaseCtx := s.lease, s.leaseCtx
 	s.mu.Unlock()
-	if current == 0 || lease != current {
-		http.Error(w, staleMessage, http.StatusConflict)
-		return
+	switch {
+	case lease < current:
+		staleLease(w, current)
+	case lease > current:
+		w.Header().Set(leaseStateHeader, "unenrolled")
+		http.Error(w, "worker is not enrolled under this lease", http.StatusConflict)
+	default:
+		handle(w, r, leaseCtx)
 	}
-	handle(w, r, leaseCtx)
+}
+
+func staleLease(w http.ResponseWriter, current int64) {
+	w.Header().Set(leaseStateHeader, "stale")
+	w.Header().Set(currentLeaseHeader, strconv.FormatInt(current, 10))
+	http.Error(w, staleMessage, http.StatusConflict)
 }
 
 // fenced derives a context from the request that is also cancelled when the
@@ -193,7 +226,7 @@ func fenced(r *http.Request, leaseCtx context.Context) (context.Context, context
 func (s *Server) list(w http.ResponseWriter, r *http.Request, _ context.Context) {
 	instances, err := s.driver.List(r.Context())
 	if err != nil {
-		driverFailed(w, "list")
+		driverFailed(w, "list", err)
 		return
 	}
 	out := make([]instanceJSON, 0, len(instances))
@@ -203,7 +236,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, _ context.Context)
 	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *Server) create(w http.ResponseWriter, r *http.Request, _ context.Context) {
+func (s *Server) create(w http.ResponseWriter, r *http.Request, leaseCtx context.Context) {
 	var request createRequest
 	if !decodeJSON(w, r, &request) {
 		return
@@ -218,12 +251,119 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, _ context.Contex
 	case request.CPUs != s.decl.CPUs || request.MemoryMiB != s.decl.MemoryMiB:
 		http.Error(w, "VM shape differs from this worker's declaration", http.StatusBadRequest)
 	default:
-		instance, err := s.driver.Create(r.Context(), vm.Spec(request))
+		// Record the end time before the VM can exist, so the reaper never
+		// sees it without one.
+		s.mu.Lock()
+		s.ends[request.ID] = s.capEnd(request.Ends)
+		s.creating[request.ID] = true
+		s.mu.Unlock()
+		instance, err := s.driver.Create(r.Context(), vm.Spec{ID: request.ID, Image: request.Image, Network: request.Network,
+			CPUs: request.CPUs, MemoryMiB: request.MemoryMiB})
+		s.mu.Lock()
+		delete(s.creating, request.ID)
+		s.mu.Unlock()
+		// A newer gateway enrolled while this Create ran: the caller no longer
+		// owns this worker and must not admit the VM. The new owner's
+		// reconciliation finds it without a ledger row and destroys it.
+		if leaseCtx.Err() != nil {
+			s.mu.Lock()
+			current := s.lease
+			s.mu.Unlock()
+			staleLease(w, current)
+			return
+		}
 		if err != nil {
-			driverFailed(w, "create")
+			driverFailed(w, "create", err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, instanceJSON(instance))
+	}
+}
+
+// capEnd bounds a requested end time by this worker's max TTL from now; a
+// zero end time means the max TTL. Callers hold s.mu.
+func (s *Server) capEnd(ends time.Time) time.Time {
+	limit := s.now().Add(s.maxTTL)
+	if ends.IsZero() || ends.After(limit) {
+		return limit
+	}
+	return ends
+}
+
+func (s *Server) expire(w http.ResponseWriter, r *http.Request, id string, _ context.Context) {
+	var request expiryRequest
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if request.Ends.IsZero() {
+		http.Error(w, "ends is required", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	s.ends[id] = s.capEnd(request.Ends)
+	s.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Reap destroys every VM whose end time has passed, using one complete
+// inventory. A VM seen for the first time without an end time (it predates a
+// worker restart) gets the max TTL from now. A failed destroy is retried on
+// the next pass.
+func (s *Server) Reap(ctx context.Context) error {
+	instances, err := s.driver.List(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	now := s.now()
+	present := make(map[string]bool, len(instances))
+	var expired []string
+	for _, instance := range instances {
+		present[instance.ID] = true
+		ends, known := s.ends[instance.ID]
+		if !known {
+			ends = now.Add(s.maxTTL)
+			s.ends[instance.ID] = ends
+		}
+		if !now.Before(ends) && !s.creating[instance.ID] {
+			expired = append(expired, instance.ID)
+		}
+	}
+	for id := range s.ends {
+		if !present[id] && !s.creating[id] {
+			delete(s.ends, id)
+		}
+	}
+	s.mu.Unlock()
+	var errs []error
+	for _, id := range expired {
+		if err := s.driver.Destroy(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("destroy expired VM %s: %w", id, err))
+			continue
+		}
+		log.Printf("worker %s: destroyed VM %s at the end of its lifetime", s.decl.ID, id)
+		s.mu.Lock()
+		delete(s.ends, id)
+		s.mu.Unlock()
+	}
+	return errors.Join(errs...)
+}
+
+// ReapEvery runs Reap every interval until ctx ends, logging failures.
+func (s *Server) ReapEvery(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			passCtx, cancel := context.WithTimeout(ctx, time.Minute)
+			if err := s.Reap(passCtx); err != nil && ctx.Err() == nil {
+				log.Printf("worker %s: expiry pass: %v", s.decl.ID, err)
+			}
+			cancel()
+		}
 	}
 }
 
@@ -238,9 +378,12 @@ func (s *Server) declaresImage(image string) bool {
 
 func (s *Server) destroy(w http.ResponseWriter, r *http.Request, id string, _ context.Context) {
 	if err := s.driver.Destroy(r.Context(), id); err != nil {
-		driverFailed(w, "destroy")
+		driverFailed(w, "destroy", err)
 		return
 	}
+	s.mu.Lock()
+	delete(s.ends, id)
+	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -277,10 +420,13 @@ func (s *Server) copyIn(w http.ResponseWriter, r *http.Request, id string, lease
 	}
 	if err := s.driver.CopyIn(ctx, id, tmp.Name(), guestPaths[0]); err != nil {
 		if leaseCtx.Err() != nil {
-			http.Error(w, staleMessage, http.StatusConflict)
+			s.mu.Lock()
+			current := s.lease
+			s.mu.Unlock()
+			staleLease(w, current)
 			return
 		}
-		driverFailed(w, "copy")
+		driverFailed(w, "copy", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -325,7 +471,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request, id string, _ cont
 	}
 	usage, err := s.meter.Usage(r.Context(), id)
 	if err != nil {
-		driverFailed(w, "usage")
+		driverFailed(w, "usage", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, usageJSON(usage))
@@ -438,7 +584,10 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 // driverFailed reports a driver error without leaking its details, which can
-// include host paths and tool output.
-func driverFailed(w http.ResponseWriter, operation string) {
+// include host paths and tool output, to the gateway; the worker's own log
+// keeps them.
+func driverFailed(w http.ResponseWriter, operation string, err error) {
+	log.Printf("worker driver %s failed: %v", operation, err)
+	w.Header().Set(driverErrorHeader, operation)
 	http.Error(w, fmt.Sprintf("worker driver %s failed", operation), http.StatusBadGateway)
 }

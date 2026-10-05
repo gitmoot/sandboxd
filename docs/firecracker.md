@@ -129,7 +129,9 @@ To run it as a worker that another sandboxd gateway enrolls (see
 flags with `-worker-key-file <0600 file>` and keep `-worker-id`. It then
 declares architecture `amd64` and driver `firecracker`. The gateway enrolls
 it with `-enroll id=<worker-id>,url=<https URL>,key-file=<same key>` and
-`-template-arch review-amd64=amd64`.
+`-template-arch review-amd64=amd64`. The worker destroys each VM at the end
+time the gateway sent, capped by its own `-max-ttl` (default 1h), even when
+it cannot reach the gateway.
 
 ## Tests
 

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
@@ -113,8 +114,16 @@ func (c *Client) Enroll(ctx context.Context, lease int64) (Declaration, error) {
 	return decl, nil
 }
 
+// Create creates a VM that the worker destroys at its own max TTL.
 func (c *Client) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) {
-	body, err := json.Marshal(createRequest(spec))
+	return c.CreateUntil(ctx, spec, time.Time{})
+}
+
+// CreateUntil creates a VM that the worker destroys on its own at ends,
+// capped by the worker's max TTL.
+func (c *Client) CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) (vm.Instance, error) {
+	body, err := json.Marshal(createRequest{ID: spec.ID, Image: spec.Image, Network: spec.Network, CPUs: spec.CPUs,
+		MemoryMiB: spec.MemoryMiB, Ends: ends.UTC()})
 	if err != nil {
 		return vm.Instance{}, err
 	}
@@ -134,6 +143,26 @@ func (c *Client) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 		return vm.Instance{}, fmt.Errorf("worker %s: create %s returned VM %q", c.id, spec.ID, instance.ID)
 	}
 	return vm.Instance(instance), nil
+}
+
+// Expire moves the worker-side end time of VM id.
+func (c *Client) Expire(ctx context.Context, id string, ends time.Time) error {
+	if err := c.checkVM(id); err != nil {
+		return err
+	}
+	if ends.IsZero() {
+		return fmt.Errorf("worker %s: expire %s: end time is required", c.id, id)
+	}
+	body, err := json.Marshal(expiryRequest{Ends: ends.UTC()})
+	if err != nil {
+		return err
+	}
+	resp, err := c.leased(ctx, http.MethodPut, "/vms/"+id+"/expiry", nil, bytes.NewReader(body), int64(len(body)), "application/json")
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return c.expect(resp, http.StatusNoContent)
 }
 
 func (c *Client) List(ctx context.Context) ([]vm.Instance, error) {
@@ -218,7 +247,7 @@ func (c *Client) Run(ctx context.Context, id string, cmd vm.Command, stdout, std
 	buf := make([]byte, maxFrameData)
 	for {
 		if _, err := io.ReadFull(reader, header[:]); err != nil {
-			return 0, fmt.Errorf("worker %s: run %s: stream ended without exit status: %w", c.id, id, err)
+			return 0, fmt.Errorf("worker %s: run %s: stream ended without exit status: %w: %w", c.id, id, ErrUnavailable, err)
 		}
 		size := binary.BigEndian.Uint32(header[1:])
 		if size > maxFrameData {
@@ -226,7 +255,7 @@ func (c *Client) Run(ctx context.Context, id string, cmd vm.Command, stdout, std
 		}
 		data := buf[:size]
 		if _, err := io.ReadFull(reader, data); err != nil {
-			return 0, fmt.Errorf("worker %s: run %s: stream ended without exit status: %w", c.id, id, err)
+			return 0, fmt.Errorf("worker %s: run %s: stream ended without exit status: %w: %w", c.id, id, ErrUnavailable, err)
 		}
 		switch header[0] {
 		case frameStarted:
@@ -334,7 +363,7 @@ func (c *Client) leased(ctx context.Context, method, route string, query url.Val
 	lease := c.lease
 	c.mu.Unlock()
 	if lease == 0 {
-		return nil, fmt.Errorf("worker %s: %w", c.id, errNotEnrolled)
+		return nil, fmt.Errorf("worker %s: %w: %w", c.id, ErrUnavailable, errNotEnrolled)
 	}
 	return c.send(ctx, method, route, query, lease, body, length, contentType)
 }
@@ -360,12 +389,16 @@ func (c *Client) send(ctx context.Context, method, route string, query url.Value
 	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("worker %s: %s %s: %w", c.id, method, route, err)
+		return nil, fmt.Errorf("worker %s: %s %s: %w: %w", c.id, method, route, ErrUnavailable, err)
 	}
 	return resp, nil
 }
 
-// expect maps any status but want to an error; 409 is a stale lease.
+// expect maps any status but want to an error. A 409 is a stale lease, or,
+// when the worker says it is not enrolled under this lease (it restarted),
+// ErrUnavailable. A failure reported by the worker's driver is a plain error;
+// any other server error came from the transport in front of the worker and
+// is ErrUnavailable.
 func (c *Client) expect(resp *http.Response, want int) error {
 	if resp.StatusCode == want {
 		return nil
@@ -373,10 +406,18 @@ func (c *Client) expect(resp *http.Response, want int) error {
 	message, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 	route := resp.Request.URL.Path
 	if resp.StatusCode == http.StatusConflict {
-		return fmt.Errorf("worker %s: %s %s: %w", c.id, resp.Request.Method, route, ErrStaleLease)
+		if resp.Header.Get(leaseStateHeader) == "unenrolled" {
+			return fmt.Errorf("worker %s: %s %s: %w: %w", c.id, resp.Request.Method, route, ErrUnavailable, errNotEnrolled)
+		}
+		current, _ := strconv.ParseInt(resp.Header.Get(currentLeaseHeader), 10, 64)
+		return fmt.Errorf("worker %s: %s %s: %w", c.id, resp.Request.Method, route, &StaleLeaseError{Current: current})
 	}
-	return fmt.Errorf("worker %s: %s %s: status %d: %q", c.id, resp.Request.Method, route,
+	err := fmt.Errorf("worker %s: %s %s: status %d: %q", c.id, resp.Request.Method, route,
 		resp.StatusCode, strings.TrimSpace(string(message)))
+	if resp.StatusCode >= 500 && resp.Header.Get(driverErrorHeader) == "" {
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+	}
+	return err
 }
 
 func decodeResponse(resp *http.Response, dst any) error {

@@ -33,6 +33,20 @@ type Authorizer interface {
 	Abort(context.Context, string, string) error
 }
 
+// ErrRetryable marks a Guest failure that reached no verdict on the guest:
+// the worker hosting it was unreachable, lost the stream, or is owned by a
+// newer gateway. The data plane answers "unavailable" and keeps the VM; only
+// a real guest failure, an output overflow or the caller's own cancellation
+// tears it down.
+var ErrRetryable = errors.New("guest temporarily unreachable")
+
+// retryable reports an ErrRetryable failure of a request its caller has not
+// abandoned. A cancelled request still aborts the VM, since a guest process
+// can outlive its disconnected exec.
+func retryable(r *http.Request, err error) bool {
+	return r.Context().Err() == nil && errors.Is(err, ErrRetryable)
+}
+
 // Guest is the part of a VM driver the data plane uses. The gateway passes a
 // router that sends each call to the worker owning the sandbox.
 type Guest interface {
@@ -160,6 +174,10 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request, id, token strin
 		return
 	}
 	if err := h.Driver.CopyIn(r.Context(), id, file.Name(), guestPath); err != nil {
+		if retryable(r, err) {
+			http.Error(w, "guest temporarily unreachable; sandbox kept, retry", http.StatusServiceUnavailable)
+			return
+		}
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = h.Authorizer.Abort(cleanup, id, token)
 		cancel()
@@ -254,6 +272,10 @@ func (h *Handler) start(w http.ResponseWriter, r *http.Request, id, token string
 	stream.outputMu.Lock()
 	outputErr := stream.outputErr
 	stream.outputMu.Unlock()
+	if err != nil && outputErr == nil && retryable(r, err) {
+		_ = stream.frame(2, []byte(`{"error":{"code":"unavailable","message":"guest temporarily unreachable; sandbox kept"}}`))
+		return
+	}
 	if err != nil || outputErr != nil || !started {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		_ = h.Authorizer.Abort(cleanup, id, token)

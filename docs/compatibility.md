@@ -287,19 +287,34 @@ sandboxd ... -enroll id=linux-1,url=https://linux-1.<tailnet>:8444,key-file=/etc
 - **Scheduling.** A create goes to the online worker that serves its
   template and has the most free slots. Slots and capacity are per worker.
   When every compatible worker is full, create is `409` as above.
-- **Fencing.** Every enrollment takes a new lease from a durable per-worker
-  counter in the ledger. A worker refuses requests made under an older lease
-  and cancels runs and uploads started under one. The gateway drops a
-  worker's lease whenever it cannot observe the worker; until it re-enrolls,
-  that worker's sandboxes grant no guest access and get no new work. A
-  Create answered across a re-enrollment never admits its VM; the VM is
-  reconciled under the new lease. Each row records its worker and the lease
-  under which it was last proven present.
+- **Fencing.** A gateway instance claims each worker once, with a new lease
+  from a durable per-worker counter in the ledger, and keeps that lease
+  across reconnects. A worker refuses requests made under an older lease and
+  cancels runs, uploads and creates started under one, so only a newer
+  gateway instance (a restart, or one whose ledger was replaced) fences an
+  older one. A superseded gateway stops using the worker until it restarts;
+  it destroys nothing there. Each row records its worker and the lease under
+  which it was last proven present.
+- **Network blips.** While a worker cannot be observed, its sandboxes grant
+  no new guest access and it gets no new work, but its lease is kept: when it
+  answers again it is re-enrolled under the same lease, and runs already in
+  flight continue. A guest call that fails because the worker is unreachable,
+  the stream was lost, or a newer gateway owns the worker answers
+  `unavailable` and keeps the VM; only a real guest failure, an output
+  overflow or the caller's own cancellation tears the VM down. (After a lost
+  stream the guest process may still be running; the job can retry or delete
+  the sandbox, and the worker's expiry bounds it.)
+- **Expiry on the worker.** The gateway sends each sandbox's end time to its
+  worker on create, on renewal (`POST /sandboxes/{id}/timeout` fails with
+  `503` if the worker cannot be told) and after every re-enrollment. The
+  worker caps it by its own `-max-ttl` and destroys expired VMs itself every
+  second, also while partitioned from the gateway or after `forget-worker`.
+  A VM a restarted worker finds without an end time gets `-max-ttl` from then.
 - **Losing a worker.** Its sandboxes stay in the ledger, keep their slots and
   are listed as unconfirmed; deleting one is `503` until the worker returns.
   A retried job is scheduled elsewhere; when the old worker returns, its
-  superseded attempt is destroyed and every other sandbox is re-adopted.
-  The other workers' sandboxes are not affected.
+  superseded attempt is destroyed and every other sandbox is kept. The other
+  workers' sandboxes are not affected.
 - **Removing a worker.** A worker whose `-enroll` is removed while it still
   owns live sandboxes is treated like an offline one: its sandboxes stay
   listed, it is named in `X-Sandboxd-Offline-Workers` and reported in

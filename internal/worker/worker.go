@@ -16,14 +16,20 @@
 //     Every request carries "Authorization: Bearer <key>"; the worker keeps
 //     only the key's SHA-256 digest and compares digests in constant time
 //     before doing anything else. A leaked key compromises one worker only.
-//   - Lease fencing: enrollment presents the gateway's durable, strictly
-//     increasing lease generation. A worker accepts a lease only if it is >=
+//   - Lease fencing: a gateway instance claims a worker with a lease from its
+//     durable, strictly increasing counter and keeps that lease for its whole
+//     lifetime, across reconnects. A worker accepts a lease only if it is >=
 //     every lease it has accepted, and every other request must carry exactly
-//     the current lease. Re-enrollment under a newer lease cancels in-flight
-//     Run/CopyIn work started under an older one, so a delayed request from a
-//     superseded gateway, or a run it started, cannot act after re-enrollment.
-//     The accepted-lease floor lives in worker memory: a restarted worker has
-//     no in-flight work and accepts the next enrollment.
+//     the current lease. Only a newer gateway instance presents a higher
+//     lease; that cancels in-flight Run/CopyIn work started under the older
+//     one, so a superseded gateway, or a run it started, cannot act after it
+//     was replaced. A network blip never changes the lease and never cancels
+//     work. The accepted-lease floor lives in worker memory: a restarted worker
+//     has no in-flight work and accepts the next enrollment.
+//   - Expiry: every VM carries an end time on the worker, set from the
+//     gateway's sandbox TTL and capped by the worker's own max TTL. The worker
+//     destroys expired VMs itself, even while partitioned from the gateway or
+//     after the gateway forgot it.
 package worker
 
 import (
@@ -33,13 +39,33 @@ import (
 	"maps"
 	"regexp"
 	"slices"
+	"time"
 
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
 // ErrStaleLease reports that the worker has accepted a newer lease than the
-// one presented; the caller has been fenced off and must re-enroll.
+// one presented: another gateway instance owns the worker now.
 var ErrStaleLease = errors.New("stale worker lease")
+
+// StaleLeaseError is the worker's stale-lease answer. Current is the lease the
+// worker holds, or 0 when it was not reported.
+type StaleLeaseError struct{ Current int64 }
+
+func (e *StaleLeaseError) Error() string {
+	if e.Current == 0 {
+		return ErrStaleLease.Error()
+	}
+	return fmt.Sprintf("%s (worker holds lease %d)", ErrStaleLease, e.Current)
+}
+
+func (e *StaleLeaseError) Is(target error) bool { return target == ErrStaleLease }
+
+// ErrUnavailable marks a call that failed in transport or because the worker
+// is not (yet) enrolled under the caller's lease, without a verdict from the
+// worker's driver. Nothing about the guest is known to have failed; the call
+// may be retried.
+var ErrUnavailable = errors.New("worker unavailable")
 
 // ErrNoMetrics reports that the worker's driver cannot measure VM usage.
 var ErrNoMetrics = errors.New("VM metrics unavailable")
@@ -125,6 +151,12 @@ type Member interface {
 	// accepted, then returns its declaration; every later call is made under
 	// that lease.
 	Enroll(ctx context.Context, lease int64) (Declaration, error)
+	// CreateUntil is Create for a VM the worker destroys on its own at ends
+	// (capped by the worker's max TTL), whether or not the gateway is reachable.
+	CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) (vm.Instance, error)
+	// Expire moves a VM's worker-side end time, for a renewal or after the
+	// gateway re-adopts it.
+	Expire(ctx context.Context, id string, ends time.Time) error
 }
 
 type local struct {
@@ -135,7 +167,8 @@ type local struct {
 // Local wraps an in-process driver (today's single Mac). Enroll validates and
 // returns a copy of decl; there is no transport, so the member cannot be
 // stale. Usage delegates to vm.ResourceMeter when the driver implements it,
-// else returns ErrNoMetrics.
+// else returns ErrNoMetrics. Expiry is enforced by the gateway's own sweep in
+// the same process, so CreateUntil and Expire record no end time.
 func Local(driver vm.Driver, decl Declaration) Member {
 	return &local{Driver: driver, decl: decl.clone()}
 }
@@ -158,6 +191,12 @@ func (l *local) Usage(ctx context.Context, id string) (vm.Usage, error) {
 	return meter.Usage(ctx, id)
 }
 
+func (l *local) CreateUntil(ctx context.Context, spec vm.Spec, _ time.Time) (vm.Instance, error) {
+	return l.Driver.Create(ctx, spec)
+}
+
+func (l *local) Expire(context.Context, string, time.Time) error { return nil }
+
 // wire types shared by Server and Client.
 
 type enrollRequest struct {
@@ -176,6 +215,13 @@ type createRequest struct {
 	Network   string `json:"network"`
 	CPUs      int    `json:"cpus"`
 	MemoryMiB int    `json:"memoryMiB"`
+	// Ends is when the worker destroys the VM on its own; zero means the
+	// worker's max TTL from now.
+	Ends time.Time `json:"ends,omitzero"`
+}
+
+type expiryRequest struct {
+	Ends time.Time `json:"ends"`
 }
 
 type runRequest struct {
@@ -192,13 +238,21 @@ type usageJSON struct {
 }
 
 const (
-	apiPrefix    = "/worker/v1/"
-	leaseHeader  = "X-Sandboxd-Lease"
-	maxJSONBody  = 1 << 20
-	maxUpload    = 512 << 20
-	maxFrameData = 64 << 10
-	minKeyLen    = 16
-	staleMessage = "stale worker lease"
+	apiPrefix   = "/worker/v1/"
+	leaseHeader = "X-Sandboxd-Lease"
+	// leaseStateHeader qualifies a 409: "stale" (a newer lease was accepted;
+	// currentLeaseHeader carries it) or "unenrolled" (the worker holds no lease
+	// or an older one, e.g. after a worker restart; the caller re-enrolls).
+	leaseStateHeader   = "X-Sandboxd-Lease-State"
+	currentLeaseHeader = "X-Sandboxd-Current-Lease"
+	// driverErrorHeader marks a failure reported by the worker's VM driver, as
+	// opposed to a proxy or transport failure in front of the worker.
+	driverErrorHeader = "X-Sandboxd-Worker-Error"
+	maxJSONBody       = 1 << 20
+	maxUpload         = 512 << 20
+	maxFrameData      = 64 << 10
+	minKeyLen         = 16
+	staleMessage      = "stale worker lease"
 
 	frameStarted = 's'
 	frameStdout  = 'o'

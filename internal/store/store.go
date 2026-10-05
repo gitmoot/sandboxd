@@ -389,17 +389,21 @@ func (s *Store) Identities(ctx context.Context) (map[string]bool, error) {
 	return result, rows.Err()
 }
 
-// NextLease durably advances a worker's enrollment lease and returns it. Each
-// enrollment presents a lease no earlier enrollment ever used, including one
-// made before a gateway restart. local records whether the worker runs on the
-// gateway's own host.
-func (s *Store) NextLease(ctx context.Context, workerID string, local bool) (int64, error) {
+// NextLease durably advances a worker's enrollment lease and returns it. A
+// new gateway instance claims each worker once with it; no earlier instance
+// ever used the result, including one that ran before a gateway restart and
+// was not fenced yet. The result exceeds above, which lets a newly
+// started gateway claim a worker that already holds a higher lease (its ledger
+// was replaced). local records whether the worker runs on the gateway's own
+// host.
+func (s *Store) NextLease(ctx context.Context, workerID string, local bool, above int64) (int64, error) {
 	if workerID == "" {
 		return 0, errors.New("worker identity is required")
 	}
 	var lease int64
-	err := s.db.QueryRowContext(ctx, `INSERT INTO workers(id,lease,local) VALUES(?,1,?)
-		ON CONFLICT(id) DO UPDATE SET lease=lease+1, local=excluded.local RETURNING lease`, workerID, local).Scan(&lease)
+	err := s.db.QueryRowContext(ctx, `INSERT INTO workers(id,lease,local) VALUES(?,max(1,?+1),?)
+		ON CONFLICT(id) DO UPDATE SET lease=max(lease+1,?+1), local=excluded.local RETURNING lease`,
+		workerID, above, local, above).Scan(&lease)
 	return lease, err
 }
 

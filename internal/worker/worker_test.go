@@ -153,7 +153,7 @@ type plainDriver struct{ vm.Driver }
 
 func serve(t *testing.T, driver vm.Driver) (*Server, *httptest.Server) {
 	t.Helper()
-	server, err := NewServer(driver, testDecl(), testKey)
+	server, err := NewServer(driver, testDecl(), testKey, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestUploadCap(t *testing.T) {
 
 func TestEnrollRefusesForeignDeclaration(t *testing.T) {
 	fake := newFake()
-	server, err := NewServer(fake, testDecl(), testKey)
+	server, err := NewServer(fake, testDecl(), testKey, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -643,5 +643,152 @@ func TestDeclarationValidate(t *testing.T) {
 		if err := d.Validate(); err == nil {
 			t.Errorf("%s: accepted %+v", name, d)
 		}
+	}
+}
+
+// The worker ends VMs at their end time on its own: the gateway's end time is
+// honoured, capped by the worker's max TTL, and a VM it never heard of (after
+// a worker restart) gets the max TTL from when it is first seen.
+func TestWorkerReapsExpiredVMs(t *testing.T) {
+	fake := newFake()
+	server, ts := serve(t, fake)
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	server.now = func() time.Time { return now }
+	client := enrolled(t, ts.URL, 1)
+	ctx := context.Background()
+	if _, err := client.CreateUntil(ctx, spec(vmA), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	// The gateway asks for longer than the worker allows: capped to 1h.
+	if _, err := client.CreateUntil(ctx, vm.Spec{ID: vmB, Image: "img-review", Network: "slot-2", CPUs: 2, MemoryMiB: 2048}, now.Add(48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	const unknown = "sandboxd-00000000000000000000000000000009"
+	fake.mu.Lock()
+	fake.vms[unknown] = vm.Instance{ID: unknown, Running: true} // created before a worker restart
+	fake.mu.Unlock()
+	alive := func(id string) bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		_, ok := fake.vms[id]
+		return ok
+	}
+	step := func(at time.Duration) {
+		t.Helper()
+		now = time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC).Add(at)
+		if err := server.Reap(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	step(59 * time.Second)
+	if !alive(vmA) || !alive(vmB) || !alive(unknown) {
+		t.Fatal("reaped a VM before its end time")
+	}
+	step(time.Minute)
+	if alive(vmA) || !alive(vmB) {
+		t.Fatal("VM not ended at the gateway's end time")
+	}
+	// A renewal moves the end time; an end time beyond the cap is capped.
+	if err := client.Expire(ctx, vmB, now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	step(time.Hour + 58*time.Second) // unknown ends at 1h0m59s, the renewal at 1h1m
+	if !alive(vmB) || !alive(unknown) {
+		t.Fatal("reaped before the capped end time")
+	}
+	step(time.Minute + time.Hour)
+	if alive(vmB) || alive(unknown) {
+		t.Fatalf("VMs outlived the worker's max TTL: renewed=%v unknown=%v", alive(vmB), alive(unknown))
+	}
+}
+
+// Error classes decide what the gateway may do: a stale lease means a newer
+// gateway owns the worker; "not enrolled" (worker restarted) and transport
+// failures in front of the worker are retryable; a driver failure is real.
+func TestClientClassifiesFailures(t *testing.T) {
+	fake := newFake()
+	server, ts := serve(t, fake)
+	ctx := context.Background()
+	client := enrolled(t, ts.URL, 3)
+
+	// Worker restart: a fresh server behind the same URL holds no lease.
+	restarted, err := NewServer(fake, testDecl(), testKey, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.Config.Handler = restarted
+	_, err = client.List(ctx)
+	if !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrStaleLease) {
+		t.Fatalf("restarted worker: %v, want retryable, not stale", err)
+	}
+	if _, err := client.Enroll(ctx, 3); err != nil {
+		t.Fatalf("re-enroll under the same lease: %v", err)
+	}
+	// A newer gateway enrolls: stale, carrying the worker's lease.
+	enrolled(t, ts.URL, 9)
+	_, err = client.List(ctx)
+	var stale *StaleLeaseError
+	if !errors.As(err, &stale) || stale.Current != 9 || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("superseded gateway: %v, want stale lease reporting 9", err)
+	}
+	_ = server
+
+	// A proxy failure in front of the worker is retryable; a driver failure
+	// is not.
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/worker/v1/enroll" {
+			restarted.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}))
+	t.Cleanup(proxy.Close)
+	behindProxy := enrolled(t, proxy.URL, 10)
+	if _, err := behindProxy.List(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("proxy 502: %v, want retryable", err)
+	}
+	if err := enrolled(t, ts.URL, 11).CopyIn(ctx, vmA, writeTemp(t, "x"), "/home/user/x"); err == nil || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("driver failure: %v, want a non-retryable error", err)
+	}
+}
+
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	path := t.TempDir() + "/upload"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// gatedDriver holds Create until gate closes.
+type gatedDriver struct {
+	*fakeDriver
+	entered chan struct{}
+	gate    chan struct{}
+}
+
+func (g *gatedDriver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) {
+	close(g.entered)
+	<-g.gate
+	return g.fakeDriver.Create(ctx, spec)
+}
+
+// A Create that a newer gateway's enrollment overtakes answers stale, so the
+// superseded gateway never admits the VM.
+func TestCreateOvertakenByNewerLeaseIsStale(t *testing.T) {
+	gated := &gatedDriver{fakeDriver: newFake(), entered: make(chan struct{}), gate: make(chan struct{})}
+	_, ts := serve(t, gated)
+	old := enrolled(t, ts.URL, 1)
+	result := make(chan error, 1)
+	go func() {
+		_, err := old.CreateUntil(context.Background(), spec(vmA), time.Now().Add(time.Hour))
+		result <- err
+	}()
+	<-gated.entered
+	enrolled(t, ts.URL, 2)
+	close(gated.gate)
+	if err := <-result; !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("overtaken create: %v, want a stale lease", err)
 	}
 }

@@ -206,12 +206,17 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	var handler http.Handler
 	if workerMode {
-		server, err := worker.NewServer(driver, workerDeclaration(*driverName, *workerID, *template, *image, *cpus, *memory, *maxVMs, slotNames), workerKey)
+		server, err := worker.NewServer(driver, workerDeclaration(*driverName, *workerID, *template, *image, *cpus, *memory, *maxVMs, slotNames), workerKey, *maxTTL)
 		if err != nil {
 			return err
 		}
 		handler = server
-		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s)", *workerID, *driverName, driverArch(*driverName))
+		// The worker ends every VM at its end time itself, also while the
+		// gateway is unreachable; -max-ttl caps that end time.
+		reapCtx, stopReap := context.WithCancel(ctx)
+		defer stopReap()
+		go server.ReapEvery(reapCtx, time.Second)
+		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
 	} else {
 		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, Templates: templateArchs, Workers: remotes}
 		var local vm.Driver

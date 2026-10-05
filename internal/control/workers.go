@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/envd"
 	"github.com/gitmoot/sandboxd/internal/store"
 	"github.com/gitmoot/sandboxd/internal/vm"
 	"github.com/gitmoot/sandboxd/internal/worker"
@@ -30,11 +31,13 @@ func validArch(arch string) bool { return arch == "arm64" || arch == "amd64" }
 
 // member is the gateway's state for one enrolled worker.
 //
-// Ownership of a sandbox is the pair (worker, lease). Every enrollment takes
-// a fresh durable lease; any failure to observe the worker drops the lease, so
-// the next contact re-enrolls under a higher one. A worker fences requests
-// made under older leases, and the gateway refuses any answer or guest access
-// that does not carry the worker's current lease.
+// Ownership of a sandbox is the pair (worker, lease). A gateway instance
+// claims each worker once, with a fresh durable lease, and keeps that lease
+// across reconnects: a worker that blips or restarts is re-enrolled under the
+// same lease, so nothing it runs for this gateway is cancelled. Only a newer
+// gateway instance presents a higher lease; the worker then fences this one,
+// which stays superseded (offline) until it restarts. The gateway refuses any
+// answer or guest access that does not carry its current lease.
 type member struct {
 	id  string
 	api worker.Member
@@ -45,13 +48,21 @@ type member struct {
 	sync sync.Mutex
 
 	// The fields below are guarded by Service.mu.
-	decl     worker.Declaration
-	serves   map[string]string // template ID -> image, arch-compatible and registered
-	refused  map[string]string // template ID -> reason the gateway refused it
-	lease    int64             // 0 until enrolled; reset whenever the worker is lost
-	online   bool
-	lastSeen time.Time
-	err      string
+	decl    worker.Declaration
+	serves  map[string]string // template ID -> image, arch-compatible and registered
+	refused map[string]string // template ID -> reason the gateway refused it
+	// lease is this gateway instance's claim; 0 until first allocated, then
+	// fixed for the life of the process.
+	lease int64
+	// enrolled: the worker accepted lease since it was last unobservable.
+	enrolled bool
+	// claimed: the worker has accepted lease at least once.
+	claimed bool
+	// superseded: the worker accepted a newer gateway's lease.
+	superseded bool
+	online     bool
+	lastSeen   time.Time
+	err        string
 }
 
 // refusal is a create that provably allocated nothing.
@@ -76,23 +87,53 @@ func (s *Service) reconcileAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// offline records that m could not be observed. Its lease is dropped, so the
-// worker must re-enroll under a new lease before anything it owns is used.
+// offline records that m could not be observed. Its lease is kept: the next
+// pass re-enrolls under the same lease, which cancels nothing on the worker.
+// A stale-lease answer means a newer gateway owns the worker; this gateway
+// then stops using it for good.
 func (s *Service) offline(m *member, err error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	m.online = false
-	m.lease = 0
+	m.enrolled = false
+	if errors.Is(err, worker.ErrStaleLease) && m.claimed {
+		m.superseded = true
+		err = fmt.Errorf("superseded by a newer gateway instance; restart this gateway to reclaim the worker: %w", err)
+	}
 	m.err = err.Error()
 	return err
 }
 
 func (s *Service) enroll(ctx context.Context, m *member) error {
-	lease, err := s.ledger.NextLease(ctx, m.id, m.local)
-	if err != nil {
-		return err
+	s.mu.Lock()
+	lease, claimed, superseded := m.lease, m.claimed, m.superseded
+	s.mu.Unlock()
+	if superseded {
+		return errors.New("superseded by a newer gateway instance; restart this gateway to reclaim the worker")
+	}
+	var err error
+	if lease == 0 {
+		if lease, err = s.ledger.NextLease(ctx, m.id, m.local, 0); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		m.lease = lease
+		s.mu.Unlock()
 	}
 	decl, err := m.api.Enroll(ctx, lease)
+	var stale *worker.StaleLeaseError
+	if !claimed && errors.As(err, &stale) && stale.Current > 0 {
+		// This gateway instance never held the worker, which still holds a
+		// lease from a gateway whose ledger is gone. Starting up is what
+		// claims a worker, so take a lease above it once.
+		if lease, err = s.ledger.NextLease(ctx, m.id, m.local, stale.Current); err != nil {
+			return err
+		}
+		s.mu.Lock()
+		m.lease = lease
+		s.mu.Unlock()
+		decl, err = m.api.Enroll(ctx, lease)
+	}
 	if err != nil {
 		return fmt.Errorf("enroll worker %s: %w", m.id, err)
 	}
@@ -117,7 +158,8 @@ func (s *Service) enroll(ctx context.Context, m *member) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m.decl, m.serves, m.refused, m.lease = decl, serves, refused, lease
+	m.decl, m.serves, m.refused = decl, serves, refused
+	m.enrolled, m.claimed = true, true
 	return nil
 }
 
@@ -130,15 +172,18 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	m.sync.Lock()
 	defer m.sync.Unlock()
 	s.mu.Lock()
-	lease := m.lease
+	enrolled := m.enrolled
 	s.mu.Unlock()
-	if lease == 0 {
+	// fresh: this pass (re-)enrolled the worker, which may have restarted and
+	// lost the end times of the VMs it runs.
+	fresh := !enrolled
+	if fresh {
 		if err := s.enroll(ctx, m); err != nil {
 			return s.offline(m, err)
 		}
 	}
 	s.mu.Lock()
-	lease = m.lease
+	lease := m.lease
 	rows, err := s.ledger.Active(ctx)
 	settled := make(map[string]bool)
 	for _, row := range rows {
@@ -166,9 +211,9 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	}
 
 	s.mu.Lock()
-	if m.lease != lease {
+	if m.superseded {
 		s.mu.Unlock()
-		return s.offline(m, errors.New("worker lease changed during reconciliation"))
+		return errors.New("superseded by a newer gateway instance")
 	}
 	rows, err = s.ledger.Active(ctx)
 	if err != nil {
@@ -176,6 +221,10 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		return s.offline(m, err)
 	}
 	var rowsToDestroy, orphans []string
+	// expiries are end times the worker must (re-)learn: for rows adopted from
+	// an earlier gateway instance, and for every kept row after a
+	// (re-)enrollment, since a restarted worker forgets them.
+	expiries := make(map[string]time.Time)
 	now := time.Now()
 	for _, row := range rows {
 		instance, observed := inventory[row.ID]
@@ -198,6 +247,9 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 					s.mu.Unlock()
 					return s.offline(m, err)
 				}
+			}
+			if fresh || row.Lease != lease {
+				expiries[row.ID] = row.Ends
 			}
 			continue
 		}
@@ -259,11 +311,16 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 			return s.offline(m, err)
 		}
 	}
+	for id, ends := range expiries {
+		if err := m.api.Expire(ctx, id, ends); err != nil {
+			return s.offline(m, fmt.Errorf("send end time of %s to worker %s: %w", id, m.id, err))
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if m.lease != lease {
+	if m.superseded {
 		m.online = false
-		return errors.New("worker lease changed during reconciliation")
+		return errors.New("superseded by a newer gateway instance")
 	}
 	m.online, m.lastSeen, m.err = true, time.Now().UTC(), ""
 	return nil
@@ -542,35 +599,56 @@ func (s *Service) ForgetWorker(ctx context.Context, id string) ([]string, error)
 
 // Guests routes guest file and process calls to the worker that owns each
 // sandbox, under that worker's current lease.
+//
+// A call that fails before reaching a verdict on the guest (worker offline or
+// unreachable, stream lost, worker owned by a newer gateway) wraps
+// envd.ErrRetryable: the guest itself did not fail, so the data plane must
+// keep the VM rather than abort it.
 type Guests struct{ s *Service }
 
 func (s *Service) Guests() *Guests { return &Guests{s: s} }
 
-func (g *Guests) owner(ctx context.Context, id string) (worker.Member, error) {
+func (g *Guests) owner(ctx context.Context, id string) (*member, error) {
 	g.s.mu.Lock()
 	defer g.s.mu.Unlock()
 	row, m, err := g.s.owned(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", envd.ErrRetryable, err)
 	}
 	if row.State != "running" || g.s.busy[id] {
-		return nil, errors.New("sandbox not running")
+		return nil, fmt.Errorf("%w: sandbox not running", envd.ErrRetryable)
 	}
-	return m.api, nil
+	return m, nil
+}
+
+// classify marks transport and fencing failures retryable. A stale lease
+// also takes the worker offline: a newer gateway owns it.
+func (g *Guests) classify(m *member, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, worker.ErrStaleLease):
+		_ = g.s.offline(m, err)
+		return fmt.Errorf("%w: %w", envd.ErrRetryable, err)
+	case errors.Is(err, worker.ErrUnavailable):
+		return fmt.Errorf("%w: %w", envd.ErrRetryable, err)
+	}
+	return err
 }
 
 func (g *Guests) CopyIn(ctx context.Context, id, hostPath, guestPath string) error {
-	api, err := g.owner(ctx, id)
+	m, err := g.owner(ctx, id)
 	if err != nil {
 		return err
 	}
-	return api.CopyIn(ctx, id, hostPath, guestPath)
+	return g.classify(m, m.api.CopyIn(ctx, id, hostPath, guestPath))
 }
 
 func (g *Guests) Run(ctx context.Context, id string, command vm.Command, stdout, stderr io.Writer) (int, error) {
-	api, err := g.owner(ctx, id)
+	m, err := g.owner(ctx, id)
 	if err != nil {
 		return -1, err
 	}
-	return api.Run(ctx, id, command, stdout, stderr)
+	code, err := m.api.Run(ctx, id, command, stdout, stderr)
+	return code, g.classify(m, err)
 }

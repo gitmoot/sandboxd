@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/envd"
 	"github.com/gitmoot/sandboxd/internal/vm"
 	"github.com/gitmoot/sandboxd/internal/worker"
 )
@@ -32,6 +33,8 @@ type fileDriver struct {
 	mu        sync.Mutex
 	instances map[string]vm.Instance
 	destroyed []string
+	// ended holds, per VM with a blocked run, a channel closed on Destroy.
+	ended map[string]chan struct{}
 	// createGate, when set, holds Create until it is closed; createEntered
 	// then reports that a Create reached the driver.
 	createGate    chan struct{}
@@ -119,16 +122,38 @@ func (d *fileDriver) Run(ctx context.Context, id string, cmd vm.Command, stdout,
 		_, err = stdout.Write(data)
 		return 0, err
 	case len(cmd.Args) == 1 && cmd.Args[0] == "block":
+		gone := d.gone(id)
 		d.runStarted <- struct{}{}
-		<-ctx.Done()
-		return -1, ctx.Err()
+		select {
+		case <-ctx.Done():
+			return -1, ctx.Err()
+		case <-gone:
+			return -1, errors.New("VM destroyed")
+		}
 	}
 	return 127, nil
+}
+
+// gone returns a channel closed when VM id is destroyed.
+func (d *fileDriver) gone(id string) chan struct{} {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.ended == nil {
+		d.ended = make(map[string]chan struct{})
+	}
+	if d.ended[id] == nil {
+		d.ended[id] = make(chan struct{})
+	}
+	return d.ended[id]
 }
 
 func (d *fileDriver) Destroy(_ context.Context, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if _, ok := d.instances[id]; ok && d.ended[id] != nil {
+		close(d.ended[id])
+		delete(d.ended, id)
+	}
 	delete(d.instances, id)
 	d.destroyed = append(d.destroyed, id)
 	return os.RemoveAll(filepath.Join(d.root, id))
@@ -156,10 +181,27 @@ func (d *fileDriver) destroyCount() int {
 // fakeWorker serves a fileDriver through the real authenticated worker API
 // over HTTP, and can be partitioned from the gateway.
 type fakeWorker struct {
-	id     string
-	driver *fileDriver
-	down   atomic.Bool
-	client *worker.Client
+	id      string
+	driver  *fileDriver
+	down    atomic.Bool
+	client  *worker.Client
+	server  *worker.Server
+	current atomic.Pointer[worker.Server]
+	decl    worker.Declaration
+	url     string
+	http    *http.Client
+}
+
+// restart replaces the worker daemon: its VMs survive, its lease and end
+// times are forgotten.
+func (w *fakeWorker) restart(t *testing.T) {
+	t.Helper()
+	server, err := worker.NewServer(w.driver, w.decl, fakeWorkerKey, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.server = server
+	w.current.Store(server)
 }
 
 const fakeWorkerKey = "worker-key-0123456789abcdef"
@@ -172,8 +214,9 @@ func newFakeWorker(t *testing.T, id, arch string, templates map[string]string, m
 		// The same names on every worker: slots are worker-local networks.
 		slots[i] = fmt.Sprintf("slot-%d", i+1)
 	}
-	server, err := worker.NewServer(w.driver, worker.Declaration{ID: id, Arch: arch, Driver: "fake", Templates: templates,
-		CPUs: 2, MemoryMiB: 512, MaxVMs: maxVMs, Slots: slots}, fakeWorkerKey)
+	decl := worker.Declaration{ID: id, Arch: arch, Driver: "fake", Templates: templates,
+		CPUs: 2, MemoryMiB: 512, MaxVMs: maxVMs, Slots: slots}
+	server, err := worker.NewServer(w.driver, decl, fakeWorkerKey, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,9 +225,11 @@ func newFakeWorker(t *testing.T, id, arch string, templates map[string]string, m
 			http.Error(rw, "partitioned", http.StatusBadGateway)
 			return
 		}
-		server.ServeHTTP(rw, r)
+		w.current.Load().ServeHTTP(rw, r)
 	}))
 	t.Cleanup(httpServer.Close)
+	w.server, w.url, w.http, w.decl = server, httpServer.URL, httpServer.Client(), decl
+	w.current.Store(server)
 	if w.client, err = worker.NewClient(id, httpServer.URL, fakeWorkerKey, httpServer.Client()); err != nil {
 		t.Fatal(err)
 	}
@@ -547,58 +592,103 @@ func jobOf(t *testing.T, s *Service, id string) string {
 	return row.JobID
 }
 
-func TestStaleLeaseWorkerIsFenced(t *testing.T) {
-	// worker-a has the most free slots, then wins ties: everything below
-	// lands on it, so worker-b stays a bystander.
+// blockingRun starts a run that blocks on the worker until its VM is
+// destroyed or the run is fenced, and returns its result channel.
+func blockingRun(t *testing.T, s *Service, w *fakeWorker, id string) <-chan error {
+	t.Helper()
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	t.Cleanup(cancelRun) // A failed assertion must not leave the run blocked.
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Guests().Run(runCtx, id, vm.Command{Args: []string{"block"}}, io.Discard, io.Discard)
+		done <- err
+	}()
+	receive(t, w.driver.runStarted)
+	return done
+}
+
+func memberLease(s *Service, id string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.byID[id].lease
+}
+
+// Network blips must not fence the gateway's own work: the worker keeps the
+// same lease across reconnects, so an in-flight run survives several failed
+// observations. It ends only when another attempt takes the job over.
+func TestTransientBlipsDoNotFenceInFlightRun(t *testing.T) {
 	owner := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 2)
 	bystander := newFakeWorker(t, "worker-b", "arm64", arm64Templates, 1)
 	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), owner, bystander)
 	ctx := context.Background()
-
-	mustCreate(t, s, createFor("review-arm64", "filler", 1))
 	old := mustCreate(t, s, createFor("review-arm64", "job-x", 1))
-	if owner.driver.count() != 2 {
-		t.Fatalf("placement: owner=%d bystander=%d", owner.driver.count(), bystander.driver.count())
+	if !owner.driver.has(old.ID) {
+		t.Fatal("placement: sandbox not on worker-a")
 	}
-	row, _ := s.ledger.Get(ctx, old.ID)
-	oldLease := row.Lease
-	// A command is running on the old attempt when its worker drops out.
-	runDone := make(chan error, 1)
-	runCtx, cancelRun := context.WithCancel(ctx)
-	t.Cleanup(cancelRun) // A failed assertion must not leave the run blocked.
-	go func() {
-		_, err := s.Guests().Run(runCtx, old.ID, vm.Command{Args: []string{"block"}}, io.Discard, io.Discard)
-		runDone <- err
-	}()
-	receive(t, owner.driver.runStarted)
+	lease := memberLease(s, "worker-a")
+	run := blockingRun(t, s, owner, old.ID)
 
+	// A guest call that hits the partition before the gateway notices is
+	// retryable: the guest did not fail and must not be torn down.
 	owner.down.Store(true)
-	s.reconcileAll(ctx)
-	if s.Authorize(old.ID, old.Token) {
-		t.Fatal("sandbox on an unobservable worker stayed authorized")
+	if err := s.Guests().CopyIn(ctx, old.ID, writeHostFile(t, "x"), "/home/user/x"); !errors.Is(err, envd.ErrRetryable) {
+		t.Fatalf("copy across a partition: %v, want retryable", err)
 	}
-	if _, err := catGuest(t, s, old.ID, "/etc/hostname"); err == nil {
-		t.Fatal("guest call routed to a worker without a current lease")
-	}
-	owner.down.Store(false)
-	s.reconcileAll(ctx)
-	row, _ = s.ledger.Get(ctx, old.ID)
-	if row.Lease <= oldLease || !s.Authorize(old.ID, old.Token) {
-		t.Fatalf("returned worker not re-enrolled under a newer lease: %d -> %d", oldLease, row.Lease)
+	for blip := range 2 {
+		owner.down.Store(true)
+		for range 3 {
+			s.reconcileAll(ctx) // Every List fails.
+		}
+		if entry := workerReport(t, readCapacity(t, s), "worker-a"); entry.Online {
+			t.Fatalf("blip %d: unobservable worker reported online", blip)
+		}
+		owner.down.Store(false)
+		s.reconcileAll(ctx)
+		if entry := workerReport(t, readCapacity(t, s), "worker-a"); !entry.Online || entry.Lease != lease {
+			t.Fatalf("blip %d: worker back as %+v, want online under lease %d", blip, entry, lease)
+		}
 	}
 	select {
-	case err := <-runDone:
-		if err == nil || !errors.Is(err, worker.ErrStaleLease) {
-			t.Fatalf("run under the superseded lease ended with %v, want a stale-lease error", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("run under the superseded lease kept going after re-enrollment")
+	case err := <-run:
+		t.Fatalf("a transient blip ended the in-flight run: %v", err)
+	default:
+	}
+	if row, _ := s.ledger.Get(ctx, old.ID); row.Lease != lease || row.State != "running" || !owner.driver.has(old.ID) {
+		t.Fatalf("sandbox after blips: %+v (VM present %v), want running under lease %d", row, owner.driver.has(old.ID), lease)
+	}
+	if !s.Authorize(old.ID, old.Token) {
+		t.Fatal("sandbox lost guest access after the worker returned")
 	}
 
-	// A Create answered across a re-enrollment cannot admit its VM.
-	if got := request(t, s, http.MethodDelete, "/sandboxes/"+old.ID, nil); got.Code != http.StatusNoContent {
-		t.Fatalf("delete: %d", got.Code)
+	// A retry of the job takes ownership: the superseded attempt's VM is
+	// destroyed, which ends its run as a real guest failure.
+	retry := mustCreate(t, s, createFor("review-arm64", "job-x", 2))
+	s.reconcileAll(ctx)
+	err := receive(t, run)
+	if err == nil || errors.Is(err, envd.ErrRetryable) || owner.driver.has(old.ID) {
+		t.Fatalf("superseded attempt: run ended with %v (retryable=%v), VM present %v", err, errors.Is(err, envd.ErrRetryable), owner.driver.has(old.ID))
 	}
+	if !s.Authorize(retry.ID, retry.Token) || s.Authorize(old.ID, old.Token) {
+		t.Fatal("ownership did not move to the retried attempt")
+	}
+}
+
+// A newer gateway instance (a restart presents a higher durable lease) takes
+// the worker: the superseded gateway's in-flight run and Create are fenced,
+// it stops using the worker, and it destroys nothing there.
+func TestNewerGatewayFencesSupersededGateway(t *testing.T) {
+	owner := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 3)
+	bystander := newFakeWorker(t, "worker-b", "arm64", arm64Templates, 1)
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), owner, bystander)
+	ctx := context.Background()
+	old := mustCreate(t, s, createFor("review-arm64", "job-x", 1))
+	if !owner.driver.has(old.ID) {
+		t.Fatal("placement: sandbox not on worker-a")
+	}
+	lease := memberLease(s, "worker-a")
+	run := blockingRun(t, s, owner, old.ID)
+
+	// A Create is in flight on the worker when the newer gateway enrolls.
 	gate := make(chan struct{})
 	release := sync.OnceFunc(func() { close(gate) })
 	t.Cleanup(release) // A failed assertion must not leave the worker's handler stuck.
@@ -607,21 +697,98 @@ func TestStaleLeaseWorkerIsFenced(t *testing.T) {
 	owner.driver.mu.Unlock()
 	answer := make(chan *httptest.ResponseRecorder, 1)
 	go func() { answer <- request(t, s, http.MethodPost, "/sandboxes", createFor("review-arm64", "job-y", 1)) }()
-	receive(t, owner.driver.createEntered) // The worker accepted the Create under the old lease.
-	owner.down.Store(true)
-	s.reconcileAll(ctx)
-	owner.down.Store(false)
-	s.reconcileAll(ctx)
+	receive(t, owner.driver.createEntered)
+
+	rival, err := worker.NewClient(owner.id, owner.url, fakeWorkerKey, owner.http)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rival.Enroll(ctx, lease+10); err != nil {
+		t.Fatal(err)
+	}
 	release()
 	if got := receive(t, answer); got.Code != http.StatusServiceUnavailable {
-		t.Fatalf("create answered under a superseded lease admitted: %d %s", got.Code, got.Body.String())
+		t.Fatalf("create answered after a newer gateway took the worker was admitted: %d %s", got.Code, got.Body.String())
 	}
+	err = receive(t, run)
+	if !errors.Is(err, worker.ErrStaleLease) || !errors.Is(err, envd.ErrRetryable) {
+		t.Fatalf("run under the superseded gateway ended with %v, want a retryable stale lease", err)
+	}
+
+	for range 3 {
+		s.reconcileAll(ctx)
+	}
+	entry := workerReport(t, readCapacity(t, s), "worker-a")
+	if entry.Online || !strings.Contains(entry.Error, "superseded") || memberLease(s, "worker-a") != lease {
+		t.Fatalf("superseded gateway still uses the worker or re-claimed it: %+v lease %d", entry, memberLease(s, "worker-a"))
+	}
+	if s.Authorize(old.ID, old.Token) {
+		t.Fatal("superseded gateway granted guest access")
+	}
+	if !owner.driver.has(old.ID) || owner.driver.destroyCount() != 0 {
+		t.Fatal("superseded gateway destroyed VMs on a worker it no longer owns")
+	}
+	// New work goes to the workers this gateway still owns.
+	next := mustCreate(t, s, createFor("review-arm64", "job-z", 1))
+	if !bystander.driver.has(next.ID) {
+		t.Fatal("create not placed on the remaining worker")
+	}
+}
+
+// A restarted worker forgets its lease and end times. The gateway re-enrolls
+// it under the same lease, nothing is fenced, and the worker learns every
+// kept sandbox's end time again.
+func TestRestartedWorkerIsReenrolledUnderSameLease(t *testing.T) {
+	w := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 1)
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), w)
+	ctx := context.Background()
+	c := mustCreate(t, s, createFor("review-arm64", "job-1", 1))
+	lease := memberLease(s, "worker-a")
+	// Shorten the sandbox's life through the API, so its end time is near.
+	if got := request(t, s, http.MethodPost, "/sandboxes/"+c.ID+"/timeout", map[string]int{"timeout": 2}); got.Code != http.StatusNoContent {
+		t.Fatalf("renew: %d", got.Code)
+	}
+	w.restart(t)
+	s.reconcileAll(ctx) // the restarted worker answers "not enrolled"
 	s.reconcileAll(ctx)
-	if owner.driver.count() != 1 {
-		t.Fatalf("VM from a fenced create survived reconciliation: %d VMs", owner.driver.count())
+	if entry := workerReport(t, readCapacity(t, s), "worker-a"); !entry.Online || entry.Lease != lease || !s.Authorize(c.ID, c.Token) {
+		t.Fatalf("restarted worker: %+v, want online under lease %d with the sandbox kept", entry, lease)
 	}
-	if rows, _ := s.ledger.Active(ctx); len(rows) != 1 {
-		t.Fatalf("fenced create left %d live rows, want only the filler", len(rows))
+	// Partition the worker so only its own reaper can end the sandbox.
+	w.down.Store(true)
+	time.Sleep(2100 * time.Millisecond)
+	if err := w.server.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w.driver.has(c.ID) {
+		t.Fatal("restarted worker did not relearn the sandbox's end time")
+	}
+}
+
+// Workers end expired guests on their own, while partitioned from the
+// gateway and after the gateway forgot them.
+func TestPartitionedWorkerEndsExpiredGuests(t *testing.T) {
+	w := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 2)
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), w)
+	ctx := context.Background()
+	short := createFor("review-arm64", "job-short", 1)
+	short["timeout"] = 1
+	expiring := mustCreate(t, s, short)
+	lasting := mustCreate(t, s, createFor("review-arm64", "job-long", 1))
+	w.down.Store(true)
+	s.reconcileAll(ctx)
+	if got := request(t, s, http.MethodPost, "/sandboxd/workers/worker-a/forget", map[string]bool{"confirm": true}); got.Code != http.StatusOK {
+		t.Fatalf("forget: %d %s", got.Code, got.Body.String())
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if err := w.server.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if w.driver.has(expiring.ID) {
+		t.Fatal("partitioned, forgotten worker kept a guest past its end time")
+	}
+	if !w.driver.has(lasting.ID) {
+		t.Fatal("worker reaped a guest before its end time")
 	}
 }
 
@@ -859,4 +1026,35 @@ func TestRenamedLocalWorkerNeverDoubleBooksAPhysicalSlot(t *testing.T) {
 		t.Fatalf("new guest placed on slot %s still held by the old identity's VM", newRow.Slot)
 	}
 	assertCapacityFull(t, request(t, s, http.MethodPost, "/sandboxes", createBody("job-third", 1)))
+}
+
+// A gateway whose ledger was replaced finds the worker holding a lease from
+// its predecessor. Starting up claims the worker once, above that lease.
+func TestNewGatewayClaimsWorkerAboveInheritedLease(t *testing.T) {
+	w := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 1)
+	predecessor, err := worker.NewClient(w.id, w.url, fakeWorkerKey, w.http)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := predecessor.Enroll(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), w)
+	s.reconcileAll(context.Background())
+	if entry := workerReport(t, readCapacity(t, s), "worker-a"); !entry.Online || entry.Lease != 8 {
+		t.Fatalf("new gateway did not claim the worker above lease 7: %+v", entry)
+	}
+	if _, err := predecessor.List(context.Background()); !errors.Is(err, worker.ErrStaleLease) {
+		t.Fatalf("predecessor not fenced: %v", err)
+	}
+	mustCreate(t, s, createFor("review-arm64", "job-1", 1))
+}
+
+func writeHostFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "upload")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

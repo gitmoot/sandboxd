@@ -489,15 +489,17 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	s.busy[row.ID] = true
 	s.mu.Unlock()
 
-	instance, err := m.api.Create(r.Context(), spec)
-
+	instance, err := m.api.CreateUntil(r.Context(), spec, row.Ends)
+	if errors.Is(err, worker.ErrStaleLease) {
+		_ = s.offline(m, err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, row.ID)
-	// A worker that went offline or re-enrolled while this Create was in
-	// flight answered under a superseded lease. Its answer cannot admit the VM;
-	// reconciliation under the new lease decides the row's fate.
-	fenced := !m.online || m.lease != row.Lease
+	// A worker that another gateway instance took over while this Create was
+	// in flight answered outside this gateway's lease. Its answer cannot admit
+	// the VM. A worker that merely blipped keeps this gateway's lease.
+	fenced := m.superseded || m.lease != row.Lease
 	if err != nil || fenced || instance.ID != row.ID || !instance.Running {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
@@ -661,13 +663,24 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "invalid timeout", http.StatusBadRequest)
 		return
 	}
-	if _, _, err := s.live(r.Context(), id); err != nil {
+	_, m, err := s.live(r.Context(), id)
+	if err != nil {
 		http.Error(w, "sandbox unavailable", statusFor(err))
+		return
+	}
+	ends := time.Now().UTC().Add(ttl)
+	// The worker enforces end times on its own; it must learn the new one
+	// before the ledger promises it. Holding the worker's sync keeps a
+	// concurrent reconciliation from re-sending the older end time.
+	m.sync.Lock()
+	defer m.sync.Unlock()
+	if err := m.api.Expire(r.Context(), id, ends); err != nil {
+		unavailable(w)
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.ledger.Extend(r.Context(), id, time.Now().UTC().Add(ttl)); err != nil {
+	if err := s.ledger.Extend(r.Context(), id, ends); err != nil {
 		unavailable(w)
 		return
 	}
