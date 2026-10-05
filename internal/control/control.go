@@ -122,7 +122,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 			return nil, fmt.Errorf("template %q is registered for %s but the local worker runs %s", cfg.TemplateID, arch, cfg.Arch)
 		}
 		templates[cfg.TemplateID] = cfg.Arch
-		members = append(members, &member{id: cfg.WorkerID, api: worker.Local(driver, decl), local: true})
+		members = append(members, newMember(cfg.WorkerID, worker.Local(driver, decl), true))
 	}
 	for _, remote := range cfg.Workers {
 		if remote.Member == nil || !validWorkerID(remote.ID) {
@@ -133,7 +133,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 				return nil, fmt.Errorf("worker %q is enrolled twice", remote.ID)
 			}
 		}
-		members = append(members, &member{id: remote.ID, api: remote.Member})
+		members = append(members, newMember(remote.ID, remote.Member, false))
 	}
 	ledger, err := store.Open(ctx, path)
 	if err != nil {
@@ -252,7 +252,9 @@ func (s *Service) Abort(ctx context.Context, id, token string) error {
 	stateErr := s.ledger.SetState(ctx, id, "unknown")
 	s.busy[id] = true
 	s.mu.Unlock()
-	destroyErr := m.api.Destroy(ctx, id)
+	destroyCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
+	destroyErr := m.api.Destroy(destroyCtx, id)
+	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
@@ -489,7 +491,9 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	s.busy[row.ID] = true
 	s.mu.Unlock()
 
-	instance, err := m.api.CreateUntil(r.Context(), spec, row.Ends)
+	createCtx, cancel := context.WithTimeout(r.Context(), workerSlowTimeout)
+	instance, err := m.api.CreateUntil(createCtx, spec, row.Ends)
+	cancel()
 	if errors.Is(err, worker.ErrStaleLease) {
 		_ = s.offline(m, err)
 	}
@@ -670,11 +674,17 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	ends := time.Now().UTC().Add(ttl)
 	// The worker enforces end times on its own; it must learn the new one
-	// before the ledger promises it. Holding the worker's sync keeps a
-	// concurrent reconciliation from re-sending the older end time.
-	m.sync.Lock()
-	defer m.sync.Unlock()
-	if err := m.api.Expire(r.Context(), id, ends); err != nil {
+	// before the ledger promises it. m.expiry keeps a concurrent
+	// reconciliation from re-sending the older end time; it is held only for
+	// this one bounded call, never across the worker's reconciliation.
+	ctx, cancel := context.WithTimeout(r.Context(), workerTimeout)
+	defer cancel()
+	if err := m.expiry.lock(ctx); err != nil {
+		unavailable(w)
+		return
+	}
+	defer m.expiry.unlock()
+	if err := m.api.Expire(ctx, id, ends); err != nil {
 		unavailable(w)
 		return
 	}
@@ -710,8 +720,8 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 		unavailable(w)
 		return
 	}
-	m.sync.Lock()
-	defer m.sync.Unlock()
+	// The busy mark set below, not the worker's reconciliation turn, keeps a
+	// concurrent reconciliation from judging this row while Destroy runs.
 	s.mu.Lock()
 	row, err = s.ledger.Get(r.Context(), id)
 	if err != nil || released(row) {
@@ -723,6 +733,13 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if s.busy[id] {
+		// Another teardown (a reconciliation or a concurrent delete) of this
+		// sandbox is in flight; its outcome decides. Retry.
+		s.mu.Unlock()
+		unavailable(w)
+		return
+	}
 	if err := s.ledger.SetState(r.Context(), id, "unknown"); err != nil {
 		s.mu.Unlock()
 		unavailable(w)
@@ -730,7 +747,9 @@ func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 	}
 	s.busy[id] = true
 	s.mu.Unlock()
-	destroyErr := m.api.Destroy(r.Context(), id)
+	destroyCtx, cancel := context.WithTimeout(r.Context(), workerSlowTimeout)
+	destroyErr := m.api.Destroy(destroyCtx, id)
+	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.busy, id)
@@ -751,7 +770,9 @@ func (s *Service) metrics(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "sandbox unavailable", statusFor(err))
 		return
 	}
-	usage, err := m.api.Usage(r.Context(), id)
+	usageCtx, cancel := context.WithTimeout(r.Context(), workerTimeout)
+	defer cancel()
+	usage, err := m.api.Usage(usageCtx, id)
 	if errors.Is(err, worker.ErrNoMetrics) {
 		http.Error(w, "VM metrics unavailable", http.StatusServiceUnavailable)
 		return

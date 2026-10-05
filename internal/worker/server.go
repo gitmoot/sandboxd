@@ -49,6 +49,11 @@ type Server struct {
 	// ends is each known VM's end time. A VM first seen without one (after a
 	// worker restart) gets maxTTL from that moment.
 	ends map[string]time.Time
+	// endsGen records, per end time, the value of gen when it was last set.
+	// Reap prunes only end times older than its inventory snapshot, so an end
+	// time set while the snapshot was being taken is never lost.
+	endsGen map[string]uint64
+	gen     uint64
 	// creating holds VMs whose Create is in flight; they may not be listed yet.
 	creating map[string]bool
 }
@@ -70,7 +75,8 @@ func NewServer(driver vm.Driver, decl Declaration, key string, maxTTL time.Durat
 		return nil, errors.New("worker max TTL must be at least one second")
 	}
 	s := &Server{driver: driver, decl: decl.clone(), keyHash: sha256.Sum256([]byte(key)), maxUpload: maxUpload,
-		maxTTL: maxTTL, now: time.Now, ends: make(map[string]time.Time), creating: make(map[string]bool)}
+		maxTTL: maxTTL, now: time.Now, ends: make(map[string]time.Time), endsGen: make(map[string]uint64),
+		creating: make(map[string]bool)}
 	s.meter, _ = driver.(vm.ResourceMeter)
 	s.leaseCtx, s.leaseCancel = context.WithCancel(context.Background())
 	return s, nil
@@ -254,7 +260,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, leaseCtx context
 		// Record the end time before the VM can exist, so the reaper never
 		// sees it without one.
 		s.mu.Lock()
-		s.ends[request.ID] = s.capEnd(request.Ends)
+		s.setEnd(request.ID, s.capEnd(request.Ends))
 		s.creating[request.ID] = true
 		s.mu.Unlock()
 		instance, err := s.driver.Create(r.Context(), vm.Spec{ID: request.ID, Image: request.Image, Network: request.Network,
@@ -300,16 +306,34 @@ func (s *Server) expire(w http.ResponseWriter, r *http.Request, id string, _ con
 		return
 	}
 	s.mu.Lock()
-	s.ends[id] = s.capEnd(request.Ends)
+	s.setEnd(id, s.capEnd(request.Ends))
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// setEnd records a VM's end time. Callers hold s.mu.
+func (s *Server) setEnd(id string, ends time.Time) {
+	s.gen++
+	s.ends[id] = ends
+	s.endsGen[id] = s.gen
+}
+
+// dropEnd forgets a VM's end time. Callers hold s.mu.
+func (s *Server) dropEnd(id string) {
+	delete(s.ends, id)
+	delete(s.endsGen, id)
+}
+
 // Reap destroys every VM whose end time has passed, using one complete
 // inventory. A VM seen for the first time without an end time (it predates a
-// worker restart) gets the max TTL from now. A failed destroy is retried on
-// the next pass.
+// worker restart) gets the max TTL from now. End times of VMs absent from the
+// inventory are pruned, except those set after the inventory was requested:
+// their VM may have been created after the snapshot. A failed destroy is
+// retried on the next pass.
 func (s *Server) Reap(ctx context.Context) error {
+	s.mu.Lock()
+	snapshot := s.gen
+	s.mu.Unlock()
 	instances, err := s.driver.List(ctx)
 	if err != nil {
 		return err
@@ -323,15 +347,15 @@ func (s *Server) Reap(ctx context.Context) error {
 		ends, known := s.ends[instance.ID]
 		if !known {
 			ends = now.Add(s.maxTTL)
-			s.ends[instance.ID] = ends
+			s.setEnd(instance.ID, ends)
 		}
 		if !now.Before(ends) && !s.creating[instance.ID] {
 			expired = append(expired, instance.ID)
 		}
 	}
 	for id := range s.ends {
-		if !present[id] && !s.creating[id] {
-			delete(s.ends, id)
+		if !present[id] && !s.creating[id] && s.endsGen[id] <= snapshot {
+			s.dropEnd(id)
 		}
 	}
 	s.mu.Unlock()
@@ -343,7 +367,7 @@ func (s *Server) Reap(ctx context.Context) error {
 		}
 		log.Printf("worker %s: destroyed VM %s at the end of its lifetime", s.decl.ID, id)
 		s.mu.Lock()
-		delete(s.ends, id)
+		s.dropEnd(id)
 		s.mu.Unlock()
 	}
 	return errors.Join(errs...)
@@ -382,7 +406,7 @@ func (s *Server) destroy(w http.ResponseWriter, r *http.Request, id string, _ co
 		return
 	}
 	s.mu.Lock()
-	delete(s.ends, id)
+	s.dropEnd(id)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }

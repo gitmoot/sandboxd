@@ -43,8 +43,8 @@ var errNotEnrolled = errors.New("worker is not enrolled")
 
 // NewClient returns the gateway's view of the remote worker enrolled as id.
 // baseURL must be https://..., or http:// only for a loopback IP host. A nil
-// httpClient selects a client without a global timeout that does not follow
-// redirects; callers bound every call with its context.
+// httpClient selects defaultHTTPClient. Callers bound every call with its
+// context.
 func NewClient(id, baseURL, key string, httpClient *http.Client) (*Client, error) {
 	if !workerIDPattern.MatchString(id) {
 		return nil, fmt.Errorf("worker id %q must match %s", id, workerIDPattern)
@@ -70,7 +70,7 @@ func NewClient(id, baseURL, key string, httpClient *http.Client) (*Client, error
 		return nil, fmt.Errorf("worker %s: URL scheme must be https", id)
 	}
 	if httpClient == nil {
-		httpClient = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		httpClient = defaultHTTPClient()
 	}
 	return &Client{
 		id:     id,
@@ -78,6 +78,31 @@ func NewClient(id, baseURL, key string, httpClient *http.Client) (*Client, error
 		auth:   "Bearer " + key,
 		client: httpClient,
 	}, nil
+}
+
+// Transport bounds for the default client. They stop a black-holed connection
+// (a tailnet partition mid-request) from holding a call forever even if its
+// context has no deadline. The response-header bound is a backstop above the
+// slowest worker answer, a Create that boots a VM or a large CopyIn; gateway
+// contexts set the tighter per-call deadlines. Streamed Run output is not
+// bounded: a job's process may run for its whole TTL.
+const (
+	dialTimeout           = 10 * time.Second
+	tlsHandshakeTimeout   = 10 * time.Second
+	responseHeaderTimeout = 5 * time.Minute
+)
+
+// defaultHTTPClient does not follow redirects and bounds dialing, the TLS
+// handshake and the wait for response headers.
+func defaultHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	transport.TLSHandshakeTimeout = tlsHandshakeTimeout
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{
+		Transport:     transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // Enroll presents lease and returns the worker's declaration. It refuses a

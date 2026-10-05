@@ -16,10 +16,15 @@ Client revision: `gitmoot/gitmoot@a61e1435e7625bf062e05eed21337765833eade6` (the
 
 The guest endpoint accepts either the private wildcard host `49983-<id>.<domain>` or an explicitly configured single gateway host with `E2b-Sandbox-Id` and `E2b-Sandbox-Port: 49983`. The latter requires Gitmoot's explicit `e2b_envd_base_url` and `provider = "mac"` configuration. The control endpoint is separate from the guest address. Both require private HTTPS in deployment; loopback HTTP was used only for local conformance through an SSH tunnel.
 
-A canceled or transport-failed guest execution revokes its capability and
-destroys the **entire VM**, because Apple `container exec` alone leaves the
-guest process alive when the host CLI disconnects. An uncertain destroy remains
-reserved as `unknown` for reconciliation. Set
+A guest execution or upload that its caller cancels, or that fails in the
+gateway's own (local) driver, revokes its capability and destroys the
+**entire VM**, because Apple `container exec` alone leaves the guest process
+alive when the host CLI disconnects. On an enrolled remote worker, a call
+that fails because the worker is unreachable, the gateway-to-worker stream is
+lost, or a newer gateway owns the worker does **not** tear the VM down: it
+answers `unavailable` and keeps the VM and its capability (see
+[Network blips](#multiple-workers) under Multiple workers). An uncertain
+destroy remains reserved as `unknown` for reconciliation. Set
 `SANDBOXD_CONFORMANCE_CANCEL=1` to check cancellation against a real VM;
 the Mac run removed both its VM and its private volume.
 
@@ -303,7 +308,11 @@ sandboxd ... -enroll id=linux-1,url=https://linux-1.<tailnet>:8444,key-file=/etc
   `unavailable` and keeps the VM; only a real guest failure, an output
   overflow or the caller's own cancellation tears the VM down. (After a lost
   stream the guest process may still be running; the job can retry or delete
-  the sandbox, and the worker's expiry bounds it.)
+  the sandbox, and the worker's expiry bounds it.) Every gateway-to-worker
+  call has a deadline (10 s; 3 min for a create or a requested destroy), the
+  worker client bounds dialing, the TLS handshake and the wait for response
+  headers, and each worker is reconciled on its own, so one stalled worker
+  never holds up renewals, the sweep or the other workers.
 - **Expiry on the worker.** The gateway sends each sandbox's end time to its
   worker on create, on renewal (`POST /sandboxes/{id}/timeout` fails with
   `503` if the worker cannot be told) and after every re-enrollment. The

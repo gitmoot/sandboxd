@@ -181,9 +181,15 @@ func (d *fileDriver) destroyCount() int {
 // fakeWorker serves a fileDriver through the real authenticated worker API
 // over HTTP, and can be partitioned from the gateway.
 type fakeWorker struct {
-	id      string
-	driver  *fileDriver
-	down    atomic.Bool
+	id     string
+	driver *fileDriver
+	down   atomic.Bool
+	// stall, when set, black-holes requests whose path ends with it: the
+	// worker never answers until the caller gives up. stalled reports each.
+	stall   atomic.Pointer[string]
+	stalled chan struct{}
+	unstall chan struct{} // closed when the test ends
+
 	client  *worker.Client
 	server  *worker.Server
 	current atomic.Pointer[worker.Server]
@@ -208,7 +214,7 @@ const fakeWorkerKey = "worker-key-0123456789abcdef"
 
 func newFakeWorker(t *testing.T, id, arch string, templates map[string]string, maxVMs int) *fakeWorker {
 	t.Helper()
-	w := &fakeWorker{id: id, driver: newFileDriver(t)}
+	w := &fakeWorker{id: id, driver: newFileDriver(t), stalled: make(chan struct{}, 8), unstall: make(chan struct{})}
 	slots := make([]string, maxVMs)
 	for i := range slots {
 		// The same names on every worker: slots are worker-local networks.
@@ -225,9 +231,23 @@ func newFakeWorker(t *testing.T, id, arch string, templates map[string]string, m
 			http.Error(rw, "partitioned", http.StatusBadGateway)
 			return
 		}
+		if suffix := w.stall.Load(); suffix != nil && strings.HasSuffix(r.URL.Path, *suffix) {
+			select {
+			case w.stalled <- struct{}{}:
+			default:
+			}
+			// Consume the body, so the server notices the caller hanging up.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-r.Context().Done():
+			case <-w.unstall:
+			}
+			return
+		}
 		w.current.Load().ServeHTTP(rw, r)
 	}))
 	t.Cleanup(httpServer.Close)
+	t.Cleanup(func() { close(w.unstall) }) // runs first: no handler outlives the test
 	w.server, w.url, w.http, w.decl = server, httpServer.URL, httpServer.Client(), decl
 	w.current.Store(server)
 	if w.client, err = worker.NewClient(id, httpServer.URL, fakeWorkerKey, httpServer.Client()); err != nil {
@@ -1057,4 +1077,83 @@ func writeHostFile(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// shortenWorkerTimeout lowers the per-call worker deadline for one test. Call
+// it before opening the gateway, so it is restored after the gateway closes.
+func shortenWorkerTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := workerTimeout
+	workerTimeout = d
+	t.Cleanup(func() { workerTimeout = old })
+}
+
+func lastSeen(t *testing.T, s *Service, id string) time.Time {
+	t.Helper()
+	entry := workerReport(t, readCapacity(t, s), id)
+	if entry.LastSeen == nil {
+		return time.Time{}
+	}
+	return *entry.LastSeen
+}
+
+// A renewal whose worker call black-holes is bounded and holds nothing the
+// sweep needs: every worker, including that one, is still reconciled. A
+// black-holed worker inventory ends at the sweep's deadline and does not hold
+// up the other workers.
+func TestStalledWorkerCallsDoNotBlockTheSweep(t *testing.T) {
+	shortenWorkerTimeout(t, 2*time.Second)
+	a := newFakeWorker(t, "worker-a", "arm64", arm64Templates, 1)
+	b := newFakeWorker(t, "worker-b", "arm64", arm64Templates, 1)
+	s := openGateway(t, filepath.Join(t.TempDir(), "ledger.sqlite"), a, b)
+	ctx := context.Background()
+	c := mustCreate(t, s, createFor("review-arm64", "job-1", 1))
+	mustCreate(t, s, createFor("review-arm64", "job-2", 1))
+	if !a.driver.has(c.ID) {
+		t.Fatal("placement: first sandbox not on worker-a")
+	}
+	before, _ := s.ledger.Get(ctx, c.ID)
+
+	expiry := "/expiry"
+	a.stall.Store(&expiry)
+	renewed := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		renewed <- request(t, s, http.MethodPost, "/sandboxes/"+c.ID+"/timeout", map[string]int{"timeout": 1800})
+	}()
+	receive(t, a.stalled)
+	began := time.Now()
+	sweep, cancel := context.WithTimeout(ctx, time.Second)
+	s.reconcileAll(sweep)
+	cancel()
+	if elapsed := time.Since(began); elapsed > 1500*time.Millisecond {
+		t.Fatalf("a stalled renewal held the sweep for %s", elapsed)
+	}
+	for _, id := range []string{"worker-a", "worker-b"} {
+		if !lastSeen(t, s, id).After(began) {
+			t.Fatalf("%s not reconciled while a renewal was stalled", id)
+		}
+	}
+	if got := receive(t, renewed); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stalled renewal: %d, want a bounded 503", got.Code)
+	}
+	if after, _ := s.ledger.Get(ctx, c.ID); !after.Ends.Equal(before.Ends) {
+		t.Fatal("the ledger promised an end time the worker never learned")
+	}
+
+	inventory := "/vms"
+	a.stall.Store(&inventory)
+	began = time.Now()
+	sweep, cancel = context.WithTimeout(ctx, time.Second)
+	s.reconcileAll(sweep)
+	cancel()
+	if elapsed := time.Since(began); elapsed > 1800*time.Millisecond {
+		t.Fatalf("a black-holed worker held the sweep for %s", elapsed)
+	}
+	if entry := workerReport(t, readCapacity(t, s), "worker-a"); entry.Online {
+		t.Fatal("black-holed worker reported online")
+	}
+	if !lastSeen(t, s, "worker-b").After(began) {
+		t.Fatal("a black-holed worker kept the other worker from being reconciled")
+	}
+	a.stall.Store(nil)
 }

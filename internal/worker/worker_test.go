@@ -792,3 +792,69 @@ func TestCreateOvertakenByNewerLeaseIsStale(t *testing.T) {
 		t.Fatalf("overtaken create: %v, want a stale lease", err)
 	}
 }
+
+// snapshotListDriver takes a List snapshot, reports it, and returns it only
+// when released: a Create can complete in between, as on a busy worker.
+type snapshotListDriver struct {
+	*fakeDriver
+	once    sync.Once
+	taken   chan struct{}
+	release chan struct{}
+}
+
+func (d *snapshotListDriver) List(ctx context.Context) ([]vm.Instance, error) {
+	snapshot, err := d.fakeDriver.List(ctx)
+	d.once.Do(func() {
+		close(d.taken)
+		<-d.release
+	})
+	return snapshot, err
+}
+
+// An end time set while Reap's inventory snapshot was in flight survives the
+// prune: the VM still ends at the gateway's end time, not the worker max TTL.
+func TestReapKeepsEndTimeSetDuringInventory(t *testing.T) {
+	driver := &snapshotListDriver{fakeDriver: newFake(), taken: make(chan struct{}), release: make(chan struct{})}
+	server, ts := serve(t, driver)
+	start := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	var clock atomic.Int64
+	clock.Store(start.UnixNano())
+	server.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	client := enrolled(t, ts.URL, 1)
+	ctx := context.Background()
+
+	reaped := make(chan error, 1)
+	go func() { reaped <- server.Reap(ctx) }()
+	<-driver.taken // the snapshot does not contain vmA
+	if _, err := client.CreateUntil(ctx, spec(vmA), start.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	close(driver.release)
+	if err := <-reaped; err != nil {
+		t.Fatal(err)
+	}
+	clock.Store(start.Add(2 * time.Minute).UnixNano())
+	if err := server.Reap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	driver.mu.Lock()
+	_, alive := driver.vms[vmA]
+	driver.mu.Unlock()
+	if alive {
+		t.Fatal("VM outlived the gateway's end time: Reap pruned an end time set during its inventory")
+	}
+}
+
+// The default client bounds dialing, the TLS handshake and the wait for
+// response headers, so a black-holed worker cannot hold a call forever.
+func TestDefaultClientBoundsTransport(t *testing.T) {
+	client, err := NewClient("linux-1", "https://linux-1.example", testKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport, ok := client.client.Transport.(*http.Transport)
+	if !ok || transport.TLSHandshakeTimeout != tlsHandshakeTimeout || transport.ResponseHeaderTimeout != responseHeaderTimeout ||
+		transport.DialContext == nil || client.client.CheckRedirect == nil {
+		t.Fatalf("default worker client transport is unbounded: %+v", client.client.Transport)
+	}
+}

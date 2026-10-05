@@ -19,9 +19,37 @@ import (
 	"github.com/gitmoot/sandboxd/internal/worker"
 )
 
-// workerTimeout bounds one enrollment-plus-reconciliation pass of a worker, so
-// a partitioned worker turns offline instead of stalling requests.
-const workerTimeout = 10 * time.Second
+// Every worker call has a deadline, so a partitioned worker turns offline
+// instead of stalling requests, the sweep, or other workers. workerTimeout
+// bounds one enrollment-plus-reconciliation pass and each short call (List,
+// Expire, Usage); workerSlowTimeout bounds a Create, which boots a VM, and a
+// requested Destroy. Guest Run and CopyIn are bounded by their caller, since a
+// job's process may run for its whole TTL. Variables only so tests can shorten
+// them.
+var (
+	workerTimeout     = 10 * time.Second
+	workerSlowTimeout = 3 * time.Minute
+)
+
+// turn is a mutex whose Lock gives up when its context ends.
+type turn chan struct{}
+
+func newTurn() turn { return make(turn, 1) }
+
+func (t turn) lock(ctx context.Context) error {
+	select {
+	case t <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (t turn) unlock() { <-t }
+
+func newMember(id string, api worker.Member, local bool) *member {
+	return &member{id: id, api: api, local: local, pass: newTurn(), expiry: newTurn()}
+}
 
 var workerIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
@@ -43,9 +71,13 @@ type member struct {
 	api worker.Member
 	// local is the gateway's own driver, whose slots are this host's networks.
 	local bool
-	// sync serializes enrollment, reconciliation and confirmed deletion for
-	// this worker only.
-	sync sync.Mutex
+	// pass serializes enrollment, reconciliation and forgetting for this
+	// worker only. Waiting for it honours the caller's context.
+	pass turn
+	// expiry orders end-time updates sent to the worker, so a reconciliation
+	// never overwrites a renewal with the older end time. It is held only for
+	// one bounded Expire call.
+	expiry turn
 
 	// The fields below are guarded by Service.mu.
 	decl    worker.Declaration
@@ -169,8 +201,12 @@ func (s *Service) enroll(ctx context.Context, m *member) error {
 // requested are judged by it. Owned VMs with no live ledger row are destroyed;
 // VMs recorded for another worker are left to that worker's ledger rows.
 func (s *Service) reconcile(ctx context.Context, m *member) error {
-	m.sync.Lock()
-	defer m.sync.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, workerTimeout)
+	defer cancel()
+	if err := m.pass.lock(ctx); err != nil {
+		return fmt.Errorf("worker %s: reconciliation already in progress: %w", m.id, err)
+	}
+	defer m.pass.unlock()
 	s.mu.Lock()
 	enrolled := m.enrolled
 	s.mu.Unlock()
@@ -221,10 +257,10 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		return s.offline(m, err)
 	}
 	var rowsToDestroy, orphans []string
-	// expiries are end times the worker must (re-)learn: for rows adopted from
-	// an earlier gateway instance, and for every kept row after a
+	// expiries are sandboxes whose end time the worker must (re-)learn: rows
+	// adopted from an earlier gateway instance, and every kept row after a
 	// (re-)enrollment, since a restarted worker forgets them.
-	expiries := make(map[string]time.Time)
+	var expiries []string
 	now := time.Now()
 	for _, row := range rows {
 		instance, observed := inventory[row.ID]
@@ -249,7 +285,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 				}
 			}
 			if fresh || row.Lease != lease {
-				expiries[row.ID] = row.Ends
+				expiries = append(expiries, row.ID)
 			}
 			continue
 		}
@@ -311,8 +347,8 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 			return s.offline(m, err)
 		}
 	}
-	for id, ends := range expiries {
-		if err := m.api.Expire(ctx, id, ends); err != nil {
+	for _, id := range expiries {
+		if err := s.pushExpiry(ctx, m, id); err != nil {
 			return s.offline(m, fmt.Errorf("send end time of %s to worker %s: %w", id, m.id, err))
 		}
 	}
@@ -324,6 +360,27 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	}
 	m.online, m.lastSeen, m.err = true, time.Now().UTC(), ""
 	return nil
+}
+
+// pushExpiry sends a sandbox's current ledger end time to its worker. The
+// ledger is read under m.expiry, which renewals also hold while they update
+// the worker and then the ledger, so the last value sent is never older than
+// the ledger's.
+func (s *Service) pushExpiry(ctx context.Context, m *member, id string) error {
+	if err := m.expiry.lock(ctx); err != nil {
+		return err
+	}
+	defer m.expiry.unlock()
+	s.mu.Lock()
+	row, err := s.ledger.Get(ctx, id)
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if row.State != "running" {
+		return nil
+	}
+	return m.api.Expire(ctx, id, row.Ends)
 }
 
 // admit schedules row onto the online worker serving its template with the
@@ -578,8 +635,10 @@ func (s *Service) ForgetWorker(ctx context.Context, id string) ([]string, error)
 	}
 	m := s.byID[id]
 	if m != nil {
-		m.sync.Lock() // No reconciliation of this worker runs concurrently.
-		defer m.sync.Unlock()
+		if err := m.pass.lock(ctx); err != nil { // No reconciliation of this worker runs concurrently.
+			return nil, err
+		}
+		defer m.pass.unlock()
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
