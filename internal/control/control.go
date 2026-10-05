@@ -10,9 +10,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,49 +24,131 @@ import (
 
 	"github.com/gitmoot/sandboxd/internal/store"
 	"github.com/gitmoot/sandboxd/internal/vm"
+	"github.com/gitmoot/sandboxd/internal/worker"
 )
 
-// Config fixes the only permitted VM shape, template and public guest domain.
-// Slots are the dedicated guest networks, each used by at most one VM at a
-// time; MaxVMs may not exceed them.
+// Config fixes the permitted VM shapes, templates and public guest domain.
+//
+// The local fields (TemplateID, Image, WorkerID, CPUs, MemoryMiB, MaxVMs,
+// Slots, Arch, DriverName) describe the in-process driver passed to Open, as
+// in a single-worker deployment. Slots are that worker's dedicated guest
+// networks, each used by at most one VM at a time; MaxVMs may not exceed
+// them. Workers adds enrolled remote workers, which declare their own shape.
 type Config struct {
 	APIKey, TemplateID, Image, Domain, WorkerID string
 	CPUs, MemoryMiB, MaxVMs                     int
 	MaxTTL                                      time.Duration
 	Slots                                       []string
+	// Arch is the local worker's guest architecture; "" means runtime.GOARCH.
+	Arch string
+	// DriverName labels the local driver in capacity reports; "" means "local".
+	DriverName string
+	// Templates maps each additional servable template ID to the guest
+	// architecture it requires. The local TemplateID requires Arch. A worker
+	// is never scheduled a template it declares for another architecture.
+	Templates map[string]string
+	// Workers are enrolled remote workers, in scheduling-preference order
+	// after the local worker.
+	Workers []Remote
+}
+
+// Remote is one enrolled worker reached through its own transport.
+type Remote struct {
+	ID     string
+	Member worker.Member
 }
 
 type Service struct {
-	mu      sync.Mutex
-	ledger  *store.Store
-	driver  vm.Driver
-	cfg     Config
+	// mu guards the ledger, worker state and busy set. It is never held across
+	// a worker call, so one slow or partitioned worker cannot stall the rest.
+	mu        sync.Mutex
+	ledger    *store.Store
+	cfg       Config
+	templates map[string]string // template ID -> required guest architecture
+	workers   []*member
+	byID      map[string]*member
+	// localMember is the gateway's own driver, nil for a gateway without one.
+	localMember *member
+	// busy marks rows whose worker call (Create or Destroy) is in flight. They
+	// are not judged by reconciliation or listed until the call settles.
+	busy    map[string]bool
 	apiHash [32]byte
 	stop    chan struct{}
 	done    chan struct{}
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
-// background sweep reaps expired VMs even without incoming HTTP requests.
+// background sweep enrolls workers and reaps expired VMs even without incoming
+// HTTP requests. driver may be nil for a gateway that runs no local VMs.
 func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Service, error) {
-	if driver == nil || cfg.APIKey == "" || strings.TrimSpace(cfg.TemplateID) == "" || strings.TrimSpace(cfg.Image) == "" || strings.TrimSpace(cfg.WorkerID) == "" ||
-		cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
-		cfg.CPUs < 1 || cfg.CPUs > math.MaxInt32 || cfg.MemoryMiB < 128 || cfg.MemoryMiB > math.MaxInt32 ||
-		cfg.MaxVMs < 1 || cfg.MaxVMs > len(cfg.Slots) || cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
+	if cfg.APIKey == "" || cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
+		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 {
 		return nil, errors.New("invalid sandbox control configuration")
 	}
-	for i, slot := range cfg.Slots {
-		if strings.TrimSpace(slot) == "" || slices.Contains(cfg.Slots[:i], slot) {
-			return nil, errors.New("sandbox network slots must be distinct and non-empty")
-		}
+	if driver == nil && len(cfg.Workers) == 0 {
+		return nil, errors.New("sandbox control needs a local driver or an enrolled worker")
 	}
-	cfg.Slots = slices.Clone(cfg.Slots)
+	templates := make(map[string]string, len(cfg.Templates)+1)
+	for template, arch := range cfg.Templates {
+		if strings.TrimSpace(template) == "" || !validArch(arch) {
+			return nil, fmt.Errorf("template %q must name an arm64 or amd64 architecture", template)
+		}
+		templates[template] = arch
+	}
+	var members []*member
+	if driver != nil {
+		if cfg.Arch == "" {
+			cfg.Arch = runtime.GOARCH
+		}
+		if cfg.DriverName == "" {
+			cfg.DriverName = "local"
+		}
+		if strings.TrimSpace(cfg.TemplateID) == "" || strings.TrimSpace(cfg.Image) == "" ||
+			cfg.CPUs > math.MaxInt32 || cfg.MemoryMiB > math.MaxInt32 {
+			return nil, errors.New("invalid sandbox control configuration")
+		}
+		for i, slot := range cfg.Slots {
+			if strings.TrimSpace(slot) == "" || slices.Contains(cfg.Slots[:i], slot) {
+				return nil, errors.New("sandbox network slots must be distinct and non-empty")
+			}
+		}
+		decl := worker.Declaration{ID: cfg.WorkerID, Arch: cfg.Arch, Driver: cfg.DriverName,
+			Templates: map[string]string{cfg.TemplateID: cfg.Image}, CPUs: cfg.CPUs, MemoryMiB: cfg.MemoryMiB,
+			MaxVMs: cfg.MaxVMs, Slots: slices.Clone(cfg.Slots)}
+		if err := decl.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid sandbox control configuration: %w", err)
+		}
+		if arch, ok := templates[cfg.TemplateID]; ok && arch != cfg.Arch {
+			return nil, fmt.Errorf("template %q is registered for %s but the local worker runs %s", cfg.TemplateID, arch, cfg.Arch)
+		}
+		templates[cfg.TemplateID] = cfg.Arch
+		members = append(members, &member{id: cfg.WorkerID, api: worker.Local(driver, decl), local: true})
+	}
+	for _, remote := range cfg.Workers {
+		if remote.Member == nil || !validWorkerID(remote.ID) {
+			return nil, fmt.Errorf("invalid enrolled worker %q", remote.ID)
+		}
+		for _, existing := range members {
+			if existing.id == remote.ID {
+				return nil, fmt.Errorf("worker %q is enrolled twice", remote.ID)
+			}
+		}
+		members = append(members, &member{id: remote.ID, api: remote.Member})
+	}
 	ledger, err := store.Open(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	s := &Service{ledger: ledger, driver: driver, cfg: cfg, apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
+	s := &Service{ledger: ledger, cfg: cfg, templates: templates, workers: members, byID: make(map[string]*member, len(members)),
+		busy: make(map[string]bool), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{})}
+	for _, m := range members {
+		s.byID[m.id] = m
+		if m.local {
+			s.localMember = m
+		}
+	}
 	s.cfg.APIKey = "" // never retain a second plaintext copy of the control key
+	s.cfg.Workers = nil
 	go s.sweep()
 	return s, nil
 }
@@ -82,22 +166,21 @@ func (s *Service) sweep() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
+		ctx, cancel := context.WithTimeout(context.Background(), workerTimeout)
+		s.reconcileAll(ctx)
+		cancel()
 		select {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			s.mu.Lock()
-			_ = s.reconcile(ctx)
-			s.mu.Unlock()
-			cancel()
 		}
 	}
 }
 
-// Authorize demands a current positive VM inventory observation, a live
-// unexpired ledger row, the newest job attempt, and the sandbox-scoped token.
-// Inconclusive inventory or a stopped VM never grants guest access.
+// Authorize demands a current positive VM inventory observation from the
+// sandbox's worker under its current lease, a live unexpired ledger row, the
+// newest job attempt, and the sandbox-scoped token. Inconclusive inventory, a
+// stopped VM or an offline worker never grants guest access.
 func (s *Service) Authorize(id, token string) bool {
 	if !validID(id) || token == "" {
 		return false
@@ -105,16 +188,16 @@ func (s *Service) Authorize(id, token string) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	row, err := s.ledger.Get(ctx, id)
+	row, m, err := s.owned(ctx, id)
+	s.mu.Unlock()
 	if err != nil || row.State != "running" || !time.Now().Before(row.Ends) {
 		return false
 	}
-	current, err := s.ledger.Current(ctx, row)
-	if err != nil || !current {
+	hash := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(row.TokenHash, hash[:]) != 1 {
 		return false
 	}
-	observed, err := s.driver.List(ctx)
+	observed, err := m.api.List(ctx)
 	if err != nil {
 		return false
 	}
@@ -126,11 +209,26 @@ func (s *Service) Authorize(id, token string) bool {
 			running = instance.Running
 		}
 	}
-	if matches != 1 || !running {
-		return false
+	return matches == 1 && running
+}
+
+// owned returns a sandbox's row and worker only while the row is the newest
+// attempt of its job and was proven present under the worker's current lease.
+// Callers hold s.mu.
+func (s *Service) owned(ctx context.Context, id string) (store.Row, *member, error) {
+	row, err := s.ledger.Get(ctx, id)
+	if err != nil {
+		return store.Row{}, nil, err
 	}
-	hash := sha256.Sum256([]byte(token))
-	return subtle.ConstantTimeCompare(row.TokenHash, hash[:]) == 1
+	m := s.byID[row.WorkerID]
+	if m == nil || !m.online || m.lease == 0 || row.Lease != m.lease {
+		return store.Row{}, nil, errors.New("sandbox owner is not the current worker lease")
+	}
+	current, err := s.ledger.Current(ctx, row)
+	if err != nil || !current {
+		return store.Row{}, nil, errors.New("sandbox owner superseded")
+	}
+	return row, m, nil
 }
 
 // Abort revokes a canceled/failed guest execution before tearing down its VM.
@@ -140,18 +238,24 @@ func (s *Service) Abort(ctx context.Context, id, token string) error {
 		return errors.New("invalid sandbox capability")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	row, err := s.ledger.Get(ctx, id)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
+	m := s.byID[row.WorkerID]
 	hash := sha256.Sum256([]byte(token))
-	if row.State != "running" || row.WorkerID != s.cfg.WorkerID ||
-		subtle.ConstantTimeCompare(row.TokenHash, hash[:]) != 1 {
+	if row.State != "running" || m == nil || subtle.ConstantTimeCompare(row.TokenHash, hash[:]) != 1 {
+		s.mu.Unlock()
 		return errors.New("sandbox capability is no longer active")
 	}
 	stateErr := s.ledger.SetState(ctx, id, "unknown")
-	destroyErr := s.driver.Destroy(ctx, id)
+	s.busy[id] = true
+	s.mu.Unlock()
+	destroyErr := m.api.Destroy(ctx, id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.busy, id)
 	if destroyErr != nil {
 		return errors.Join(stateErr, destroyErr)
 	}
@@ -174,6 +278,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 	if path == "/v2/sandboxes" && r.Method == http.MethodGet {
 		s.list(w, r)
 		return
+	}
+	if path == "/sandboxd/capacity" && r.Method == http.MethodGet {
+		s.capacity(w, r)
+		return
+	}
+	if rest, ok := strings.CutPrefix(path, "/sandboxd/workers/"); ok && r.Method == http.MethodPost {
+		if id, ok := strings.CutSuffix(rest, "/forget"); ok {
+			s.forget(w, r, id)
+			return
+		}
 	}
 	if !strings.HasPrefix(path, "/sandboxes/") {
 		http.NotFound(w, r)
@@ -284,8 +398,12 @@ type sandbox struct {
 func (s *Service) describe(row store.Row) sandbox {
 	var metadata map[string]string
 	_ = json.Unmarshal([]byte(row.Metadata), &metadata)
+	cpus, memory := row.CPUs, row.MemoryMiB
+	if cpus == 0 || memory == 0 { // recorded before rows carried their VM shape
+		cpus, memory = s.cfg.CPUs, s.cfg.MemoryMiB
+	}
 	return sandbox{ID: row.ID, TemplateID: row.TemplateID, StartedAt: row.Started, EndAt: row.Ends,
-		CPUCount: s.cfg.CPUs, MemoryMB: s.cfg.MemoryMiB, DiskSizeMB: 10 * 1024,
+		CPUCount: cpus, MemoryMB: memory, DiskSizeMB: 10 * 1024,
 		State: "running", EnvdVersion: "sandboxd-1", Metadata: metadata, Domain: s.cfg.Domain}
 }
 
@@ -295,13 +413,25 @@ func jsonResponse(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// apiError writes the E2B API error shape {"code","message"}.
+func apiError(w http.ResponseWriter, status int, message string) {
+	jsonResponse(w, status, struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	}{status, message})
+}
+
 func unavailable(w http.ResponseWriter) {
 	http.Error(w, "sandbox state unavailable", http.StatusServiceUnavailable)
 }
 
 func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	var request createRequest
-	if !readJSON(w, r, &request) || request.TemplateID != s.cfg.TemplateID || !request.Secure || request.AutoPause || len(request.EnvVars) != 0 {
+	if !readJSON(w, r, &request) || !request.Secure || request.AutoPause || len(request.EnvVars) != 0 {
+		http.Error(w, "unsupported sandbox request", http.StatusBadRequest)
+		return
+	}
+	if _, known := s.templates[request.TemplateID]; !known {
 		http.Error(w, "unsupported sandbox request", http.StatusBadRequest)
 		return
 	}
@@ -335,29 +465,40 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	hash := sha256.Sum256([]byte(token))
 	started := time.Now().UTC()
 	row := store.Row{ID: "sandboxd-" + idBytes, TokenHash: hash[:], Metadata: string(metadata), JobID: job,
-		TemplateID: s.cfg.TemplateID, Image: s.cfg.Image, WorkerID: s.cfg.WorkerID,
-		Attempt: attempt, Generation: generation, Fence: request.Metadata["daemon_fencing_token"],
+		TemplateID: request.TemplateID, Attempt: attempt, Generation: generation, Fence: request.Metadata["daemon_fencing_token"],
 		Started: started, Ends: started.Add(ttl)}
+
+	reconcileCtx, cancel := context.WithTimeout(r.Context(), workerTimeout)
+	s.reconcileAll(reconcileCtx)
+	cancel()
+	s.mu.Lock()
+	m, spec, err := s.admit(r.Context(), &row)
+	if err != nil {
+		s.mu.Unlock()
+		var refusal *refusal
+		switch {
+		case errors.As(err, &refusal):
+			apiError(w, refusal.status, refusal.message)
+		default:
+			// Includes store.ErrLegacySlot: a live pre-slot row blocks admission
+			// until reconciliation proves it gone.
+			unavailable(w)
+		}
+		return
+	}
+	s.busy[row.ID] = true
+	s.mu.Unlock()
+
+	instance, err := m.api.Create(r.Context(), spec)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.reconcile(r.Context()); err != nil {
-		unavailable(w)
-		return
-	}
-	slot, err := s.ledger.Reserve(r.Context(), row, s.cfg.MaxVMs, s.cfg.Slots)
-	if errors.Is(err, store.ErrCapacity) || errors.Is(err, store.ErrStale) {
-		http.Error(w, "sandbox capacity or owner conflict", http.StatusConflict)
-		return
-	}
-	if err != nil {
-		// Includes store.ErrLegacySlot: a live pre-slot row blocks admission
-		// until reconciliation proves it gone.
-		unavailable(w)
-		return
-	}
-	instance, err := s.driver.Create(r.Context(), vm.Spec{ID: row.ID, Image: s.cfg.Image, Network: slot, CPUs: s.cfg.CPUs, MemoryMiB: s.cfg.MemoryMiB})
-	if err != nil || instance.ID != row.ID || !instance.Running {
+	delete(s.busy, row.ID)
+	// A worker that went offline or re-enrolled while this Create was in
+	// flight answered under a superseded lease. Its answer cannot admit the VM;
+	// reconciliation under the new lease decides the row's fate.
+	fenced := !m.online || m.lease != row.Lease
+	if err != nil || fenced || instance.ID != row.ID || !instance.Running {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
 		_ = s.ledger.SetState(context.Background(), row.ID, "unknown")
@@ -368,80 +509,12 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 		unavailable(w)
 		return
 	}
+	row.State = "running"
 	response := struct {
 		sandbox
 		EnvdAccessToken string `json:"envdAccessToken"`
 	}{sandbox: s.describe(row), EnvdAccessToken: token}
 	jsonResponse(w, http.StatusCreated, response)
-}
-
-// reconcile uses only the driver's complete successful inventory. Unknown or
-// failed observations never release a reservation. List returns only VMs
-// owned by this driver; orphaned owned VMs must be destroyed before admission.
-// All callers hold s.mu.
-func (s *Service) reconcile(ctx context.Context) error {
-	instances, err := s.driver.List(ctx)
-	if err != nil {
-		return err
-	}
-	rows, err := s.ledger.Active(ctx)
-	if err != nil {
-		return err
-	}
-	inventory := make(map[string]vm.Instance, len(instances))
-	for _, instance := range instances {
-		if instance.ID == "" {
-			return errors.New("VM inventory contains empty ID")
-		}
-		if _, duplicate := inventory[instance.ID]; duplicate {
-			return errors.New("VM inventory contains duplicate ID")
-		}
-		inventory[instance.ID] = instance
-	}
-	now := time.Now()
-	for _, row := range rows {
-		instance, exists := inventory[row.ID]
-		delete(inventory, row.ID)
-		// A failed Create can complete late; even a formerly running VM can
-		// leave a job-owned volume after its container disappears. Confirm
-		// allocation cleanup before marking absence.
-		if !exists {
-			if err := s.driver.Destroy(ctx, row.ID); err != nil {
-				return err
-			}
-		}
-		if !exists {
-			if err := s.ledger.SetState(ctx, row.ID, "gone"); err != nil {
-				return err
-			}
-			continue
-		}
-		current, err := s.ledger.Current(ctx, row)
-		if err != nil {
-			return err
-		}
-		// A guest observed off its recorded slot may share a network with
-		// another guest; never keep it. Legacy rows have no recorded slot.
-		onSlot := row.Slot == "" || instance.Network == row.Slot
-		if row.State == "running" && instance.Running && onSlot && current && now.Before(row.Ends) {
-			continue
-		}
-		if err := s.ledger.SetState(ctx, row.ID, "unknown"); err != nil {
-			return err
-		}
-		if err := s.driver.Destroy(ctx, row.ID); err != nil {
-			return err
-		}
-		if err := s.ledger.SetState(ctx, row.ID, "gone"); err != nil {
-			return err
-		}
-	}
-	for id := range inventory {
-		if err := s.driver.Destroy(ctx, id); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (s *Service) list(w http.ResponseWriter, r *http.Request) {
@@ -463,9 +536,19 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid next token", http.StatusBadRequest)
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), workerTimeout)
+	s.reconcileAll(ctx)
+	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.reconcile(r.Context()); err != nil {
+	var offline []string
+	for _, m := range s.workers {
+		if !m.online {
+			offline = append(offline, m.id)
+		}
+	}
+	// With no worker observed there is no inventory at all, only guesses.
+	if len(offline) == len(s.workers) {
 		unavailable(w)
 		return
 	}
@@ -474,15 +557,33 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 		unavailable(w)
 		return
 	}
+	// A worker that is no longer enrolled is reported like an offline one.
+	offline = append(offline, s.unenrolled(rows)...)
 	result := make([]sandbox, 0, len(rows))
 	for _, row := range rows {
-		if row.State != "running" || row.TemplateID != s.cfg.TemplateID || row.Image != s.cfg.Image || row.WorkerID != s.cfg.WorkerID {
+		if s.busy[row.ID] {
+			continue // Create or Destroy in flight: not yet, or no longer, a sandbox.
+		}
+		m := s.byID[row.WorkerID]
+		if m == nil || !m.online {
+			// The worker's last known running sandboxes stay listed: an offline
+			// or removed worker neither strands nor silently drops them. The
+			// header below says this part of the inventory is unconfirmed.
+			if row.State == "running" {
+				result = append(result, s.describe(row))
+			}
+			continue
+		}
+		if row.State != "running" || m.serves[row.TemplateID] != row.Image {
 			unavailable(w)
 			return
 		}
 		result = append(result, s.describe(row))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ID < result[j].ID })
+	if len(offline) > 0 {
+		w.Header().Set("X-Sandboxd-Offline-Workers", strings.Join(offline, ","))
+	}
 	w.Header().Set("X-Total-Running", strconv.Itoa(len(result)))
 	start := sort.Search(len(result), func(i int) bool { return result[i].ID > token })
 	page := result[start:]
@@ -493,26 +594,45 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, page)
 }
 
-func (s *Service) live(ctx context.Context, id string) (store.Row, error) {
-	if err := s.reconcile(ctx); err != nil {
-		return store.Row{}, err
-	}
+// live reconciles the sandbox's own worker and returns its row only while it
+// is running, current and owned under the worker's current lease.
+func (s *Service) live(ctx context.Context, id string) (store.Row, *member, error) {
+	s.mu.Lock()
 	row, err := s.ledger.Get(ctx, id)
+	m := s.byID[row.WorkerID]
+	s.mu.Unlock()
 	if err != nil {
-		return store.Row{}, err
+		return store.Row{}, nil, err
 	}
-	if row.State == "gone" {
-		return store.Row{}, sql.ErrNoRows
+	if released(row) {
+		return store.Row{}, nil, sql.ErrNoRows
 	}
-	if row.State != "running" || row.TemplateID != s.cfg.TemplateID || row.Image != s.cfg.Image || row.WorkerID != s.cfg.WorkerID {
-		return store.Row{}, errors.New("sandbox not running")
+	if m == nil {
+		return store.Row{}, nil, errors.New("sandbox worker is not enrolled")
 	}
-	current, err := s.ledger.Current(ctx, row)
-	if err != nil || !current {
-		return store.Row{}, errors.New("sandbox owner superseded")
+	if err := s.reconcile(ctx, m); err != nil {
+		return store.Row{}, nil, err
 	}
-	return row, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if row, err = s.ledger.Get(ctx, id); err != nil {
+		return store.Row{}, nil, err
+	}
+	if released(row) {
+		return store.Row{}, nil, sql.ErrNoRows
+	}
+	if row.State != "running" || s.busy[id] || m.serves[row.TemplateID] != row.Image {
+		return store.Row{}, nil, errors.New("sandbox not running")
+	}
+	if row, m, err = s.owned(ctx, id); err != nil {
+		return store.Row{}, nil, err
+	}
+	return row, m, nil
 }
+
+// released reports a row that no longer holds a reservation: proven gone, or
+// released by forget-worker without proof (its VM is then no longer managed).
+func released(row store.Row) bool { return row.State == "gone" || row.State == "unverified" }
 
 func statusFor(err error) int {
 	if errors.Is(err, sql.ErrNoRows) {
@@ -522,9 +642,7 @@ func statusFor(err error) int {
 }
 
 func (s *Service) get(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	row, err := s.live(r.Context(), id)
+	row, _, err := s.live(r.Context(), id)
 	if err != nil {
 		http.Error(w, "sandbox unavailable", statusFor(err))
 		return
@@ -543,12 +661,12 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "invalid timeout", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.live(r.Context(), id); err != nil {
+	if _, _, err := s.live(r.Context(), id); err != nil {
 		http.Error(w, "sandbox unavailable", statusFor(err))
 		return
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := s.ledger.Extend(r.Context(), id, time.Now().UTC().Add(ttl)); err != nil {
 		unavailable(w)
 		return
@@ -556,55 +674,82 @@ func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// delete confirms teardown through the sandbox's own worker. An offline
+// worker leaves the reservation in place (503) until teardown is proven.
 func (s *Service) delete(w http.ResponseWriter, r *http.Request, id string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.reconcile(r.Context()); err != nil {
-		unavailable(w)
-		return
-	}
 	row, err := s.ledger.Get(r.Context(), id)
+	m := s.byID[row.WorkerID]
+	s.mu.Unlock()
 	if err != nil {
 		http.Error(w, "sandbox unavailable", statusFor(err))
 		return
 	}
-	if row.State != "gone" {
-		if err := s.ledger.SetState(r.Context(), id, "unknown"); err != nil {
+	if released(row) {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if m == nil {
+		unavailable(w)
+		return
+	}
+	if err := s.reconcile(r.Context(), m); err != nil {
+		unavailable(w)
+		return
+	}
+	m.sync.Lock()
+	defer m.sync.Unlock()
+	s.mu.Lock()
+	row, err = s.ledger.Get(r.Context(), id)
+	if err != nil || released(row) {
+		s.mu.Unlock()
+		if err != nil {
 			unavailable(w)
 			return
 		}
-		if err := s.driver.Destroy(r.Context(), id); err != nil {
-			unavailable(w)
-			return
-		}
-		if err := s.ledger.SetState(r.Context(), id, "gone"); err != nil {
-			unavailable(w)
-			return
-		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := s.ledger.SetState(r.Context(), id, "unknown"); err != nil {
+		s.mu.Unlock()
+		unavailable(w)
+		return
+	}
+	s.busy[id] = true
+	s.mu.Unlock()
+	destroyErr := m.api.Destroy(r.Context(), id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.busy, id)
+	if destroyErr != nil {
+		unavailable(w)
+		return
+	}
+	if err := s.ledger.SetState(r.Context(), id, "gone"); err != nil {
+		unavailable(w)
+		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Service) metrics(w http.ResponseWriter, r *http.Request, id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, err := s.live(r.Context(), id); err != nil {
+	row, m, err := s.live(r.Context(), id)
+	if err != nil {
 		http.Error(w, "sandbox unavailable", statusFor(err))
 		return
 	}
-	meter, ok := s.driver.(vm.ResourceMeter)
-	if !ok {
+	usage, err := m.api.Usage(r.Context(), id)
+	if errors.Is(err, worker.ErrNoMetrics) {
 		http.Error(w, "VM metrics unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	usage, err := meter.Usage(r.Context(), id)
 	if err != nil {
 		unavailable(w)
 		return
 	}
 	jsonResponse(w, http.StatusOK, []map[string]any{{
 		"timestampUnix": time.Now().Unix(),
-		"cpuCount":      s.cfg.CPUs,
+		"cpuCount":      s.describe(row).CPUCount,
 		"cpuUsedPct":    usage.CPUUsedPct,
 		"memUsed":       usage.MemoryUsedBytes,
 		"memTotal":      usage.MemoryLimitBytes,

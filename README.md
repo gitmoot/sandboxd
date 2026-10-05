@@ -269,7 +269,11 @@ another guest user.
 ## Roadmap
 
 - **General E2B SDK compatibility**, so stock SDKs work unchanged.
-- **A second worker and capability-based scheduling across workers**
+- **A two-worker proof.** The gateway enrolls several workers, including
+  the Firecracker Linux worker, and schedules by architecture and free
+  capacity ([#30](https://github.com/gitmoot/sandboxd/issues/30); see
+  [Multiple workers](docs/compatibility.md#multiple-workers)). Running the
+  Mac and a Linux worker together in production remains
   ([#11](https://github.com/gitmoot/sandboxd/issues/11)).
 - **Proof of recovery after a Mac reboot** with no manual step
   ([#7](https://github.com/gitmoot/sandboxd/issues/7)).

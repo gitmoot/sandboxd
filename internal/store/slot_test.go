@@ -66,10 +66,15 @@ func TestConcurrentReservationsGetExclusiveSlots(t *testing.T) {
 	if len(got) != 3 || got[0] != "slot-1" || got[1] != "slot-2" || got[2] != "slot-3" {
 		t.Fatalf("concurrent reservations did not get one exclusive slot each: %v", got)
 	}
-	// The ledger itself refuses a second live row on a held slot.
-	if _, err := ledger.db.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,slot,started_ns,ends_ns)
-		VALUES('intruder',x'00','{}','j',1,0,'','reserved','slot-2',0,0)`); err == nil {
+	// The ledger itself refuses a second live row on a held slot of one worker,
+	// while another worker may reuse the same worker-local slot name.
+	if _, err := ledger.db.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,worker_id,slot,started_ns,ends_ns)
+		VALUES('intruder',x'00','{}','j',1,0,'','reserved','mac-local','slot-2',0,0)`); err == nil {
 		t.Fatal("ledger admitted two live rows on one slot")
+	}
+	if _, err := ledger.db.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,worker_id,slot,started_ns,ends_ns)
+		VALUES('neighbour',x'00','{}','k',1,0,'','reserved','linux-1','slot-2',0,0)`); err != nil {
+		t.Fatalf("another worker could not use its own slot-2: %v", err)
 	}
 }
 

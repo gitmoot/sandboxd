@@ -33,9 +33,16 @@ type Authorizer interface {
 	Abort(context.Context, string, string) error
 }
 
+// Guest is the part of a VM driver the data plane uses. The gateway passes a
+// router that sends each call to the worker owning the sandbox.
+type Guest interface {
+	CopyIn(ctx context.Context, id, hostPath, guestPath string) error
+	Run(ctx context.Context, id string, cmd vm.Command, stdout, stderr io.Writer) (exitCode int, err error)
+}
+
 // Handler exposes only file upload and process start for an owned VM.
 type Handler struct {
-	Driver     vm.Driver
+	Driver     Guest
 	Authorizer Authorizer
 	Domain     string
 	// GatewayHost permits E2B's header-routed data plane on one private

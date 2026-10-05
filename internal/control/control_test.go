@@ -263,9 +263,14 @@ func TestRestartDoesNotReassignLiveVMToNewWorker(t *testing.T) {
 	if got := request(t, second, http.MethodGet, "/sandboxes/"+sandbox.ID, nil); got.Code != http.StatusServiceUnavailable {
 		t.Fatalf("reassigned old VM to replacement worker: %d", got.Code)
 	}
-	if got := request(t, second, http.MethodGet, "/v2/sandboxes", nil); got.Code != http.StatusServiceUnavailable {
-		t.Fatalf("false complete inventory for unknown worker: %d", got.Code)
+	// The old identity is reported like an offline worker: its sandbox stays
+	// listed as unconfirmed rather than being dropped or claimed.
+	list := request(t, second, http.MethodGet, "/v2/sandboxes", nil)
+	if list.Code != http.StatusOK || list.Header().Get("X-Sandboxd-Offline-Workers") != "mac-original" ||
+		!strings.Contains(list.Body.String(), sandbox.ID) {
+		t.Fatalf("old worker's sandbox hidden or not marked unconfirmed: %d %v %s", list.Code, list.Header(), list.Body.String())
 	}
+	// Both identities ran on this host: the old VM still holds the only slot.
 	if got := request(t, second, http.MethodPost, "/sandboxes", createBody("new-job", 1)); got.Code != http.StatusConflict {
 		t.Fatalf("old worker VM released its capacity: %d", got.Code)
 	}

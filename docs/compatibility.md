@@ -4,9 +4,11 @@ Client revision: `gitmoot/gitmoot@a61e1435e7625bf062e05eed21337765833eade6` (the
 
 | Plane | Supported operation | Authentication and result |
 | --- | --- | --- |
-| Control | `POST /sandboxes` | `X-API-Key`; known template, secure mode, bounded TTL and owner metadata; `201` with `sandboxID`, `envdAccessToken` and VM shape. Unknown template and unsupported options are rejected. |
+| Control | `POST /sandboxes` | `X-API-Key`; known template, secure mode, bounded TTL and owner metadata; `201` with `sandboxID`, `envdAccessToken` and VM shape. Unknown template and unsupported options are rejected. A template that no enrolled worker can run on its architecture is `400`. When every compatible worker is full the answer is `409` `{"code":409,"message":"sandbox capacity exhausted: ..."}`, and nothing was allocated. |
 | Control | `GET /sandboxes/{id}` | `X-API-Key`; `200` for live VM; per-ID `404` remains **inconclusive** to the pinned Gitmoot client; unavailable observation is `503`. |
-| Control | `GET /v2/sandboxes?limit=100&nextToken=...` | `X-API-Key`; sorted stable-ID pages, `X-Next-Token` and `X-Total-Running`; inventory failure is `503`, never an empty success. The complete inventory, not a per-ID 404, proves absence. |
+| Control | `GET /v2/sandboxes?limit=100&nextToken=...` | `X-API-Key`; sorted stable-ID pages, `X-Next-Token` and `X-Total-Running`; inventory failure is `503`, never an empty success. The complete inventory, not a per-ID 404, proves absence. Sandboxes of every enrolled worker are merged; an offline or no-longer-enrolled worker's last known running sandboxes stay listed and its ID is named in `X-Sandboxd-Offline-Workers`. |
+| Control | `GET /sandboxd/capacity` | `X-API-Key`; sandboxd extension. `200` with `totalSlots`, `usedSlots`, `freeSlots` over online workers, per-template totals, and per-worker `arch`, `driver`, `templates`, `refusedTemplates` (for example an architecture mismatch), `enrolled`, `online`, `lease`, `maxVMs`, `usedSlots`, `cpus`, `memoryMiB`, `lastSeen` and last `error`. |
+| Control | `POST /sandboxd/workers/{id}/forget` | `X-API-Key`; sandboxd extension, body `{"confirm":true}`. Releases a non-online worker's live reservations as `unverified` (see [Multiple workers](#multiple-workers)); `409` while the worker is enrolled and online. |
 | Control | `POST /sandboxes/{id}/timeout`, `DELETE /sandboxes/{id}` | `X-API-Key`; bounded extension, idempotent confirmed destroy; success `204`; uncertain cleanup is `503` and retains capacity. |
 | Control | `GET /sandboxes/{id}/metrics` | `X-API-Key`; measured CPU and memory values from Apple VM stats; `200` array or `503` on incomplete samples. No invented disk usage or cloud charge. |
 | Guest | `POST /files?username=user&path=/home/user/...` | `X-Access-Token` per-VM capability and sandbox ID/port routing headers; bounded regular file, confined path, no host mounts. |
@@ -255,6 +257,70 @@ one loopback port; Gitmoot's mTLS certificate and short-lived lease still
 authorize each model request. Source admission is not a firewall for other
 Mac services. Recheck the actual network subnets after any Apple network
 recreation.
+
+## Multiple workers
+
+One sandboxd is the gateway. Its own driver (the Mac, configured exactly as
+above) is one worker; `-enroll` adds more. `-driver none` runs a gateway with
+no local VMs. A remote worker is a sandboxd started with
+`-worker-key-file <0600 file>` and its usual driver flags (no `-db`,
+`-api-key-file`, `-domain` or `-gateway-host`). It declares its real driver
+and architecture: `apple` runs `arm64` guests, `firecracker` runs `amd64`
+guests ([firecracker.md](firecracker.md)). It serves only the worker API on
+its loopback `-listen` address, behind a private HTTPS proxy such as
+Tailscale Serve, exactly like the control API:
+
+```sh
+sandboxd ... -enroll id=linux-1,url=https://linux-1.<tailnet>:8444,key-file=/etc/sandboxd/linux-1.key \
+  -template-arch review-amd64=amd64
+```
+
+- **Declaration.** On enrollment each worker declares its ID, guest
+  architecture, driver, templates (template ID to worker-local image), VM
+  shape and slots. `-template-arch` registers each template served by
+  enrolled workers with the architecture it needs; the local template needs
+  the local architecture. A template declared by a worker of another
+  architecture is refused and reported under `refusedTemplates`.
+- **Authentication.** Each worker has its own key (at least 16 bytes), sent
+  as a bearer token over HTTPS; plain HTTP is accepted only to a loopback
+  IP. A worker that answers with another worker's ID is refused.
+- **Scheduling.** A create goes to the online worker that serves its
+  template and has the most free slots. Slots and capacity are per worker.
+  When every compatible worker is full, create is `409` as above.
+- **Fencing.** Every enrollment takes a new lease from a durable per-worker
+  counter in the ledger. A worker refuses requests made under an older lease
+  and cancels runs and uploads started under one. The gateway drops a
+  worker's lease whenever it cannot observe the worker; until it re-enrolls,
+  that worker's sandboxes grant no guest access and get no new work. A
+  Create answered across a re-enrollment never admits its VM; the VM is
+  reconciled under the new lease. Each row records its worker and the lease
+  under which it was last proven present.
+- **Losing a worker.** Its sandboxes stay in the ledger, keep their slots and
+  are listed as unconfirmed; deleting one is `503` until the worker returns.
+  A retried job is scheduled elsewhere; when the old worker returns, its
+  superseded attempt is destroyed and every other sandbox is re-adopted.
+  The other workers' sandboxes are not affected.
+- **Removing a worker.** A worker whose `-enroll` is removed while it still
+  owns live sandboxes is treated like an offline one: its sandboxes stay
+  listed, it is named in `X-Sandboxd-Offline-Workers` and reported in
+  capacity with `"enrolled": false`, deletes are `503`, and its reservations
+  count only against itself, so the other workers keep admitting. (An
+  identity that ran on the gateway's own host, such as a renamed local
+  worker, still holds the local slots its VMs may occupy.)
+- **Forgetting a worker.** When a worker is gone for good, release its
+  reservations explicitly:
+
+  ```sh
+  sandboxd forget-worker -id linux-1 -confirm -api-key-file <key> [-api-url http://127.0.0.1:43180]
+  ```
+
+  This calls `POST /sandboxd/workers/{id}/forget` with `{"confirm":true}`. It
+  is refused (`409`) while the worker is enrolled and online. Its live rows
+  become `unverified`, a state distinct from `gone`: their VMs were not proven
+  destroyed, and the gateway and the command log each sandbox ID as such.
+  They no longer hold capacity and are not listed. If the worker is enrolled
+  again, its complete inventory destroys their VMs and only then are the
+  rows marked `gone`.
 
 ## Review image module cache
 
