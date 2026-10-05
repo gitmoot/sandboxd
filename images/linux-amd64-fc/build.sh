@@ -25,10 +25,12 @@ cid=
 cleanup() {
     [ -n "$cid" ] && docker rm -f "$cid" >/dev/null 2>&1 || true
     docker rmi -f "$tag" >/dev/null 2>&1 || true
-    # Drop only this Dockerfile's build cache (about 520 MB, plus about
-    # 1.4 GB for --go126 including the golang base layers it pulls); other
-    # users' cache entries are left alone. A record is prunable only once its
-    # children are gone, so repeat until nothing matches.
+    # Drop only this Dockerfile's build cache (about 520 MB, more with
+    # --go126); other users' cache entries are left alone. A
+    # record is prunable only once its children are gone, so repeat until
+    # nothing matches. The golang base image's pulled layers (about 0.7 GB)
+    # are tried too, but BuildKit may keep them while it shares their
+    # snapshots with other cache records; `docker buildx du` lists them.
     pass=0
     while [ "$pass" -lt 6 ]; do
         ids=$(docker buildx du --verbose 2>/dev/null | awk -v go126="$go126" '/^ID:/{id=$2}
