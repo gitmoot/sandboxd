@@ -31,11 +31,13 @@ func main() {
 
 func run(ctx context.Context, args []string) (runErr error) {
 	flags := flag.NewFlagSet("sandboxd", flag.ContinueOnError)
+	driverName := flags.String("driver", "apple", "VM driver: apple (Apple container on macOS) or firecracker (Linux/KVM)")
+	fc := addFirecrackerFlags(flags)
 	listen := flags.String("listen", "127.0.0.1:43180", "loopback address behind private HTTPS proxy")
 	database := flags.String("db", "", "durable SQLite ledger path")
 	keyFile := flags.String("api-key-file", "", "0600 file containing E2B-compatible API key")
 	cli := flags.String("container-cli", "/usr/local/bin/container", "absolute path to Apple container CLI")
-	image := flags.String("image", "", "allowlisted Linux ARM64 OCI image")
+	image := flags.String("image", "", "allowlisted guest image: Linux ARM64 OCI image (apple) or absolute read-only ext4 root image (firecracker)")
 	pinImage := flags.String("pin-image", "", "trusted digest-pinned read-only bridge VM image")
 	pfSocket := flags.String("pf-socket", "", "root helper Unix socket")
 	template := flags.String("template", "", "allowlisted E2B-compatible template identifier")
@@ -48,7 +50,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	memory := flags.Int("memory-mib", 4096, "memory limit in MiB for each VM")
 	relayListen := flags.String("model-relay-listen", "", "optional <first slot gateway>:<port> listener for the fixed mTLS model gateway relay")
 	relayTarget := flags.String("model-relay-target", "", "loopback endpoint of a fixed SSH reverse tunnel")
-	maxVMs := flags.Int("max-vms", 0, "maximum concurrent VMs; zero means one per slot, never more than the slots")
+	maxVMs := flags.Int("max-vms", 0, "maximum concurrent VMs; zero means one per slot (apple, never more than the slots) or 2 (firecracker)")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-job lifetime")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -60,22 +62,41 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil || !net.ParseIP(host).IsLoopback() {
 		return fmt.Errorf("listen address must be an explicit loopback IP and port")
 	}
-	if *database == "" || *keyFile == "" || *image == "" || *pinImage == "" || *pfSocket == "" ||
-		*template == "" || *gatewayHost == "" || *domain == "" || *workerID == "" ||
-		strings.ContainsAny(*gatewayHost, "/?# ") {
-		return fmt.Errorf("db, api-key-file, image, pin-image, pf-socket, template, domain, gateway-host and worker-id are required")
+	if *database == "" || *keyFile == "" || *image == "" || *template == "" || *gatewayHost == "" || *domain == "" || *workerID == "" ||
+		(*driverName == "apple" && (*pinImage == "" || *pfSocket == "")) || strings.ContainsAny(*gatewayHost, "/?# ") {
+		return fmt.Errorf("db, api-key-file, image, template, domain, gateway-host and worker-id are required, plus pin-image and pf-socket for the apple driver")
 	}
-	if err := firewall.ValidateSlots(slots); err != nil {
-		return err
+	var slotNames []string
+	switch *driverName {
+	case "apple":
+		if err := firewall.ValidateSlots(slots); err != nil {
+			return err
+		}
+		slotNames = slots.Networks()
+		if err := checkModelRelayListen(*relayListen, slots[0].Gateway); err != nil {
+			return err
+		}
+	case "firecracker":
+		// Firecracker guests have no host-reachable network; PF slots, the
+		// bridge pin and the slot-gateway model relay are Apple-only.
+		if len(slots) != 0 || *pinImage != "" || *pfSocket != "" || *relayListen != "" || *relayTarget != "" {
+			return fmt.Errorf("slot, pin-image, pf-socket and model-relay flags apply only to the apple driver")
+		}
+		if *maxVMs == 0 {
+			*maxVMs = 2
+		}
+		if *maxVMs < 1 || *maxVMs > 64 {
+			return fmt.Errorf("max-vms must be between 1 and 64 for the firecracker driver")
+		}
+		slotNames = vm.FirecrackerSlotNames(*maxVMs)
+	default:
+		return fmt.Errorf("unknown driver %q", *driverName)
 	}
 	if *maxVMs == 0 {
-		*maxVMs = len(slots)
+		*maxVMs = len(slotNames)
 	}
-	if *maxVMs < 1 || *maxVMs > len(slots) {
-		return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slots))
-	}
-	if err := checkModelRelayListen(*relayListen, slots[0].Gateway); err != nil {
-		return err
+	if *maxVMs < 1 || *maxVMs > len(slotNames) {
+		return fmt.Errorf("max-vms must be between 1 and the %d configured slots", len(slotNames))
 	}
 	key, err := os.ReadFile(*keyFile)
 	if err != nil {
@@ -89,46 +110,65 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if len(apiKey) < 8 || strings.ContainsAny(apiKey, "\r\n") {
 		return fmt.Errorf("API key must be a single nonempty value of at least eight bytes")
 	}
-	gate, err := firewall.NewClient(*pfSocket)
-	if err != nil {
-		return err
-	}
-	driver, err := vm.NewAppleDriver(*cli, []string{*image}, slots.Networks(), *workerID, *pinImage, gate)
-	if err != nil {
-		return err
-	}
-	if err := driver.EnsureSystem(ctx); err != nil {
-		return fmt.Errorf("start Apple container services: %w", err)
-	}
-	if err := driver.CleanupGuests(ctx); err != nil {
-		return fmt.Errorf("remove stale guest VMs before firewall admission: %w", err)
-	}
-	if err := driver.StartPin(ctx); err != nil {
-		return fmt.Errorf("start trusted bridge pin: %w", err)
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := driver.CleanupGuests(cleanupCtx); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("leave PF armed; guest cleanup failed: %w", err))
-			return
+	var driver isolatedDriver
+	switch *driverName {
+	case "apple":
+		gate, err := firewall.NewClient(*pfSocket)
+		if err != nil {
+			return err
 		}
-		if err := driver.StopPin(cleanupCtx); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("leave PF armed; pin cleanup failed: %w", err))
-			return
+		apple, err := vm.NewAppleDriver(*cli, []string{*image}, slotNames, *workerID, *pinImage, gate)
+		if err != nil {
+			return err
 		}
-		if err := gate.Disarm(cleanupCtx); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("PF anchor cleanup: %w", err))
+		if err := apple.EnsureSystem(ctx); err != nil {
+			return fmt.Errorf("start Apple container services: %w", err)
 		}
-	}()
-	bridges, err := gate.Arm(ctx)
-	if err != nil {
-		return fmt.Errorf("arm privileged firewall: %w", err)
+		if err := apple.CleanupGuests(ctx); err != nil {
+			return fmt.Errorf("remove stale guest VMs before firewall admission: %w", err)
+		}
+		if err := apple.StartPin(ctx); err != nil {
+			return fmt.Errorf("start trusted bridge pin: %w", err)
+		}
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if err := apple.CleanupGuests(cleanupCtx); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("leave PF armed; guest cleanup failed: %w", err))
+				return
+			}
+			if err := apple.StopPin(cleanupCtx); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("leave PF armed; pin cleanup failed: %w", err))
+				return
+			}
+			if err := gate.Disarm(cleanupCtx); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("PF anchor cleanup: %w", err))
+			}
+		}()
+		bridges, err := gate.Arm(ctx)
+		if err != nil {
+			return fmt.Errorf("arm privileged firewall: %w", err)
+		}
+		log.Printf("sandbox guest bridges %s guarded by root PF helper", bridges)
+		driver = apple
+	case "firecracker":
+		// Guests that survived a daemon kill keep running; the control
+		// plane's reconciliation keeps those its ledger still owns.
+		firecracker, shutdown, err := startFirecracker(ctx, fc, *image, slotNames)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			runErr = errors.Join(runErr, shutdown(cleanupCtx))
+		}()
+		log.Printf("Firecracker guests confined by nftables table inet sbx_fc and per-VM namespaces")
+		driver = firecracker
 	}
-	log.Printf("sandbox guest bridges %s guarded by root PF helper", bridges)
 	service, err := control.Open(ctx, *database, driver, control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: *image, Domain: *domain, WorkerID: *workerID,
-		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slots.Networks(),
+		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slotNames,
 	})
 	if err != nil {
 		return err
@@ -147,7 +187,6 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	defer listener.Close()
 	guestSubnets := make([]netip.Prefix, len(slots))
 	for i, slot := range slots {
 		guestSubnets[i] = slot.IPv4
