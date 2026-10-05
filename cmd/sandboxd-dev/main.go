@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -32,6 +33,19 @@ import (
 const devImage = "sandboxd-devvm:local-processes"
 
 func main() {
+	// The envd guest root helper (see devvm.Envd) is this binary too.
+	if len(os.Args) > 1 && os.Args[1] == devvm.EnvdGuestCommand {
+		if err := devvm.RunEnvdGuest(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if handled, err := devvm.RunEnvdGuestInit(os.Args[1:]); handled {
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, os.Args[1:]); err != nil {
@@ -55,6 +69,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-sandbox lifetime")
 	cpus := flags.Int("cpus", 2, "CPU count reported for each guest")
 	memory := flags.Int("memory-mib", 1024, "memory size reported for each guest")
+	envdBinary := flags.String("envd", "", "upstream envd binary for e2b-profile guests; without it e2b sandboxes cannot start. "+
+		"envd guests need root: as root they start directly, otherwise through 'sudo -n'")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -87,7 +103,11 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	driver, err := devvm.New(root)
+	envdGuests, err := envdConfig(*envdBinary)
+	if err != nil {
+		return err
+	}
+	driver, err := devvm.New(root, envdGuests)
 	if err != nil {
 		return err
 	}
@@ -114,7 +134,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	server := &http.Server{Handler: envd.Routes(guest, service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	server := &http.Server{Handler: envd.Routes(guest, envd.NewProxy(service, *domain, *gatewayHost), service.Handler()), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	log.Printf("sandboxd-dev listening on http://%s (devvm driver, NO isolation, state %s)", listener.Addr(), root)
@@ -126,6 +146,30 @@ func run(ctx context.Context, args []string) (runErr error) {
 		defer cancel()
 		return server.Shutdown(shutdown)
 	}
+}
+
+// envdConfig runs envd guests through this binary as the root helper.
+func envdConfig(binary string) (devvm.Envd, error) {
+	if binary == "" {
+		return devvm.Envd{}, nil
+	}
+	binary, err := filepath.Abs(binary)
+	if err != nil {
+		return devvm.Envd{}, err
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return devvm.Envd{}, err
+	}
+	helper := []string{self}
+	if os.Geteuid() != 0 {
+		sudo, err := exec.LookPath("sudo")
+		if err != nil {
+			return devvm.Envd{}, fmt.Errorf("envd guests need root or sudo: %w", err)
+		}
+		helper = []string{sudo, "-n", self}
+	}
+	return devvm.Envd{Binary: binary, Helper: helper}, nil
 }
 
 func readKey(path string) (string, error) {

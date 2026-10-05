@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -128,6 +129,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		method, handle = http.MethodGet, s.usage
 	case parts[2] == "expiry":
 		method, handle = http.MethodPut, s.expire
+	case parts[2] == "envd":
+		method, handle = http.MethodPost, s.envd
 	default:
 		http.NotFound(w, r)
 		return
@@ -264,7 +267,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, leaseCtx context
 		s.creating[request.ID] = true
 		s.mu.Unlock()
 		instance, err := s.driver.Create(r.Context(), vm.Spec{ID: request.ID, Image: request.Image, Network: request.Network,
-			CPUs: request.CPUs, MemoryMiB: request.MemoryMiB})
+			CPUs: request.CPUs, MemoryMiB: request.MemoryMiB, Envd: request.Envd})
 		s.mu.Lock()
 		delete(s.creating, request.ID)
 		// Re-stamp the end time as the VM becomes visible: a Reap whose
@@ -493,6 +496,76 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request, id string, leaseCtx
 	default:
 		frames.final(frameExit, strconv.Itoa(code))
 	}
+}
+
+// envd upgrades the request to a raw byte stream to VM id's envd, opened by
+// the driver over its host-to-guest channel. The stream ends when either side
+// closes it, or when a newer lease supersedes the one it was opened under.
+func (s *Server) envd(w http.ResponseWriter, r *http.Request, id string, leaseCtx context.Context) {
+	dialer, ok := s.driver.(vm.EnvdDialer)
+	if !ok {
+		http.Error(w, vm.ErrNoEnvd.Error(), http.StatusNotImplemented)
+		return
+	}
+	if !headerHasToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), envdUpgrade) {
+		http.Error(w, "an envd stream must upgrade to "+envdUpgrade, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := fenced(r, leaseCtx)
+	defer cancel()
+	guest, err := dialer.DialEnvd(ctx, id)
+	if err != nil {
+		driverFailed(w, "envd", err)
+		return
+	}
+	defer guest.Close()
+	conn, buffered, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		http.Error(w, "envd streams need HTTP/1.1", http.StatusHTTPVersionNotSupported)
+		return
+	}
+	defer conn.Close()
+	// The server's header and body deadlines must not end a long stream.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: "+envdUpgrade+"\r\n\r\n"); err != nil {
+		return
+	}
+	stop := context.AfterFunc(leaseCtx, func() { _ = conn.Close(); _ = guest.Close() })
+	defer stop()
+	Bridge(conn, buffered.Reader, guest)
+}
+
+// Bridge copies bytes between a client connection (read through in, which
+// may hold bytes already buffered from it) and an upstream stream until
+// either direction ends, then closes both and waits for the other direction.
+func Bridge(client net.Conn, in io.Reader, upstream net.Conn) {
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(upstream, in)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, upstream)
+		done <- struct{}{}
+	}()
+	<-done
+	_ = client.Close()
+	_ = upstream.Close()
+	<-done
+}
+
+// headerHasToken reports whether a comma-separated header lists token.
+func headerHasToken(header http.Header, name, token string) bool {
+	for _, value := range header.Values(name) {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (s *Server) usage(w http.ResponseWriter, r *http.Request, id string, _ context.Context) {

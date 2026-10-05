@@ -217,31 +217,38 @@ func readUint(path string) (uint64, error) {
 	return strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
 }
 
-func (h *linuxFCHost) CgroupStats(name string) (uint64, uint64, uint64, error) {
-	data, err := os.ReadFile(filepath.Join(cgroupPath(name), "cpu.stat"))
+func (h *linuxFCHost) CgroupStats(name string) (fcCgroupSample, error) {
+	cpu, err := readStatKey(filepath.Join(cgroupPath(name), "cpu.stat"), "usage_usec")
 	if err != nil {
-		return 0, 0, 0, err
+		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no CPU usage: %w", name, err)
 	}
-	var cpu uint64
-	found := false
-	for _, line := range strings.Split(string(data), "\n") {
-		if value, ok := strings.CutPrefix(line, "usage_usec "); ok {
-			cpu, err = strconv.ParseUint(value, 10, 64)
-			found = err == nil
-		}
-	}
-	if !found {
-		return 0, 0, 0, fmt.Errorf("cgroup %s has no CPU usage", name)
+	file, err := readStatKey(filepath.Join(cgroupPath(name), "memory.stat"), "file")
+	if err != nil {
+		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no page cache figure: %w", name, err)
 	}
 	memory, err := readUint(filepath.Join(cgroupPath(name), "memory.current"))
 	if err != nil {
-		return 0, 0, 0, err
+		return fcCgroupSample{}, err
 	}
 	limit, err := readUint(filepath.Join(cgroupPath(name), "memory.max"))
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("cgroup %s has no numeric memory limit: %w", name, err)
+		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no numeric memory limit: %w", name, err)
 	}
-	return cpu, memory, limit, nil
+	return fcCgroupSample{CPUUsec: cpu, Memory: memory, MemoryMax: limit, File: file}, nil
+}
+
+// readStatKey reads one "<key> <value>" line of a cgroup flat-keyed file.
+func readStatKey(path, key string) (uint64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, key+" "); ok {
+			return strconv.ParseUint(value, 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("%s has no %q", path, key)
 }
 
 // KillCgroup kills every process in the cgroup, waits until it is empty and

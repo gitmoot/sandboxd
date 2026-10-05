@@ -148,7 +148,7 @@ func (c *Client) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 // capped by the worker's max TTL.
 func (c *Client) CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) (vm.Instance, error) {
 	body, err := json.Marshal(createRequest{ID: spec.ID, Image: spec.Image, Network: spec.Network, CPUs: spec.CPUs,
-		MemoryMiB: spec.MemoryMiB, Ends: ends.UTC()})
+		MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Ends: ends.UTC()})
 	if err != nil {
 		return vm.Instance{}, err
 	}
@@ -367,6 +367,85 @@ func (c *Client) Usage(ctx context.Context, id string) (vm.Usage, error) {
 	}
 	return vm.Usage(usage), nil
 }
+
+// DialEnvd opens a stream to VM id's envd through the worker: an HTTP/1.1
+// upgrade the worker bridges to its driver's envd channel. ctx bounds only
+// the dial; the stream lasts until it is closed.
+func (c *Client) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+	if err := c.checkVM(id); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	lease := c.lease
+	c.mu.Unlock()
+	if lease == 0 {
+		return nil, fmt.Errorf("worker %s: %w: %w", c.id, ErrUnavailable, errNotEnrolled)
+	}
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stop := context.AfterFunc(ctx, cancel)
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.base+"/vms/"+id+"/envd", nil)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	req.Header.Set("Authorization", c.auth)
+	req.Header.Set(leaseHeader, strconv.FormatInt(lease, 10))
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", envdUpgrade)
+	resp, err := c.client.Do(req)
+	if !stop() {
+		if err == nil {
+			resp.Body.Close()
+		}
+		cancel()
+		return nil, ctx.Err()
+	}
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("worker %s: envd %s: %w: %w", c.id, id, ErrUnavailable, err)
+	}
+	if resp.StatusCode == http.StatusNotImplemented {
+		resp.Body.Close()
+		cancel()
+		return nil, fmt.Errorf("worker %s: %w", c.id, vm.ErrNoEnvd)
+	}
+	stream, ok := resp.Body.(io.ReadWriteCloser)
+	if resp.StatusCode != http.StatusSwitchingProtocols || !ok || !strings.EqualFold(resp.Header.Get("Upgrade"), envdUpgrade) {
+		defer resp.Body.Close()
+		defer cancel()
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			return nil, fmt.Errorf("worker %s: envd: malformed upgrade", c.id)
+		}
+		return nil, c.expect(resp, http.StatusSwitchingProtocols)
+	}
+	return &streamConn{ReadWriteCloser: stream, cancel: cancel}, nil
+}
+
+// streamConn adapts an upgraded HTTP stream to net.Conn for an HTTP client
+// transport, which needs no addresses or deadlines.
+type streamConn struct {
+	io.ReadWriteCloser
+	cancel context.CancelFunc
+}
+
+func (c *streamConn) Close() error {
+	err := c.ReadWriteCloser.Close()
+	c.cancel()
+	return err
+}
+
+func (c *streamConn) LocalAddr() net.Addr              { return streamAddr{} }
+func (c *streamConn) RemoteAddr() net.Addr             { return streamAddr{} }
+func (c *streamConn) SetDeadline(time.Time) error      { return errNoDeadlines }
+func (c *streamConn) SetReadDeadline(time.Time) error  { return errNoDeadlines }
+func (c *streamConn) SetWriteDeadline(time.Time) error { return errNoDeadlines }
+
+var errNoDeadlines = errors.New("worker envd streams have no deadlines")
+
+type streamAddr struct{}
+
+func (streamAddr) Network() string { return "sandboxd-envd" }
+func (streamAddr) String() string  { return "worker-envd" }
 
 func (c *Client) setLease(lease int64) {
 	c.mu.Lock()

@@ -97,6 +97,7 @@ type FirecrackerDriver struct {
 var (
 	_ Driver        = (*FirecrackerDriver)(nil)
 	_ ResourceMeter = (*FirecrackerDriver)(nil)
+	_ EnvdDialer    = (*FirecrackerDriver)(nil)
 )
 
 // ErrDiskFloor reports that creating a VM would leave less free disk than the
@@ -118,7 +119,7 @@ type fcHost interface {
 	RemoveCgroupParent() error
 	Cgroups() ([]string, error)
 	CgroupPopulated(name string) (bool, error)
-	CgroupStats(name string) (cpuUsec, memory, memoryMax uint64, err error)
+	CgroupStats(name string) (fcCgroupSample, error)
 	KillCgroup(ctx context.Context, name string) error
 
 	Netns() ([]string, error)
@@ -130,6 +131,13 @@ type fcHost interface {
 	// Dial connects to the VMM's vsock socket <chroot>/run/v.sock, which
 	// must be a socket owned by owner, without following symlinks.
 	Dial(ctx context.Context, chroot string, owner int) (net.Conn, error)
+}
+
+// fcCgroupSample is one reading of a VMM cgroup: cpu.stat usage_usec,
+// memory.current, memory.max and the file-backed (page cache) bytes of
+// memory.stat.
+type fcCgroupSample struct {
+	CPUUsec, Memory, MemoryMax, File uint64
 }
 
 // fcNetwork is one VM's private network: a namespace owned by a user
@@ -153,6 +161,8 @@ type fcMeta struct {
 	Image     string `json:"image"`
 	CPUs      int    `json:"cpus"`
 	MemoryMiB int    `json:"memoryMiB"`
+	// Envd marks an e2b guest (Spec.Envd); only those serve DialEnvd.
+	Envd bool `json:"envd,omitempty"`
 }
 
 func cleanAbs(path string) bool {
@@ -548,10 +558,18 @@ func (d *FirecrackerDriver) List(ctx context.Context) ([]Instance, error) {
 	return instances, nil
 }
 
-func (d *FirecrackerDriver) bootArgs() string {
-	return "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd " +
+// fcEnvdBootArg tells the guest agent to boot an e2b guest: a writable
+// overlay root and upstream envd (cmd/sandboxd-guest-agent).
+const fcEnvdBootArg = "sandboxd.envd=1"
+
+func (d *FirecrackerDriver) bootArgs(envd bool) string {
+	args := "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd " +
 		"random.trust_cpu=on quiet init=/sbin/sandboxd-agent " +
 		"ip=" + fcGuestAddr + "::" + fcGatewayAddr + ":255.255.255.252:sandbox:eth0:off"
+	if envd {
+		args += " " + fcEnvdBootArg
+	}
+	return args
 }
 
 func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
@@ -562,7 +580,7 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 		ReadOnly bool   `json:"is_read_only"`
 	}
 	return json.MarshalIndent(map[string]any{
-		"boot-source": map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs()},
+		"boot-source": map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec.Envd)},
 		"drives": []drive{
 			{ID: "rootfs", Path: "/rootfs.ext4", Root: true, ReadOnly: true},
 			{ID: "home", Path: "/home.ext4"},
@@ -708,7 +726,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	}
 	meta := fcMeta{
 		ID: spec.ID, Slot: spec.Network, VMMUID: d.cfg.UIDBase + slot, NetUID: d.cfg.UIDBase + fcUIDStride + slot,
-		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB,
+		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd,
 	}
 	record, err := json.Marshal(meta)
 	if err != nil {
@@ -949,33 +967,114 @@ func (d *FirecrackerDriver) Run(ctx context.Context, id string, command Command,
 }
 
 // Usage samples the VMM cgroup twice: CPU from usage_usec, memory against
-// the cgroup limit (guest RAM plus VMM overhead).
+// the cgroup limit (guest RAM plus VMM overhead), and page cache from the
+// file-backed bytes of its memory.stat. Disk use is the guest's own report
+// on its writable filesystem (the home disk, or an e2b guest's root), over
+// the agent's vsock channel.
 func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error) {
 	if err := d.running(id); err != nil {
 		return Usage{}, err
 	}
-	firstCPU, _, _, err := d.host.CgroupStats(id)
+	first, err := d.host.CgroupStats(id)
 	if err != nil {
 		return Usage{}, err
 	}
 	started := time.Now()
-	select {
-	case <-ctx.Done():
-		return Usage{}, ctx.Err()
-	case <-time.After(250 * time.Millisecond):
-	}
-	secondCPU, memory, limit, err := d.host.CgroupStats(id)
+	conn, err := d.dialAgent(ctx, id)
 	if err != nil {
 		return Usage{}, err
 	}
-	if secondCPU < firstCPU || limit == 0 || memory > limit {
+	diskTotal, diskUsed, err := guestagent.Disk(ctx, conn)
+	_ = conn.Close()
+	if err != nil {
+		return Usage{}, fmt.Errorf("guest disk usage of %q: %w", id, err)
+	}
+	select {
+	case <-ctx.Done():
+		return Usage{}, ctx.Err()
+	case <-time.After(250*time.Millisecond - time.Since(started)):
+	}
+	second, err := d.host.CgroupStats(id)
+	if err != nil {
+		return Usage{}, err
+	}
+	if second.CPUUsec < first.CPUUsec || second.MemoryMax == 0 || second.Memory > second.MemoryMax || second.File > second.Memory {
 		return Usage{}, fmt.Errorf("inconsistent VM resource sample for %q", id)
 	}
 	return Usage{
-		CPUUsedPct:       float64(secondCPU-firstCPU) / float64(time.Since(started).Microseconds()) * 100,
-		MemoryUsedBytes:  memory,
-		MemoryLimitBytes: limit,
+		CPUUsedPct:       float64(second.CPUUsec-first.CPUUsec) / float64(time.Since(started).Microseconds()) * 100,
+		MemoryUsedBytes:  second.Memory,
+		MemoryLimitBytes: second.MemoryMax,
+		Detailed:         true,
+		MemoryCacheBytes: second.File,
+		DiskUsedBytes:    diskUsed,
+		DiskTotalBytes:   diskTotal,
 	}, nil
+}
+
+// DialEnvd opens a host-initiated stream to an e2b guest's envd: a fresh
+// vsock connection to the guest agent, which bridges it to envd on the guest
+// loopback. As during Run, the host firewall is re-checked every second while
+// the stream is open; losing it closes the stream and destroys the VM.
+func (d *FirecrackerDriver) DialEnvd(ctx context.Context, id string) (net.Conn, error) {
+	if err := d.Ready(ctx); err != nil {
+		return nil, fmt.Errorf("firewall is not armed before guest access: %w", err)
+	}
+	if err := d.running(id); err != nil {
+		return nil, err
+	}
+	meta, err := d.readMeta(id)
+	if err != nil {
+		return nil, err
+	}
+	if meta == nil || !meta.Envd {
+		return nil, fmt.Errorf("Firecracker VM %q runs no envd", id)
+	}
+	conn, err := d.dialAgent(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := guestagent.OpenEnvd(ctx, conn); err != nil {
+		return nil, fmt.Errorf("envd of %q: %w", id, err)
+	}
+	guarded := &fcEnvdConn{Conn: conn, closed: make(chan struct{})}
+	go d.guardEnvd(id, guarded)
+	return guarded, nil
+}
+
+// fcEnvdConn is an envd stream whose Close also stops its firewall guard.
+type fcEnvdConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (c *fcEnvdConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func (d *FirecrackerDriver) guardEnvd(id string, conn *fcEnvdConn) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-conn.closed:
+			return
+		case <-ticker.C:
+		}
+		checkCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+		err := d.Ready(checkCtx)
+		stop()
+		if err != nil {
+			// The VM goes first, so the stream ends only once it is gone.
+			cleanupCtx, stop := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = d.Destroy(cleanupCtx, id)
+			stop()
+			_ = conn.Close()
+			return
+		}
+	}
 }
 
 // Destroy kills the VMM and network stack, deletes the namespace (and with it

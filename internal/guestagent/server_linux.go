@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,6 +37,12 @@ type Server struct {
 	// WaitDelay bounds how long output is drained after the command exits
 	// while background children keep its pipes open.
 	WaitDelay time.Duration
+	// EnvdAddr is the guest-local envd address OpEnvd bridges to, empty when
+	// the guest runs no envd.
+	EnvdAddr string
+	// DiskPath is a path on the guest's writable filesystem, reported by
+	// OpDisk; empty disables OpDisk.
+	DiskPath string
 
 	next atomic.Int64
 }
@@ -57,10 +64,60 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		result = s.exec(conn, reader, request)
 	case OpWrite:
 		result = s.write(reader, request)
+	case OpEnvd:
+		if result = s.envd(conn, reader); result.Error == "" {
+			return
+		}
+	case OpDisk:
+		result = s.disk()
 	default:
 		result = Result{Error: fmt.Sprintf("unknown guest agent operation %q", request.Op)}
 	}
 	_ = WriteJSONFrame(conn, FrameResult, result)
+}
+
+// envd connects to envd and, once the host has its acknowledgement, copies
+// bytes both ways until either side ends; then both are closed. An empty
+// Error means the bridge ran and nothing more may be written to conn.
+func (s *Server) envd(conn io.ReadWriteCloser, reader *bufio.Reader) Result {
+	if s.EnvdAddr == "" {
+		return Result{Error: "this guest runs no envd"}
+	}
+	upstream, err := net.DialTimeout("tcp", s.EnvdAddr, 5*time.Second)
+	if err != nil {
+		return Result{Error: fmt.Sprintf("envd unreachable: %v", err)}
+	}
+	defer upstream.Close()
+	if err := WriteJSONFrame(conn, FrameResult, Result{}); err != nil {
+		return Result{}
+	}
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(upstream, reader)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(conn, upstream)
+		done <- struct{}{}
+	}()
+	<-done
+	_ = upstream.Close()
+	_ = conn.Close()
+	<-done
+	return Result{}
+}
+
+func (s *Server) disk() Result {
+	if s.DiskPath == "" {
+		return Result{Error: "guest disk reporting is not configured"}
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(s.DiskPath, &stat); err != nil {
+		return Result{Error: fmt.Sprintf("statfs: %v", err)}
+	}
+	size := uint64(stat.Bsize)
+	total := stat.Blocks * size
+	return Result{DiskTotal: total, DiskUsed: total - stat.Bfree*size}
 }
 
 func validPath(path string) bool {

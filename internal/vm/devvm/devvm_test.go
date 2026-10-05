@@ -19,7 +19,7 @@ import (
 
 func newDriver(t *testing.T) *Driver {
 	t.Helper()
-	driver, err := New(filepath.Join(t.TempDir(), "guests"))
+	driver, err := New(filepath.Join(t.TempDir(), "guests"), Envd{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,10 +59,10 @@ func TestNewRefusesStateFromAnEarlierRun(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(root, "sandboxd-stale"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(root); err == nil {
+	if _, err := New(root, Envd{}); err == nil {
 		t.Fatal("non-empty state directory accepted")
 	}
-	if _, err := New("relative/guests"); err == nil {
+	if _, err := New("relative/guests", Envd{}); err == nil {
 		t.Fatal("relative state directory accepted")
 	}
 }

@@ -64,7 +64,9 @@ type fakeFCHost struct {
 	failNet    error
 	bootDies   bool
 	ownerShift int
-	stats      [][3]uint64
+	stats      []fcCgroupSample
+	// envdAddr is where a booted guest's agent bridges OpEnvd.
+	envdAddr string
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
@@ -137,12 +139,12 @@ func (h *fakeFCHost) CgroupPopulated(name string) (bool, error) {
 	defer h.mu.Unlock()
 	return h.cgroups[name], nil
 }
-func (h *fakeFCHost) CgroupStats(string) (uint64, uint64, uint64, error) {
+func (h *fakeFCHost) CgroupStats(string) (fcCgroupSample, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sample := h.stats[0]
 	h.stats = h.stats[1:]
-	return sample[0], sample[1], sample[2], nil
+	return sample, nil
 }
 func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	h.record("kill " + name)
@@ -221,7 +223,7 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, _ stri
 		return err
 	}
 	h.listeners[id] = listener
-	go serveFakeAgent(listener, guest)
+	go serveFakeAgent(listener, guest, h.envdAddr)
 	return nil
 }
 
@@ -250,10 +252,11 @@ func listenUnixIn(dir, name string) (*net.UnixListener, error) {
 
 // serveFakeAgent answers Firecracker's vsock handshake on every connection
 // and serves a real guest agent whose filesystem is the guest directory.
-func serveFakeAgent(listener *net.UnixListener, guest string) {
+func serveFakeAgent(listener *net.UnixListener, guest, envdAddr string) {
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
+		EnvdAddr: envdAddr, DiskPath: guest,
 	}
 	for {
 		conn, err := listener.Accept()
@@ -661,13 +664,95 @@ func TestFirecrackerUsageFromCgroup(t *testing.T) {
 	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
 		t.Fatal(err)
 	}
-	host.stats = [][3]uint64{{1_000_000, 0, 0}, {1_125_000, 300 << 20, 640 << 20}}
+	host.stats = []fcCgroupSample{{CPUUsec: 1_000_000}, {CPUUsec: 1_125_000, Memory: 300 << 20, MemoryMax: 640 << 20, File: 20 << 20}}
 	usage, err := d.Usage(context.Background(), fcTestID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if usage.MemoryUsedBytes != 300<<20 || usage.MemoryLimitBytes != 640<<20 || usage.CPUUsedPct <= 0 || usage.CPUUsedPct > 50 {
 		t.Fatalf("usage = %+v", usage)
+	}
+	// Page cache from memory.stat and disk from the guest agent's statfs of
+	// its writable filesystem (here the fake guest directory).
+	var guestFS unix.Statfs_t
+	if err := unix.Statfs(host.guestDir(d, fcTestID), &guestFS); err != nil {
+		t.Fatal(err)
+	}
+	if !usage.Detailed || usage.MemoryCacheBytes != 20<<20 || usage.DiskTotalBytes != guestFS.Blocks*uint64(guestFS.Bsize) ||
+		usage.DiskUsedBytes == 0 || usage.DiskUsedBytes > usage.DiskTotalBytes {
+		t.Fatalf("detailed usage = %+v", usage)
+	}
+}
+
+func TestFirecrackerEnvdGuest(t *testing.T) {
+	envd, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer envd.Close()
+	go func() {
+		for {
+			conn, err := envd.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn) // echo, standing in for envd
+			}()
+		}
+	}()
+	d, host, cfg := newTestFirecracker(t)
+	host.envdAddr = envd.Addr().String()
+	if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Create(context.Background(), Spec{ID: fcTestID2, Image: cfg.Images[0], Network: "sbx1", CPUs: 1, MemoryMiB: 512, Envd: true}); err != nil {
+		t.Fatal(err)
+	}
+	strictConfig, err := os.ReadFile(filepath.Join(d.chroot(fcTestID), "vm.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	envdConfig, err := os.ReadFile(filepath.Join(d.chroot(fcTestID2), "vm.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(strictConfig), fcEnvdBootArg) || !strings.Contains(string(envdConfig), fcEnvdBootArg) {
+		t.Fatalf("boot arguments: strict %s, envd %s", strictConfig, envdConfig)
+	}
+	// A strict guest never bridges to envd, whatever its agent would do.
+	if conn, err := d.DialEnvd(context.Background(), fcTestID); err == nil {
+		conn.Close()
+		t.Fatal("DialEnvd reached a strict guest")
+	}
+	conn, err := d.DialEnvd(context.Background(), fcTestID2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(conn, "GET /health HTTP/1.1\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	echoed := make([]byte, len("GET /health HTTP/1.1\r\n\r\n"))
+	if _, err := io.ReadFull(conn, echoed); err != nil || string(echoed) != "GET /health HTTP/1.1\r\n\r\n" {
+		t.Fatalf("envd stream = %q, %v", echoed, err)
+	}
+	// Losing the host firewall ends the stream and the VM.
+	host.mu.Lock()
+	host.firewall = ""
+	host.mu.Unlock()
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("envd stream survived firewall loss")
+	}
+	conn.Close()
+	host.mu.Lock()
+	_, alive := host.cgroups[fcTestID2]
+	host.mu.Unlock()
+	if alive {
+		t.Fatal("e2b guest survived firewall loss")
 	}
 }
 

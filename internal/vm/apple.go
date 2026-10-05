@@ -326,6 +326,11 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if err := validAppleID(spec.ID); err != nil {
 		return Instance{}, err
 	}
+	if spec.Envd {
+		// The e2b guest (images/e2b-arm64) and its exec-stdio envd channel
+		// are not wired into the Apple driver yet.
+		return Instance{}, fmt.Errorf("apple: %w", ErrNoEnvd)
+	}
 	if _, ok := d.images[spec.Image]; !ok {
 		return Instance{}, fmt.Errorf("image %q is not allowlisted", spec.Image)
 	}

@@ -453,7 +453,8 @@ func (s *Service) admit(ctx context.Context, row *store.Row) (*member, vm.Spec, 
 			return nil, vm.Spec{}, err
 		}
 		row.Slot = slot
-		return c.m, vm.Spec{ID: row.ID, Image: row.Image, Network: slot, CPUs: row.CPUs, MemoryMiB: row.MemoryMiB}, nil
+		return c.m, vm.Spec{ID: row.ID, Image: row.Image, Network: slot, CPUs: row.CPUs, MemoryMiB: row.MemoryMiB,
+			Envd: rowProfile(row.Profile) == ProfileE2B}, nil
 	}
 	return nil, vm.Spec{}, &refusal{http.StatusConflict, "sandbox capacity exhausted: every compatible worker is full"}
 }

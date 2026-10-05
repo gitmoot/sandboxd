@@ -104,6 +104,34 @@ sudo images/linux-amd64-fc/build.sh /var/lib/sandboxd-fc
 Go and the review module cache, which `images/linux-arm64` includes, are
 not in this image yet.
 
+## E2B base image
+
+Templates with `profile=e2b` use this image instead of the review image.
+Build it like the review image (root, from the repository root):
+
+```sh
+# Prints the path, images/e2b-amd64-<sha256 prefix>.ext4, about 340 MB.
+sudo images/e2b-amd64-fc/build.sh /var/lib/sandboxd-fc
+```
+
+It is `debian:bookworm-slim` (same digest) with bash, ca-certificates, curl,
+git, sudo, python3 (also as `python`), procps, iproute2, netbase, tar, gzip
+and e2fsprogs; no compilers. User `user` (1000:1000, home `/home/user`,
+shell bash) has passwordless sudo (`/etc/sudoers.d/user`). The guest agent is
+still PID 1 (`/sbin/sandboxd-agent`); for e2b guests the driver adds the
+kernel argument `sandboxd.envd=1` and the agent starts `/usr/bin/envd`.
+
+`/usr/bin/envd` is upstream [E2B envd](https://github.com/e2b-dev/infra)
+0.9.0, built from e2b-dev/infra commit `0c2108b1b76a66d18cf095d51fd7c51c703648ae`
+(the release has no git tag). The script downloads E2B's release binary and
+refuses any other SHA-256 than `c42a31d7…a02355`. envd is Apache-2.0; the
+image carries its license and source note in `/usr/share/doc/envd/`
+(`LICENSE`, `SOURCE`).
+
+`images/e2b-arm64` is the same image for the Apple driver (linux/arm64,
+envd arm64 SHA-256 `bf346976…d89189`), with envd as its entrypoint; the
+build command is in its header.
+
 ## Running
 
 ```sh

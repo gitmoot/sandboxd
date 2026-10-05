@@ -248,7 +248,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		}
 		defer service.Close()
 		guest := &envd.Handler{Driver: service.Guests(), Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
-		handler = envd.Routes(guest, service.Handler())
+		handler = envd.Routes(guest, envd.NewProxy(service, *domain, *gatewayHost), service.Handler())
 	}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {

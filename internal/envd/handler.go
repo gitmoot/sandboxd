@@ -68,8 +68,14 @@ type Handler struct {
 
 // Routes serves the guest data-plane paths with guest and every other path
 // with api, so every sandboxd binary splits its single listener the same way.
-func Routes(guest, api http.Handler) http.Handler {
+// envd traffic addressed to an e2b-profile sandbox goes to e2b instead (nil
+// when the binary serves no e2b data plane); gitmoot-strict sandboxes are
+// routed exactly as before.
+func Routes(guest http.Handler, e2b *Proxy, api http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if e2b.serve(w, r) {
+			return
+		}
 		if r.URL.Path == "/files" || r.URL.Path == "/process.Process/Start" || r.URL.Path == "/health" {
 			guest.ServeHTTP(w, r)
 			return

@@ -3,7 +3,11 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
+
+	"github.com/gitmoot/sandboxd/internal/guestagent"
 )
 
 // Spec describes one disposable Linux VM. ID is an opaque, service-owned name;
@@ -16,7 +20,25 @@ type Spec struct {
 	Network   string
 	CPUs      int
 	MemoryMiB int
+	// Envd boots an e2b-profile guest: a writable root and upstream envd as
+	// its entrypoint, reached only through EnvdDialer. Unset, the guest is
+	// the gitmoot-strict guest the driver has always started.
+	Envd bool
 }
+
+// EnvdPort is the port upstream envd listens on inside an e2b guest.
+const EnvdPort = guestagent.EnvdPort
+
+// EnvdDialer is implemented by drivers that can start Envd guests. DialEnvd
+// opens a fresh host-initiated byte stream to the guest's envd port over the
+// driver's private host-to-guest channel (never the guest network). The
+// guest never initiates it, and everything read from it is guest-controlled.
+type EnvdDialer interface {
+	DialEnvd(ctx context.Context, id string) (net.Conn, error)
+}
+
+// ErrNoEnvd reports a driver or worker that cannot run envd guests.
+var ErrNoEnvd = errors.New("this VM driver does not run envd (e2b-profile) guests")
 
 // Instance is a positive observation of a VM owned by this driver. Network is
 // its only attached network, or "" when it is not attached to exactly one.

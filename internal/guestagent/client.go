@@ -74,6 +74,44 @@ func Ping(ctx context.Context, conn io.ReadWriteCloser) error {
 	return nil
 }
 
+// OpenEnvd asks the agent to bridge conn to the guest's envd port. On
+// success conn carries raw envd bytes from then on; on failure it is closed.
+func OpenEnvd(ctx context.Context, conn io.ReadWriteCloser) error {
+	stop := closeOnCancel(ctx, conn)
+	err := WriteRequest(conn, Request{Op: OpEnvd})
+	var result Result
+	if err == nil {
+		result, err = readResult(conn)
+	}
+	if !stop() || err != nil || result.Error != "" {
+		_ = conn.Close()
+		if err == nil && result.Error != "" {
+			return errors.New(result.Error)
+		}
+		return contextErr(ctx, err)
+	}
+	return nil
+}
+
+// Disk returns the total and used bytes of the guest's writable filesystem.
+func Disk(ctx context.Context, conn io.ReadWriteCloser) (total, used uint64, err error) {
+	defer closeOnCancel(ctx, conn)()
+	if err := WriteRequest(conn, Request{Op: OpDisk}); err != nil {
+		return 0, 0, contextErr(ctx, err)
+	}
+	result, err := readResult(conn)
+	if err != nil {
+		return 0, 0, contextErr(ctx, err)
+	}
+	if result.Error != "" {
+		return 0, 0, errors.New(result.Error)
+	}
+	if result.DiskTotal == 0 || result.DiskUsed > result.DiskTotal {
+		return 0, 0, errors.New("inconsistent guest disk report")
+	}
+	return result.DiskTotal, result.DiskUsed, nil
+}
+
 func contextErr(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()

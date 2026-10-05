@@ -218,7 +218,14 @@ func (s *Service) sweep() {
 // sandbox's worker under its current lease, a live unexpired ledger row, the
 // newest job attempt, and the sandbox-scoped token. Inconclusive inventory, a
 // stopped VM or an offline worker never grants guest access.
+//
+// It grants only gitmoot-strict sandboxes; an e2b-profile sandbox's envd is
+// reached through AuthorizeEnvd and the e2b proxy alone.
 func (s *Service) Authorize(id, token string) bool {
+	return s.authorize(id, token, ProfileStrict)
+}
+
+func (s *Service) authorize(id, token string, profile Profile) bool {
 	if !validID(id) || token == "" {
 		return false
 	}
@@ -227,7 +234,7 @@ func (s *Service) Authorize(id, token string) bool {
 	s.mu.Lock()
 	row, m, err := s.owned(ctx, id)
 	s.mu.Unlock()
-	if err != nil || row.State != "running" || !time.Now().Before(row.Ends) {
+	if err != nil || row.State != "running" || !time.Now().Before(row.Ends) || rowProfile(row.Profile) != profile {
 		return false
 	}
 	hash := sha256.Sum256([]byte(token))
