@@ -1,0 +1,7 @@
+# Stock SDKs under test plus the upstream test runners. Recompile with:
+#   uv pip compile --python-version 3.12 --generate-hashes requirements.in -o requirements.txt
+e2b==2.52.0
+e2b-code-interpreter==2.10.1
+pytest>=9.0.3,<10
+pytest-asyncio>=1.3.0,<2
+pytest-timeout>=2.4.0,<3
