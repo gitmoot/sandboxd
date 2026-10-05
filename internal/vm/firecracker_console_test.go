@@ -63,3 +63,34 @@ func TestFirecrackerConsoleLogKeepsTheFile(t *testing.T) {
 		t.Fatalf("console.log = %q, %v", data, err)
 	}
 }
+
+// A logs request racing a delete must never see "keeps no console output"
+// while the VM is still being torn down: that answer means the driver does not
+// keep consoles at all. It sees the console, or the VM is already gone.
+func TestFirecrackerConsoleDuringDestroyIsNotUnsupported(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	spec := Spec{ID: fcTestID2, Image: cfg.Images[0], Network: "sbx1", CPUs: 1, MemoryMiB: 512, Envd: true}
+	if _, err := d.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	var observed []error
+	host.onKill = func(string) {
+		_, err := d.Console(ctx, spec.ID)
+		observed = append(observed, err)
+	}
+	if err := d.Destroy(ctx, spec.ID); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if len(observed) == 0 {
+		t.Fatal("teardown never reached the cgroup kill")
+	}
+	for _, err := range observed {
+		if errors.Is(err, ErrNoConsole) {
+			t.Fatalf("console during teardown = %v, want console lines or a not-found error", err)
+		}
+	}
+	if _, err := d.Console(ctx, spec.ID); err == nil || errors.Is(err, ErrNoConsole) {
+		t.Fatalf("console after destroy = %v, want a not-found error", err)
+	}
+}

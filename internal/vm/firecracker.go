@@ -1095,7 +1095,9 @@ func (d *FirecrackerDriver) Destroy(ctx context.Context, id string) error {
 	if err := validAppleID(id); err != nil {
 		return err
 	}
-	d.dropConsole(id)
+	// Keep the console until the VM is gone, so a logs request racing this
+	// delete sees output or "not running", never "keeps no console".
+	defer d.dropConsole(id)
 	vm, found, err := d.lookup(id)
 	if err != nil {
 		return err
