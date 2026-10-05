@@ -91,12 +91,13 @@ func run(ctx context.Context, args []string) (runErr error) {
 	service, err := control.Open(ctx, *database, driver, control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: devImage, Domain: *domain, WorkerID: "sandboxd-devvm",
 		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, Slots: slots,
+		DriverName: "devvm",
 	})
 	if err != nil {
 		return err
 	}
 	defer service.Close()
-	guest := &envd.Handler{Driver: driver, Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
+	guest := &envd.Handler{Driver: service.Guests(), Authorizer: service, Domain: *domain, GatewayHost: *gatewayHost}
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return err
