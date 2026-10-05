@@ -407,6 +407,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		if rest, ok := strings.CutPrefix(path, "/sandboxes/"); ok {
 			id, action, _ := strings.Cut(rest, "/")
 			if reason := sandboxRefusal(action); reason != "" {
+				if !s.refusable(w, r, id) {
+					return
+				}
 				s.refuse(w, reason)
 				return
 			}

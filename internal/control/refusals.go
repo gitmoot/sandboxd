@@ -1,6 +1,7 @@
 package control
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -47,6 +48,21 @@ func sandboxRefusal(action string) string {
 		return refuseNetwork
 	}
 	return ""
+}
+
+// refusable checks that a refused per-sandbox action names a live sandbox,
+// answering as every per-sandbox route does otherwise (404 for a gone or
+// unknown sandbox, which the SDKs raise as not found; 503 when unobservable).
+func (s *Service) refusable(w http.ResponseWriter, r *http.Request, id string) bool {
+	if !validID(id) {
+		s.fail(w, ProfileE2B, http.StatusNotFound, fmt.Sprintf("sandbox %q not found", id))
+		return false
+	}
+	if _, _, err := s.live(r.Context(), id); err != nil {
+		s.fail(w, ProfileE2B, statusFor(err), fmt.Sprintf("sandbox %q unavailable", id))
+		return false
+	}
+	return true
 }
 
 // apiRefusal names the refusal for a request outside /sandboxes, or "".

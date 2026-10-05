@@ -29,7 +29,7 @@ Templates are registered by the operator only: `-template`/`-image` for a local 
 
 ### Not supported
 
-Once an `e2b` template is registered, every route of an unsupported E2B feature answers `501` with E2B's error body `{"code":501,"message":"<reason>; see docs/compatibility.md#not-supported"}`: never a `404` route miss or a silent success, and nothing is changed. The SDKs raise their generic API error with that text, `501: <reason>; …` (Python `SandboxException` with `status_code == 501`, `VolumeException`, `SecretException` or `BuildException`; JS `SandboxError` with `statusCode === 501`, or `BuildError`). A strict-only service keeps its plain `404`.
+Once an `e2b` template is registered, every route of an unsupported E2B feature answers `501` with E2B's error body `{"code":501,"message":"<reason>; see docs/compatibility.md#not-supported"}`: never a `404` route miss or a silent success, and nothing is changed. The SDKs raise their generic API error with that text, `501: <reason>; …` (Python `SandboxException` with `status_code == 501`, `VolumeException`, `SecretException` or `BuildException`; JS `SandboxError` with `statusCode === 501`, `VolumeError`, `SecretError` or `BuildError`). A per-sandbox action (pause, resume, snapshot, fork, network) on a sandbox that is gone or unknown is still the `404` the SDKs raise as not found, as on E2B. A strict-only service keeps its plain `404`. The stock-SDK tests in `conformance/sdk` assert each SDK-visible error exactly.
 
 | Feature | Requests | Reason |
 | --- | --- | --- |
@@ -37,7 +37,7 @@ Once an `e2b` template is registered, every route of an unsupported E2B feature 
 | Snapshots | `POST /sandboxes/{id}/snapshots`, `GET /snapshots` | `snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)` |
 | Snapshot or template delete | `DELETE /templates/{id}` | `deleting templates or snapshots through the API is not supported: …` |
 | Fork | `POST /sandboxes/{id}/fork` | `fork is not supported: it needs snapshots (deferred with pause, D7)` |
-| Network updates and options | `PUT /sandboxes/{id}/network`; create with `allow_internet_access` or `network` | `network updates are not supported: a sandbox's network policy is fixed by the operator`; create: `network and internet access options are not supported` |
+| Network updates and options | `PUT /sandboxes/{id}/network`; create with `allow_internet_access`, or `network` other than exactly `{"allowPublicTraffic":false}` (what sandboxd always does) | `network updates are not supported: a sandbox's network policy is fixed by the operator`; create: `network and internet access options are not supported (guest ports are never public: only network.allowPublicTraffic=false is accepted)` |
 | Volumes | `/volumes`, `/volumes/{id}`; create with `volumeMounts` | `volumes are not supported: sandboxd keeps no storage beyond a sandbox's lifetime`; create: `volume mounts are not supported` |
 | Secrets | `/secrets`, `/secrets/{id}` | `secrets are not supported: pass values to a sandbox in envVars instead` |
 | MCP gateway | create with `mcp` | `MCP gateways are not supported` |

@@ -55,6 +55,17 @@ func TestUnsupportedFeaturesAreRefused(t *testing.T) {
 	if got := request(t, s, http.MethodGet, "/sandboxes/"+id, nil); got.Code != http.StatusOK {
 		t.Fatalf("sandbox after refusals: %d", got.Code)
 	}
+	// An action on a gone or unknown sandbox stays a 404 (the SDKs' not
+	// found), as on E2B; only a live sandbox gets the refusal.
+	if got := request(t, s, http.MethodDelete, "/sandboxes/"+id, nil); got.Code != http.StatusNoContent {
+		t.Fatalf("kill: %d", got.Code)
+	}
+	for _, path := range []string{"/sandboxes/" + id + "/fork", "/sandboxes/" + id + "/pause", "/sandboxes/sandboxd-00000000000000000000000000000000/snapshots", "/sandboxes/bogus/fork"} {
+		got := request(t, s, http.MethodPost, path, map[string]any{})
+		if failure := decodeBody[e2bError](t, got.Body); got.Code != http.StatusNotFound || failure.Code != http.StatusNotFound {
+			t.Errorf("%s on a gone sandbox: %d %s", path, got.Code, got.Body.String())
+		}
+	}
 }
 
 func TestTemplateAliasLookup(t *testing.T) {
