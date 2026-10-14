@@ -1408,6 +1408,14 @@ func TestFirecrackerVolumeAttach(t *testing.T) {
 	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("attach held by a stopped VM: %v", err)
 	}
+	// So does one whose destroy stopped after removing the jail: only its
+	// record still names the volume.
+	if err := os.RemoveAll(d.jailDir(fcTestID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("attach held by a VM record without its jail: %v", err)
+	}
 
 	if err := d.Destroy(ctx, fcTestID); err != nil {
 		t.Fatal(err)
