@@ -387,6 +387,15 @@ template on any other driver or without a local image for it, and enrolled
 workers never serve it. Other templates boot with byte-identical kernel
 arguments.
 
+Images must come from a sandboxd release that knows the feature. An agent
+from before v0.4.0 ignores `sandboxd.hardened=1` and `sandboxd.volume=`
+and would boot a writable guest without its volume, so the guest agent
+reports in its ping what its init applied (`hardened`, `volume`), and the
+driver refuses a VM that did not apply what it asked for: the create fails
+with `500` (`the operator must rebuild it`), and the VM is destroyed
+([#68](https://github.com/gitmoot/sandboxd/issues/68)). Rebuild the e2b
+image from the matching checkout to use hardening or volumes.
+
 ## Code-interpreter image
 
 The image of the `code-interpreter-v1` template: E2B's
