@@ -379,9 +379,15 @@ func serve(envd bool) error {
 		if server.VolumePath, err = guestagent.VolumePath(string(cmdline)); err != nil {
 			return err
 		}
+		if server.VolumePath != "" {
+			server.Features = append(server.Features, guestagent.FeatureVolume)
+		}
 		// A hardened guest's writable disk is its home (the default); any
 		// other e2b guest's is the overlay root.
-		if !slices.Contains(strings.Fields(string(cmdline)), guestagent.HardenedArg) {
+		if slices.Contains(strings.Fields(string(cmdline)), guestagent.HardenedArg) {
+			// Init hardened the guest before starting this server, or halted.
+			server.Features = append(server.Features, guestagent.FeatureHardened)
+		} else {
 			server.DiskPath = "/"
 		}
 	}

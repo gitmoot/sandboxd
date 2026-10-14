@@ -47,6 +47,8 @@ type Server struct {
 	// VolumePath is where an attached volume is mounted, "" when none is;
 	// OpSync remounts it read-only.
 	VolumePath string
+	// Features is what init applied, reported by OpPing.
+	Features []string
 
 	next atomic.Int64
 }
@@ -77,7 +79,7 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	var result Result
 	switch request.Op {
 	case OpPing:
-		result = Result{}
+		result = Result{Features: s.Features}
 	case OpExec:
 		result = s.exec(conn, reader, request)
 	case OpWrite:

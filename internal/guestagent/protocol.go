@@ -137,7 +137,17 @@ type Result struct {
 	// DiskTotal and DiskUsed answer OpDisk, in bytes.
 	DiskTotal uint64 `json:"diskTotal,omitempty"`
 	DiskUsed  uint64 `json:"diskUsed,omitempty"`
+	// Features answers OpPing: what this guest's init applied, from
+	// FeatureHardened and FeatureVolume. An agent older than them reports
+	// none, so the host can tell a guest that ignored a request.
+	Features []string `json:"features,omitempty"`
 }
+
+// Features a guest reports in its ping once init has applied them.
+const (
+	FeatureHardened = "hardened"
+	FeatureVolume   = "volume"
+)
 
 // WriteRequest sends the request line.
 func WriteRequest(w io.Writer, request Request) error {

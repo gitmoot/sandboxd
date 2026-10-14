@@ -328,7 +328,27 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 		return err
 	}
 	h.listeners[id] = listener
-	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent)
+	// Like the real init, the fake guest applies what its boot arguments
+	// ask for; an old agent predates features and reports none.
+	var features []string
+	if !h.oldAgent {
+		var config struct {
+			Boot struct {
+				Args string `json:"boot_args"`
+			} `json:"boot-source"`
+		}
+		data, err := os.ReadFile(filepath.Join(chroot, "vm.json"))
+		if err != nil || json.Unmarshal(data, &config) != nil {
+			return fmt.Errorf("fake VMM: unreadable vm.json: %v", err)
+		}
+		if slices.Contains(strings.Fields(config.Boot.Args), guestagent.HardenedArg) {
+			features = append(features, guestagent.FeatureHardened)
+		}
+		if path, _ := guestagent.VolumePath(config.Boot.Args); path != "" {
+			features = append(features, guestagent.FeatureVolume)
+		}
+	}
+	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent, features)
 	return nil
 }
 
@@ -357,7 +377,7 @@ func listenUnixIn(dir, name string) (*net.UnixListener, error) {
 
 // serveFakeAgent answers Firecracker's vsock handshake on every connection
 // and serves a real guest agent whose filesystem is the guest directory.
-func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent bool) {
+func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent bool, features []string) {
 	dialHost := ""
 	if dial {
 		dialHost = "127.0.0.1"
@@ -365,7 +385,7 @@ func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent boo
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
-		DialHost: dialHost, DiskPath: guest,
+		DialHost: dialHost, DiskPath: guest, Features: features,
 	}
 	for {
 		conn, err := listener.Accept()
@@ -819,6 +839,38 @@ func TestFirecrackerUsageFromCgroup(t *testing.T) {
 	if !usage.Detailed || usage.MemoryCacheBytes != 20<<20 || usage.DiskTotalBytes != guestFS.Blocks*uint64(guestFS.Bsize) ||
 		usage.DiskUsedBytes == 0 || usage.DiskUsedBytes > usage.DiskTotalBytes {
 		t.Fatalf("detailed usage = %+v", usage)
+	}
+}
+
+// An image whose agent predates a feature boots without it and says
+// nothing: a hardened or volume VM on it must fail, leaving nothing behind,
+// never run writable or with the volume unmounted. A plain e2b VM on the
+// same image still starts.
+func TestFirecrackerRefusesFeaturesTheImageLacks(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	host.oldAgent = true
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	envd := func(hardened bool, mount *VolumeMount) Spec {
+		return Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true, Hardened: hardened, Volume: mount}
+	}
+	for name, spec := range map[string]Spec{
+		"hardened": envd(true, nil),
+		"volume":   envd(false, &VolumeMount{ID: volume.ID, Path: "/home/user/data"}),
+	} {
+		if _, err := d.Create(ctx, spec); !errors.Is(err, ErrImageTooOld) || !strings.Contains(err.Error(), name) {
+			t.Fatalf("%s on an old image: %v", name, err)
+		}
+		assertNoTraces(t, d, host)
+	}
+	if volumes, _ := d.Volumes(ctx); len(volumes) != 1 || volumes[0].AttachedTo != "" {
+		t.Fatalf("volume after the refused create: %+v", volumes)
+	}
+	if _, err := d.Create(ctx, envd(false, nil)); err != nil {
+		t.Fatalf("plain e2b VM on an old image: %v", err)
 	}
 }
 
