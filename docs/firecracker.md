@@ -575,12 +575,14 @@ Claims keep conflicting instances apart. At startup, before arming its
 table, each instance (the default one included) creates
 `/run/sandboxd-fc` (0700, a tmpfs: a claim lasts until reboot, exactly as
 long as guests can), locks its own claim file for the daemon's life, and
-writes its name, root and UID range there. It refuses to start when its own
-claim is locked (`instance "phobos" is already running`), when another
-claim, live or left by a killed daemon, has the same root or overlapping
-UIDs, or when its own claim left by a killed daemon names another root or
-UIDs (those guests may still run, and the new table would not confine
-them). A daemon that stops cleanly, destroying its guests and removing its
+writes its name, root, UID range and, with volumes on, its volume directory
+there. It refuses to start when its own claim is locked (`instance "phobos"
+is already running`), when another claim, live or left by a killed daemon,
+has the same root, overlapping UIDs or the same volume directory (each
+instance's in-use check sees only its own VMs, so two sharing one could
+attach one volume twice), or when its own claim left by a killed daemon
+names another root or UIDs or cannot be read (those guests may still run,
+and the new table would not confine them). A daemon that stops cleanly, destroying its guests and removing its
 table, removes its claim. To clear a stale claim, start that instance again
 as it was and stop it cleanly, or remove the file after confirming none of
 its guests remain (no `sbx-<id>`/`sbi-<name>-<id>` namespaces in
@@ -588,8 +590,9 @@ its guests remain (no `sbx-<id>`/`sbi-<name>-<id>` namespaces in
 
 A default daemon built before claims writes none. So while
 `/run/sandboxd-fc/default.json` is absent, a named instance also refuses
-the default root `/var/lib/sandboxd-fc` and the default UIDs
-2900000-2901999; a default claim recording another root and UIDs lifts
+the default root `/var/lib/sandboxd-fc`, the default UIDs 2900000-2901999
+and the default volume directory `/var/lib/sandboxd-fc/volumes`; a default
+claim recording another root and UIDs lifts
 that. Upgrade every instance on a host to a binary with claims.
 
 ## Tests

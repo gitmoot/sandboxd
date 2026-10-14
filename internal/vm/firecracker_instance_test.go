@@ -220,6 +220,12 @@ func TestFirecrackerClaims(t *testing.T) {
 	wantClaimError(t, newClaimDriver(t, dir, "phobos", 3100000, func(c *FirecrackerConfig) { c.Root = phobos.cfg.Root }).Claim(),
 		`instance "phobos" last ran with root`, "remove "+filepath.Join(dir, "phobos.json"))
 	wantClaimError(t, newClaimDriver(t, dir, "phobos", 3000000).Claim(), `instance "phobos" last ran with root`)
+	// The same root spelled through a symlink is the same root.
+	viaLink := newClaimDriver(t, dir, "phobos", 3000000, func(c *FirecrackerConfig) { c.Root = link })
+	if err := viaLink.Claim(); err != nil {
+		t.Fatalf("restart after kill through a symlinked root: %v", err)
+	}
+	viaLink.kill()
 	restarted := newClaimDriver(t, dir, "phobos", 3000000, func(c *FirecrackerConfig) { c.Root = phobos.cfg.Root })
 	if err := restarted.Claim(); err != nil {
 		t.Fatalf("restart after kill: %v", err)
@@ -248,6 +254,31 @@ func TestFirecrackerClaims(t *testing.T) {
 	if err := newClaimDriver(t, dir, "phobos", 3100000).Claim(); err != nil {
 		t.Fatalf("claim after a clean stop: %v", err)
 	}
+}
+
+// Two instances never share a volume directory: each one's in-use check
+// sees only its own VMs, so both could attach one volume. An own claim that
+// cannot be read is never assumed to match this run.
+func TestFirecrackerClaimsVolumeDirAndUnreadableOwn(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "claims")
+	volumes := filepath.Join(t.TempDir(), "volumes")
+	withVolumes := func(c *FirecrackerConfig) { c.VolumeBudgetMiB, c.VolumeMiB, c.VolumeDir = 1024, 64, volumes }
+	phobos := newClaimDriver(t, dir, "phobos", 3000000, withVolumes)
+	if err := phobos.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	wantClaimError(t, newClaimDriver(t, dir, "deimos", 3100000, withVolumes).Claim(),
+		`would share volume directory `+volumes+` with instance "phobos"`)
+	// Without volumes the directory is no one's: no clash.
+	if err := newClaimDriver(t, dir, "deimos", 3100000, func(c *FirecrackerConfig) { c.VolumeDir = volumes }).Claim(); err != nil {
+		t.Fatalf("instance without volumes refused: %v", err)
+	}
+
+	phobos.kill()
+	if err := os.WriteFile(filepath.Join(dir, "phobos.json"), []byte("{trunc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wantClaimError(t, newClaimDriver(t, dir, "phobos", 3200000).Claim(), "of this instance is unreadable", "remove "+filepath.Join(dir, "phobos.json"))
 }
 
 // Without a default claim (a default daemon built before claims), a named

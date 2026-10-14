@@ -40,14 +40,19 @@ func fcInstanceNames(instance string) fcNames {
 	}
 }
 
-// fcClaim is an instance's claim file, ClaimDir/<name>.json: the Root and
-// UID range its guests use. A running daemon holds an exclusive flock on
-// its own; a killed daemon's file stays, since its guests may still run.
+// fcClaim is an instance's claim file, ClaimDir/<name>.json: the Root, UID
+// range and volume directory its guests use. A running daemon holds an
+// exclusive flock on its own; a killed daemon's file stays, since its guests
+// may still run.
 type fcClaim struct {
 	Instance string `json:"instance"`
 	Root     string `json:"root"`
 	UIDLow   int    `json:"uidLow"`
 	UIDHigh  int    `json:"uidHigh"`
+	// VolumeDir is "" when the instance keeps no volumes. Two instances
+	// sharing one would each attach a volume the other has attached: the
+	// in-use check sees only its own VMs.
+	VolumeDir string `json:"volumeDir,omitempty"`
 }
 
 func fcInstanceLabel(instance string) string {
@@ -73,6 +78,9 @@ func (c fcClaim) clash(other fcClaim) string {
 	}
 	if c.UIDLow <= other.UIDHigh && other.UIDLow <= c.UIDHigh {
 		return fmt.Sprintf("UIDs %d-%d", other.UIDLow, other.UIDHigh)
+	}
+	if c.VolumeDir != "" && other.VolumeDir != "" && fcSameRoot(c.VolumeDir, other.VolumeDir) {
+		return "volume directory " + other.VolumeDir
 	}
 	return ""
 }
@@ -116,6 +124,9 @@ func (d *FirecrackerDriver) Claim() error {
 	}
 	low, high := d.uidRange()
 	own := fcClaim{Instance: d.cfg.Instance, Root: d.cfg.Root, UIDLow: low, UIDHigh: high}
+	if d.cfg.VolumeBudgetMiB > 0 {
+		own.VolumeDir = d.cfg.VolumeDir
+	}
 	label := fcInstanceLabel(own.Instance)
 	name := label + ".json"
 	path := filepath.Join(dir, name)
@@ -190,7 +201,13 @@ func checkClaims(dir, name string, own fcClaim, previous []byte) error {
 	}
 	if len(previous) != 0 {
 		var last fcClaim
-		if json.Unmarshal(previous, &last) == nil && (filepath.Clean(last.Root) != filepath.Clean(own.Root) || last.UIDLow != own.UIDLow || last.UIDHigh != own.UIDHigh) {
+		if err := json.Unmarshal(previous, &last); err != nil {
+			// What the last run's guests use is unknown: never assume it
+			// matches.
+			path := filepath.Join(dir, name)
+			return fmt.Errorf("Firecracker claim %s of this instance is unreadable (%v); %s", path, err, howToClear(label, path))
+		}
+		if !fcSameRoot(last.Root, own.Root) || last.UIDLow != own.UIDLow || last.UIDHigh != own.UIDHigh {
 			return fmt.Errorf("Firecracker instance %q last ran with root %s and UIDs %d-%d, not root %s and UIDs %d-%d; %s",
 				label, last.Root, last.UIDLow, last.UIDHigh, own.Root, own.UIDLow, own.UIDHigh, howToClear(label, filepath.Join(dir, name)))
 		}
@@ -208,6 +225,9 @@ func checkClaims(dir, name string, own fcClaim, previous []byte) error {
 		defaultClaimed = defaultClaimed || other == "default"
 		path := filepath.Join(dir, entry.Name())
 		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // released by a clean stop since the listing
+		}
 		if err != nil {
 			return fmt.Errorf("read Firecracker claim %s: %w", path, err)
 		}
@@ -221,7 +241,8 @@ func checkClaims(dir, name string, own fcClaim, previous []byte) error {
 		}
 	}
 	if own.Instance != "" && !defaultClaimed {
-		def := fcClaim{Root: FirecrackerDefaultRoot, UIDLow: FirecrackerDefaultUIDBase, UIDHigh: FirecrackerDefaultUIDBase + 2*fcUIDStride - 1}
+		def := fcClaim{Root: FirecrackerDefaultRoot, UIDLow: FirecrackerDefaultUIDBase, UIDHigh: FirecrackerDefaultUIDBase + 2*fcUIDStride - 1,
+			VolumeDir: filepath.Join(FirecrackerDefaultRoot, "volumes")}
 		if what := own.clash(def); what != "" {
 			return fmt.Errorf("Firecracker instance %q would share %s with the default instance, which has no claim in %s "+
 				"(a binary without claims writes none): give this instance its own -fc-root and -fc-uid-base, "+
@@ -239,7 +260,18 @@ func (d *FirecrackerDriver) releaseClaim() error {
 	if d.claim == nil {
 		return nil
 	}
-	err := os.Remove(d.claim.Name())
+	// Under the directory lock, like Claim, so a starting instance never
+	// lists this claim and then finds it gone.
+	var err error
+	if dirFile, openErr := os.OpenFile(d.cfg.ClaimDir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0); openErr != nil {
+		err = openErr
+	} else {
+		err = unix.Flock(int(dirFile.Fd()), unix.LOCK_EX)
+		if err == nil {
+			err = os.Remove(d.claim.Name())
+		}
+		_ = dirFile.Close()
+	}
 	err = errors.Join(err, d.claim.Close())
 	d.claim = nil
 	if err != nil {
