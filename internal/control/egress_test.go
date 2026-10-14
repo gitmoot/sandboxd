@@ -210,8 +210,11 @@ func TestCreateEgressRefusals(t *testing.T) {
 // A policy sandbox runs on the gateway's local worker or nowhere, however
 // much room an enrolled worker has; without a policy it may run remotely.
 func TestEgressSandboxNeverPlacedOnRemoteWorker(t *testing.T) {
-	remote := newFakeWorker(t, "arm-1", "arm64", map[string]string{"sandboxd-base": "linux-arm64-envd"}, 4)
+	var remote *fakeWorker
+	// Each gateway gets its own worker: two gateways enrolling one worker
+	// fence each other, and the loser's sandboxes become unavailable.
 	newGateway := func(local map[string]Template) (*Service, *specDriver) {
+		remote = newFakeWorker(t, "arm-1", "arm64", map[string]string{"sandboxd-base": "linux-arm64-envd"}, 4)
 		driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
 		cfg := mixedConfig(local, 1)
 		cfg.Arch = "arm64"
