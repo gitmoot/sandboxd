@@ -1076,10 +1076,6 @@ func (d *FirecrackerDriver) waitAgent(ctx context.Context, spec Spec) error {
 	}
 }
 
-// ErrImageTooOld: the guest image's agent did not apply a feature the VM
-// was created with, so the VM is not what was asked for.
-var ErrImageTooOld = errors.New("guest image does not support a requested feature; rebuild it with this sandboxd version")
-
 func missingFeatures(spec Spec, reported []string) error {
 	var missing []string
 	if spec.Hardened && !slices.Contains(reported, guestagent.FeatureHardened) {

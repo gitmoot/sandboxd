@@ -63,6 +63,11 @@ var ErrNoEnvd = errors.New("this VM driver does not run envd (e2b-profile) guest
 // cannot boot a hardened guest: hardening is never silently dropped.
 var ErrHardenedUnsupported = errors.New("hardened guests are not supported by this worker")
 
+// ErrImageTooOld: the guest image's agent did not apply a feature the VM
+// was created with (hardening, a volume), so the VM is not what was asked
+// for and is not kept.
+var ErrImageTooOld = errors.New("guest image does not support a requested feature; rebuild it with this sandboxd version")
+
 // HardenedBooter is implemented by drivers whose guest init boots hardened
 // guests (Spec.Hardened). A gateway serves a hardened template only through
 // such a driver: support is declared, never assumed from a driver's name.
