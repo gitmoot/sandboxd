@@ -247,7 +247,7 @@ func (d *Driver) attachLocked(spec vm.Spec) (string, error) {
 		return "", errors.New("the dev driver mounts volumes only in envd guests")
 	}
 	if !validGuestMount(mount.Path) {
-		return "", fmt.Errorf("the dev driver maps only %s, so it mounts volumes only below it, not at %q", GuestHome, mount.Path)
+		return "", fmt.Errorf("%w: the dev driver maps only %s, so it mounts volumes only below it, not at %q", vm.ErrVolumeMountPath, GuestHome, mount.Path)
 	}
 	if _, ok := d.volumes[mount.ID]; !ok {
 		return "", fmt.Errorf("volume %q: %w", mount.ID, vm.ErrVolumeNotFound)

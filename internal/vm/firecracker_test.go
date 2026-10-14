@@ -1366,6 +1366,49 @@ func TestFirecrackerVolumeCrashLeftovers(t *testing.T) {
 	}
 }
 
+// Startup repairs what a crash or an operator can leave: a disk without a
+// record is reported but kept (the driver never makes one, so it is not its
+// to delete); a detached disk still owned by a former VMM goes back to root;
+// a volume directory with a wider mode is narrowed; one owned by another
+// user is refused.
+func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
+	d, _, cfg := newVolumeFirecracker(t)
+	volume, err := d.CreateVolume(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
+	if err := os.Chown(disk, cfg.UIDBase, cfg.UIDBase); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(cfg.VolumeDir, "vol-"+strings.Repeat("b", 32)+".ext4")
+	if err := os.WriteFile(foreign, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(cfg.VolumeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	host := newFakeFCHost(t)
+	if _, err := newFirecrackerDriver(cfg, host); err != nil {
+		t.Fatal(err)
+	}
+	if uid, ok := host.owner(disk); !ok || uid != 0 {
+		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
+	}
+	if _, err := os.Stat(foreign); err != nil {
+		t.Errorf("disk without a record was removed: %v", err)
+	}
+	if info, err := os.Stat(cfg.VolumeDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("volume directory mode = %v, %v", info.Mode().Perm(), err)
+	}
+	if err := os.Chown(cfg.VolumeDir, 12345, 12345); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newFirecrackerDriver(cfg, newFakeFCHost(t)); err == nil || !strings.Contains(err.Error(), "owned by uid 12345") {
+		t.Fatalf("foreign-owned volume directory accepted: %v", err)
+	}
+}
+
 func TestFirecrackerVolumeAttach(t *testing.T) {
 	d, host, cfg := newVolumeFirecracker(t)
 	ctx := context.Background()

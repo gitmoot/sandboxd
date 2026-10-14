@@ -312,6 +312,14 @@ func TestDriverVolumeInUseIsConflict(t *testing.T) {
 	if state := ledgerState(t, s, specs[0].ID); state != "unknown" && state != "gone" {
 		t.Fatalf("row after in-use create: %s", state)
 	}
+	// A volume deleted after the name lookup, and a path the worker cannot
+	// mount, are the client's to fix: never a 503.
+	driver.createError = fmt.Errorf("create: %w", vm.ErrVolumeNotFound)
+	got = request(t, s, http.MethodPost, "/v2/sandboxes", mountBody([]map[string]string{{"name": "data", "path": "/mnt"}}))
+	wantFailure(t, "driver not found", got, http.StatusNotFound, "volume not found")
+	driver.createError = fmt.Errorf("create: %w", vm.ErrVolumeMountPath)
+	got = request(t, s, http.MethodPost, "/v2/sandboxes", mountBody([]map[string]string{{"name": "data", "path": "/mnt"}}))
+	wantFailure(t, "driver mount path", got, http.StatusBadRequest, "mount path not supported")
 }
 
 // A volume sandbox runs on the gateway's local worker or nowhere, however

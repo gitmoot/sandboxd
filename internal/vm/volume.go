@@ -20,6 +20,8 @@ var (
 	// ErrVolumeBudget: creating the volume would exceed the total volume
 	// budget or the host disk floor.
 	ErrVolumeBudget = errors.New("volume budget exhausted")
+	// ErrVolumeMountPath: the driver cannot mount a volume at that path.
+	ErrVolumeMountPath = errors.New("volume mount path not supported by this worker")
 )
 
 // Volume is one durable named disk. It outlives every VM it is attached to:
