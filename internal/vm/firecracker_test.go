@@ -1377,8 +1377,9 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ownership drift: a detached disk not owned by root. Unprivileged, the
+	// disk is already the test user's, which takes the same repair branch.
 	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
-	// Ownership drift and a foreign directory owner need chown: root only.
 	asRoot := os.Geteuid() == 0
 	if asRoot {
 		if err := os.Chown(disk, cfg.UIDBase, cfg.UIDBase); err != nil {
@@ -1396,6 +1397,9 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 	if _, err := newFirecrackerDriver(cfg, host); err != nil {
 		t.Fatal(err)
 	}
+	if uid, ok := host.owner(disk); !ok || uid != 0 {
+		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
+	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Errorf("disk without a record was removed: %v", err)
 	}
@@ -1403,11 +1407,8 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 		t.Errorf("volume directory mode = %v, %v", info.Mode().Perm(), err)
 	}
 	if !asRoot {
-		t.Log("not root: ownership repair and foreign directory owner not checked")
+		t.Log("not root: a volume directory owned by another user is not checked")
 		return
-	}
-	if uid, ok := host.owner(disk); !ok || uid != 0 {
-		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
 	}
 	if err := os.Chown(cfg.VolumeDir, 12345, 12345); err != nil {
 		t.Fatal(err)
@@ -1590,8 +1591,13 @@ func TestFirecrackerHardened(t *testing.T) {
 		"volume at home": {ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true, Hardened: true,
 			Volume: &VolumeMount{ID: "vol-" + strings.Repeat("a", 32), Path: "/home/user"}},
 	} {
-		if _, err := d.Create(ctx, spec); err == nil {
+		_, err := d.Create(ctx, spec)
+		if err == nil {
 			t.Fatalf("%s: created", name)
+		}
+		// A mount path the guest cannot take is the client's mistake (400).
+		if spec.Volume != nil && !errors.Is(err, ErrVolumeMountPath) {
+			t.Fatalf("%s: %v", name, err)
 		}
 		assertNoTraces(t, d, host)
 	}

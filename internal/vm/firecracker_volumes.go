@@ -417,7 +417,7 @@ func (d *FirecrackerDriver) checkVolumeSpec(spec Spec) error {
 		return fmt.Errorf("%w: %q", ErrVolumeNotFound, spec.Volume.ID)
 	}
 	if !ValidMountPath(spec.Volume.Path) {
-		return fmt.Errorf("invalid volume mount path %q", spec.Volume.Path)
+		return fmt.Errorf("%w: invalid volume mount path %q", ErrVolumeMountPath, spec.Volume.Path)
 	}
 	return nil
 }
