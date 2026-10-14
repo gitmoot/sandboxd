@@ -143,6 +143,10 @@ func (d *Driver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 		// Dev guests share the host network; a policy is refused, never ignored.
 		return vm.Instance{}, fmt.Errorf("dev driver: %w", vm.ErrEgressUnsupported)
 	}
+	if spec.Hardened {
+		// Dev guests are host processes with no system disk to protect.
+		return vm.Instance{}, fmt.Errorf("dev driver: %w", vm.ErrHardenedUnsupported)
+	}
 	if err := ctx.Err(); err != nil {
 		return vm.Instance{}, err
 	}

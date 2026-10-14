@@ -71,8 +71,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	templateArchs := make(templateArchFlags)
 	flags.Var(templateArchs, "template-arch", "repeatable template served by enrolled workers: <template>=arm64|amd64")
 	var registered control.TemplateFlags
-	flags.Var(&registered, "register-template", "repeatable operator-registered template: id=<id>[,arch=arm64|amd64][,image=<image>][,profile=gitmoot-strict|e2b][,alias=<name>]...[,envd-version=X.Y.Z]; "+
-		"with an image this host also serves it (a -worker-key-file worker declares only id and image)")
+	flags.Var(&registered, "register-template", "repeatable operator-registered template: id=<id>[,arch=arm64|amd64][,image=<image>][,profile=gitmoot-strict|e2b][,alias=<name>]...[,envd-version=X.Y.Z][,hardened=true]; "+
+		"with an image this host also serves it (a -worker-key-file worker declares only id and image); "+
+		"hardened=true (e2b only) gives a read-only, nosuid system disk and runs only on this gateway's local firecracker worker")
 	tokenSecretFile := flags.String("token-secret-file", "", "0600 file of at least 32 bytes deriving e2b-profile envd tokens; required with any e2b template")
 	workerKeyFile := flags.String("worker-key-file", "", "serve only the enrolled-worker API on -listen, authenticated by this 0600 per-worker key file, instead of the control and guest APIs")
 	showVersion := flags.Bool("version", false, "print the release version and exit")

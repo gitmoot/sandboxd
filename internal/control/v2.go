@@ -200,7 +200,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, err.Error())
 		return
 	}
-	mount, status, reason := s.volumeMount(r.Context(), request.VolumeMounts)
+	mount, status, reason := s.volumeMount(r.Context(), request.VolumeMounts, template.Hardened)
 	if status != 0 {
 		s.fail(w, ProfileE2B, status, reason)
 		return
@@ -216,7 +216,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	row := store.Row{ID: id, TokenHash: hash[:], Metadata: string(encoded), JobID: fence.job,
 		TemplateID: template.ID, Profile: string(ProfileE2B), Attempt: fence.attempt, Generation: fence.generation,
 		Fence: metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row, placement{volume: mount, egress: egress}); err != nil {
+	if err := s.launch(r.Context(), &row, placement{volume: mount, egress: egress, hardened: template.Hardened}); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			s.fail(w, ProfileE2B, refusal.status, refusal.message)

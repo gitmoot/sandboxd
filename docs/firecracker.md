@@ -353,6 +353,29 @@ ZeroTier, the NAT's own host and resolver, metadata and RFC 1918 addresses
 were unreachable, vsock to the host was refused, and the internet was
 reachable.
 
+### Hardened e2b templates
+
+Registering an `e2b` template with `hardened=true` boots its guests without
+the overlay root ([#49](https://github.com/gitmoot/sandboxd/issues/49)):
+
+```sh
+  -register-template id=e2b-hardened,profile=e2b,envd-version=0.9.0,hardened=true,image=/var/lib/sandboxd-fc/images/e2b-amd64-<sha>.ext4
+```
+
+The driver adds the kernel argument `sandboxd.hardened=1` (after
+`sandboxd.envd=1`) and records `"hardened": true` in the VM's record; the
+agent then remounts the image root read-only, `nosuid` and `nodev`, formats
+the per-VM disk as `/home/user` exactly as for a `gitmoot-strict` guest, and
+mounts bounded tmpfs on `/tmp` (256 MiB), `/var/tmp` (64 MiB), `/run`
+(32 MiB) and `/root` (16 MiB) before the volume and envd. `sudo` and every
+setuid binary of the same image stop working; envd's `root` user still
+works (see [compatibility](compatibility.md#hardened-templates)). A volume
+mounts only below `/home/user`. Hardened sandboxes run only on the gateway's
+local Firecracker worker; the gateway refuses to start with a hardened
+template on any other driver or without a local image for it, and enrolled
+workers never serve it. Other templates boot with byte-identical kernel
+arguments.
+
 ## Code-interpreter image
 
 The image of the `code-interpreter-v1` template: E2B's

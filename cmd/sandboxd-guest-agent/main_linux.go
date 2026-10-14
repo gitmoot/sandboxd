@@ -6,7 +6,9 @@
 // An e2b guest (kernel argument sandboxd.envd=1) instead gets a writable
 // overlay root on the per-VM disk and runs upstream envd as root; the vsock
 // server then also bridges host connections to TCP ports on the guest
-// loopback (envd, and the ports its template exposes; sandboxd chooses).
+// loopback (envd, and the ports its template exposes; sandboxd chooses). A
+// hardened e2b guest (also sandboxd.hardened=1) keeps the image as a
+// read-only, nosuid root and gets the strict guest's writable home instead.
 package main
 
 import (
@@ -98,8 +100,20 @@ func initGuest() {
 	if err != nil {
 		halt("read /proc/cmdline: %v", err)
 	}
-	envd := slices.Contains(strings.Fields(string(cmdline)), envdKernelArg)
-	if envd {
+	fields := strings.Fields(string(cmdline))
+	envd := slices.Contains(fields, envdKernelArg)
+	hardened := slices.Contains(fields, guestagent.HardenedArg)
+	switch {
+	case hardened && !envd:
+		halt("%s needs %s", guestagent.HardenedArg, envdKernelArg)
+	case hardened:
+		// The rootfs drive is already read-only; nosuid also makes sudo, su
+		// and every setuid or file-capability binary of the image powerless,
+		// so the same e2b image runs hardened or not.
+		if err := unix.Mount("", "/", "", unix.MS_REMOUNT|unix.MS_RDONLY|nosuid, ""); err != nil {
+			halt("remount / read-only: %v", err)
+		}
+	case envd:
 		if err := unix.Unmount("/proc", 0); err != nil {
 			halt("unmount /proc: %v", err)
 		}
@@ -115,12 +129,20 @@ func initGuest() {
 		{"tmpfs", "/dev/shm", "tmpfs", nosuid, "mode=1777,size=64m", 0o1777},
 		{"tmpfs", "/run", "tmpfs", nosuid, "mode=0755,size=32m", 0o755},
 	}
-	if !envd {
+	switch {
+	case !envd:
 		// The strict guest's root is read-only; an e2b guest keeps /tmp on
 		// its writable root, as E2B does.
 		mounts = append(mounts,
 			mount{"tmpfs", "/tmp", "tmpfs", nosuid, "mode=1777,size=512m", 0o1777},
 			mount{"tmpfs", "/var/tmp", "tmpfs", nosuid, "mode=1777,size=256m", 0o1777})
+	case hardened:
+		// Everything else a hardened guest may write; envd runs as root
+		// with HOME=/root.
+		mounts = append(mounts,
+			mount{"tmpfs", "/tmp", "tmpfs", nosuid, "mode=1777,size=256m", 0o1777},
+			mount{"tmpfs", "/var/tmp", "tmpfs", nosuid, "mode=1777,size=64m", 0o1777},
+			mount{"tmpfs", "/root", "tmpfs", nosuid, "mode=0700,size=16m", 0o700})
 	}
 	for _, m := range mounts {
 		if err := os.MkdirAll(m.target, m.mode); err != nil && !errors.Is(err, unix.EROFS) {
@@ -138,10 +160,7 @@ func initGuest() {
 	if err := os.Symlink("pts/ptmx", "/dev/ptmx"); err != nil {
 		halt("ptmx: %v", err)
 	}
-	if envd {
-		mountVolume(string(cmdline))
-	}
-	if !envd {
+	if !envd || hardened {
 		// The writable home disk is fresh for every VM; its root belongs to
 		// the guest user, like the Apple driver's private volume.
 		formatDisk("root_owner=1000:1000,lazy_itable_init=1", "home")
@@ -151,6 +170,10 @@ func initGuest() {
 		if err := os.Chmod(homeDir, 0o755); err != nil {
 			halt("chmod home: %v", err)
 		}
+	}
+	if envd {
+		// After the home: a hardened guest's volume mounts below it.
+		mountVolume(string(cmdline), hardened)
 	}
 	_ = unix.Sethostname([]byte("sandbox"))
 	if err := loopbackUp(); err != nil {
@@ -194,16 +217,20 @@ func initGuest() {
 }
 
 // mountVolume mounts the attached volume (the third disk) where the kernel
-// argument says, after the pivot to the writable root and before envd starts.
-// The host formatted it once; it is never formatted here. A guest that cannot
-// mount its volume must not run without it.
-func mountVolume(cmdline string) {
+// argument says, on the writable root (or a hardened guest's home) and
+// before envd starts. The host formatted it once; it is never formatted
+// here. A guest that cannot mount its volume must not run without it.
+func mountVolume(cmdline string, hardened bool) {
 	path, err := guestagent.VolumePath(cmdline)
 	if err != nil {
 		halt("volume: %v", err)
 	}
 	if path == "" {
 		return
+	}
+	// The host refuses this too; a read-only root has no other mount point.
+	if hardened && !guestagent.ValidHardenedVolumePath(path) {
+		halt("volume %s: a hardened guest mounts volumes only below %s", path, guestagent.HardenedHome)
 	}
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		halt("mkdir volume %s: %v", path, err)
@@ -344,7 +371,6 @@ func serve(envd bool) error {
 	}
 	if envd {
 		server.DialHost = "127.0.0.1"
-		server.DiskPath = "/"
 		// Init mounted the volume this names, or halted the VM.
 		cmdline, err := os.ReadFile("/proc/cmdline")
 		if err != nil {
@@ -352,6 +378,11 @@ func serve(envd bool) error {
 		}
 		if server.VolumePath, err = guestagent.VolumePath(string(cmdline)); err != nil {
 			return err
+		}
+		// A hardened guest's writable disk is its home (the default); any
+		// other e2b guest's is the overlay root.
+		if !slices.Contains(strings.Fields(string(cmdline)), guestagent.HardenedArg) {
+			server.DiskPath = "/"
 		}
 	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)

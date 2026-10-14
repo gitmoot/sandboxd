@@ -43,6 +43,7 @@ provider on a Firecracker host.
 | Gitmoot's pinned client (create, upload, start, delete) | ✅ | ✅ |
 | Internet egress; private ranges and the host blocked | ✅ | ✅ |
 | Per-sandbox egress policy (`allow_internet_access`, `allowOut`/`denyOut`, network update) | ✅ | ❌ |
+| Hardened e2b templates (`hardened=true`: read-only `nosuid` system disk, no sudo; [details](docs/compatibility.md#hardened-templates)) | ✅ | ❌ |
 | One gateway scheduling onto several enrolled workers | ✅ | ✅ |
 
 The Linux column comes from two sources:
