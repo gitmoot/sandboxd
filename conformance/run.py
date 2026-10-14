@@ -122,6 +122,7 @@ OPERATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("Commands", "`commands.list`", ("commands/list",)),
     ("Commands", "`commands.send_stdin`", ("commands/send_stdin",)),
     ("Commands", "sandbox killed during a command", ("commands/sandbox_killed_during_run",)),
+    ("Commands", "process and sandbox outlive a dropped stream or output past 64 MiB (sandboxd tests)", ("sandboxd/process_survival",)),
     ("Files", "`files.write`", ("files/write",)),
     ("Files", "`files.read`", ("files/read",)),
     ("Files", "`files.list`", ("files/list",)),

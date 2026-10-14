@@ -52,6 +52,7 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 | Commands | `commands.list` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | Commands | `commands.send_stdin` | ✅ 12/12 | ✅ 7/7 | — | — | — |
 | Commands | sandbox killed during a command | ✅ 2/2 | ✅ 1/1 | — | — | — |
+| Commands | process and sandbox outlive a dropped stream or output past 64 MiB (sandboxd tests) | ✅ 2/2 | ✅ 2/2 | — | — | — |
 | Files | `files.write` | ✅ 20/20 | ✅ 12/12 | — | — | — |
 | Files | `files.read` | ✅ 18/18 | ✅ 6/6 | — | — | — |
 | Files | `files.list` | ✅ 10/10 | ✅ 5/5 | — | — | — |
@@ -87,7 +88,7 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 384 pass against sandboxd, 621 pass offline,
+Totals: 388 pass against sandboxd, 621 pass offline,
 527 expected failures, 3 skipped.
 
 ## Intentional refusals

@@ -59,13 +59,18 @@ An `e2b` guest runs upstream [E2B envd](https://github.com/e2b-dev/infra) (Apach
 - **Create.** After the VM boots, sandboxd sends envd its `/init`: the sandbox's envd access token, default user `user`, working directory `/home/user`, and the create request's `envVars`. `envVars` are held only in that request's memory and the guest; they are never written to the ledger or logged. If envd does not initialize within 30 s the sandbox is destroyed and create answers `503`.
 - **Users.** Commands and files default to `user` (1000:1000, home `/home/user`, passwordless `sudo`, as in E2B's base template). SDK `user="root"` is allowed inside the VM (owner decision D3, after the isolation probes in [#25](https://github.com/gitmoot/sandboxd/issues/25) passed): root inside the guest owns only that VM. See [firecracker.md](firecracker.md#root-inside-an-e2b-guest).
 - **Metrics.** Firecracker reports page cache from the VMM cgroup's `memory.stat` (`file`) and disk use from the guest agent's `statfs` of the writable filesystem (the home disk, or an `e2b` guest's root), so `get_metrics` no longer answers `503` there. A strict guest booted from an image whose agent predates the disk report keeps its CPU and memory metrics; only `e2b` metrics, which need disk figures, answer `503` for such a guest (`e2b` images always include it).
+- **Processes.** A process's stream is envd's, as on E2B: a client that drops it (disconnects, or its connection breaks) ends that stream only; the process keeps running and `commands.connect(pid)` re-attaches to it, `send_stdin` still reaches it, and the sandbox stays up. sandboxd puts no output cap on an `e2b` process stream, so the `gitmoot-strict` 64 MiB cap and its VM teardown (below) never apply. A dropped stream never ends the sandbox; a real guest failure still does: envd exiting, or the Firecracker firewall table found missing or changed. The sandboxd tests `conformance/sdk/{python,js}` `process_survival` check both with the stock SDKs ([#47](https://github.com/gitmoot/sandboxd/issues/47)).
 
 Once any `e2b` template is registered, `GET /v2/sandboxes` is one account-wide view, as on E2B: it accepts `metadata` (each key and value matches as sent or with the JS SDK's extra URL-encoding undone, so a literal value such as `a%20b` still matches itself), `state`, `template` (ID or alias), `startedAfter` and `order`, lists newest first by default, adds `clientID` to every item, and answers errors as JSON. Completeness stays per profile: a `gitmoot-strict` row that cannot be described still turns a response it belongs to into a `503`, while an `e2b` row never does (one that is not running, or whose template is no longer registered with the `e2b` profile, is simply not listed; a worker that stops declaring a template has its VMs reaped by reconciliation, as for every template). Per-key views are M4.
 
-A guest execution or upload that its caller cancels, or that fails in the
-gateway's own (local) driver, revokes its capability and destroys the
+A `gitmoot-strict` guest execution or upload that its caller cancels, or that
+fails in the gateway's own (local) driver, revokes its capability and destroys the
 **entire VM**, because Apple `container exec` alone leaves the guest process
-alive when the host CLI disconnects. On an enrolled remote worker, a call
+alive when the host CLI disconnects. This stays on purpose
+([#47](https://github.com/gitmoot/sandboxd/issues/47)): the strict data plane
+has no `connect`, stdin or `kill` with which a client could reach a process
+whose stream it lost, so ending the VM is the only cleanup; output past the
+64 MiB stream cap ends it for the same reason. On an enrolled remote worker, a call
 that fails because the worker is unreachable, the gateway-to-worker stream is
 lost, or a newer gateway owns the worker does **not** tear the VM down: it
 answers `unavailable` and keeps the VM and its capability (see
