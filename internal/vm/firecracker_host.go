@@ -161,7 +161,12 @@ func (h *linuxFCHost) MonitorRuleset(ctx context.Context, event func()) error {
 	for lines.Scan() {
 		event()
 	}
-	err = errors.Join(lines.Err(), c.Wait())
+	scanErr := lines.Err()
+	if scanErr != nil {
+		// nft still holds stdout open: end it, or Wait never returns.
+		_ = c.Process.Kill()
+	}
+	err = errors.Join(scanErr, c.Wait())
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
