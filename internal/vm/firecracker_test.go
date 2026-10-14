@@ -1122,7 +1122,11 @@ func TestFirecrackerFirewallEventsFailClosed(t *testing.T) {
 	d.firewallEvery = 20 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go d.WatchFirewallEvents(ctx)
+	returned := make(chan struct{})
+	go func() {
+		defer close(returned)
+		d.WatchFirewallEvents(ctx)
+	}()
 	waitFor(t, func() bool { return host.subscriptions.Load() == 1 })
 	host.endSubscription()
 	waitFor(t, func() bool { return host.subscriptions.Load() == 2 })
@@ -1134,6 +1138,13 @@ func TestFirecrackerFirewallEventsFailClosed(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("two stopped subscriptions in a row were not reported")
+	}
+	// Having reported, the watch ends by itself: it must not wait for its
+	// caller's context (here never cancelled before the deadline).
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WatchFirewallEvents did not return after reporting a loss")
 	}
 }
 
