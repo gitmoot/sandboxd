@@ -182,7 +182,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		switch {
 		case driver == nil || templates.byID[id].Image == "":
 			return nil, fmt.Errorf("hardened template %q needs an image for the local worker: it never runs on an enrolled worker", id)
-		case cfg.DriverName == "apple" || cfg.DriverName == "devvm":
+		case !bootsHardened(driver):
 			return nil, fmt.Errorf("hardened template %q needs the firecracker driver; the %s driver cannot boot hardened guests", id, cfg.DriverName)
 		}
 	}
@@ -224,6 +224,11 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret, s.cfg.Volumes = nil, nil, nil, nil
 	go s.sweep()
 	return s, nil
+}
+
+func bootsHardened(driver vm.Driver) bool {
+	_, ok := driver.(vm.HardenedBooter)
+	return ok
 }
 
 // setState records row id's state. A row that leaves "running" leaves the
