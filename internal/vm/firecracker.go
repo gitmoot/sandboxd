@@ -126,6 +126,10 @@ type FirecrackerDriver struct {
 	// running command and open envd stream, every firewallEvery.
 	firewall      fcFirewallMonitor
 	firewallEvery time.Duration
+	// lost carries the first firewall loss the event path (or its failing
+	// subscription) found, for the daemon to stop on (FirewallLost).
+	lost     chan error
+	lostOnce sync.Once
 
 	// consoles keeps the console output of envd guests started by this
 	// process (see firecracker_console.go).
@@ -168,6 +172,10 @@ type fcHost interface {
 	ApplyFirewall(ctx context.Context, ruleset string) error
 	FirewallState(ctx context.Context) (string, error)
 	RemoveFirewall(ctx context.Context) error
+	// MonitorRuleset subscribes to the host namespace's nftables change
+	// events and calls event once per event until ctx ends or the
+	// subscription stops, which it reports.
+	MonitorRuleset(ctx context.Context, event func()) error
 
 	EnsureCgroupParent() error
 	RemoveCgroupParent() error
@@ -312,7 +320,7 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	cfg.Slots = slices.Clone(cfg.Slots)
 	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
 	d := &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host,
-		names: fcInstanceNames(cfg.Instance), firewallEvery: time.Second}
+		names: fcInstanceNames(cfg.Instance), firewallEvery: time.Second, lost: make(chan error, 1)}
 	if cfg.VolumeBudgetMiB != 0 {
 		if err := d.initVolumes(); err != nil {
 			return nil, err

@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,24 +48,28 @@ func TestMain(m *testing.M) {
 // symlink-safe dial; the fake's Chown is a no-op, so the VMM UID it expects
 // is the test's own UID (shifted by ownerShift).
 type fakeFCHost struct {
-	mu         sync.Mutex
-	t          *testing.T
-	free       uint64
-	untrusted  map[string]bool
-	firewall   string
-	netns      map[string]bool
-	cgroups    map[string]bool // name -> populated
-	parent     bool
-	guests     map[string]string // jail chroot -> guest root dir
-	listeners  map[string]*net.UnixListener
-	networks   []fcNetwork
-	vmmArgs    [][]string
-	calls      []string
-	failVMM    error
-	failNet    error
-	bootDies   bool
-	ownerShift int
-	stats      []fcCgroupSample
+	// events feeds MonitorRuleset: a value is one ruleset event, a close
+	// ends the subscription. subscriptions counts MonitorRuleset calls.
+	events        chan struct{}
+	subscriptions atomic.Int32
+	mu            sync.Mutex
+	t             *testing.T
+	free          uint64
+	untrusted     map[string]bool
+	firewall      string
+	netns         map[string]bool
+	cgroups       map[string]bool // name -> populated
+	parent        bool
+	guests        map[string]string // jail chroot -> guest root dir
+	listeners     map[string]*net.UnixListener
+	networks      []fcNetwork
+	vmmArgs       [][]string
+	calls         []string
+	failVMM       error
+	failNet       error
+	bootDies      bool
+	ownerShift    int
+	stats         []fcCgroupSample
 	// vmmOutput, when set, replaces what the fake VMM writes to its
 	// console, as a VMM that panics at startup does.
 	vmmOutput string
@@ -99,7 +104,7 @@ func newFakeFCHost(t *testing.T) *fakeFCHost {
 	h := &fakeFCHost{
 		t: t, free: 100 << 30, untrusted: map[string]bool{}, netns: map[string]bool{},
 		cgroups: map[string]bool{}, guests: map[string]string{}, listeners: map[string]*net.UnixListener{},
-		owners: map[string]int{},
+		owners: map[string]int{}, events: make(chan struct{}),
 	}
 	t.Cleanup(func() {
 		h.mu.Lock()
@@ -173,6 +178,33 @@ func (h *fakeFCHost) FirewallState(context.Context) (string, error) {
 	}
 	return h.firewall, nil
 }
+func (h *fakeFCHost) MonitorRuleset(ctx context.Context, event func()) error {
+	h.subscriptions.Add(1)
+	h.mu.Lock()
+	events := h.events
+	h.mu.Unlock()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case _, ok := <-events:
+			if !ok {
+				return errors.New("nft monitor stopped")
+			}
+			event()
+		}
+	}
+}
+
+// endSubscription ends the current fake subscription; the next one reads a
+// fresh channel.
+func (h *fakeFCHost) endSubscription() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	close(h.events)
+	h.events = make(chan struct{})
+}
+
 func (h *fakeFCHost) RemoveFirewall(context.Context) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -989,6 +1021,117 @@ func TestFirecrackerFirewallMonitor(t *testing.T) {
 	d.firewall.mu.Unlock()
 	if running {
 		t.Fatal("firewall monitor still running with no watchers")
+	}
+}
+
+// A ruleset change is checked the moment it happens, not a poll later:
+// with every poll far away, an nftables event alone finds the changed
+// table, destroys the VM running a command, and tells the daemon. Events
+// that change nothing of ours cost one check and destroy nothing.
+func TestFirecrackerFirewallEvents(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	d.firewallEvery = time.Hour
+	host.envdPort = echoEnvd(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := d.Create(ctx, Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true}); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := d.DialPort(ctx, fcTestID, host.envdPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	go d.WatchFirewallEvents(ctx)
+	waitFor(t, func() bool { return host.subscriptions.Load() == 1 })
+
+	// Someone else's rule: one check, nothing lost.
+	host.mu.Lock()
+	host.stateCalls = 0
+	host.mu.Unlock()
+	host.events <- struct{}{}
+	waitFor(t, func() bool { host.mu.Lock(); defer host.mu.Unlock(); return host.stateCalls >= 1 })
+	if !echoes(stream) {
+		t.Fatal("an unrelated ruleset event ended the stream")
+	}
+
+	host.mu.Lock()
+	host.firewall = "table inet sbx_fc {}\n" // flushed
+	host.mu.Unlock()
+	start := time.Now()
+	host.events <- struct{}{}
+	select {
+	case err := <-d.FirewallLost():
+		if !errors.Is(err, errFirewallLost) {
+			t.Fatalf("reported %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a firewall change event was not reported")
+	}
+	host.mu.Lock()
+	_, alive := host.cgroups[fcTestID]
+	host.mu.Unlock()
+	if alive {
+		t.Fatal("VM survived the firewall change event")
+	}
+	t.Logf("event to VM destroyed and loss reported: %v", time.Since(start))
+}
+
+// A stopped subscription is restarted and its table re-checked; it counts
+// as a failed check, so a second stop in a row reports a loss rather than
+// leaving guests running unwatched.
+func TestFirecrackerFirewallEventsSubscriptionStops(t *testing.T) {
+	d, host, _ := newTestFirecracker(t)
+	d.firewallEvery = 20 * time.Millisecond // also the restart pause
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.WatchFirewallEvents(ctx)
+	waitFor(t, func() bool { return host.subscriptions.Load() == 1 })
+	host.endSubscription()
+	waitFor(t, func() bool { return host.subscriptions.Load() == 2 })
+	select {
+	case err := <-d.FirewallLost():
+		t.Fatalf("one stopped subscription reported a loss: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Restarted, it still sees events.
+	host.mu.Lock()
+	host.firewall = ""
+	host.mu.Unlock()
+	host.events <- struct{}{}
+	select {
+	case <-d.FirewallLost():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the restarted subscription missed a firewall change")
+	}
+}
+
+func TestFirecrackerFirewallEventsFailClosed(t *testing.T) {
+	d, host, _ := newTestFirecracker(t)
+	d.firewallEvery = 20 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.WatchFirewallEvents(ctx)
+	waitFor(t, func() bool { return host.subscriptions.Load() == 1 })
+	host.endSubscription()
+	waitFor(t, func() bool { return host.subscriptions.Load() == 2 })
+	host.endSubscription()
+	select {
+	case err := <-d.FirewallLost():
+		if !errors.Is(err, errFirewallLost) || !strings.Contains(err.Error(), "events unavailable") {
+			t.Fatalf("reported %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("two stopped subscriptions in a row were not reported")
+	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not reached in 5s")
+		}
 	}
 }
 

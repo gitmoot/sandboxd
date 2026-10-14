@@ -326,9 +326,18 @@ func run(ctx context.Context, args []string) (runErr error) {
 		}
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
+		// The Firecracker driver also reports a loss the instant the host
+		// ruleset changes, not a second later (nil channel otherwise).
+		var lost <-chan error
+		if events, ok := driver.(interface{ FirewallLost() <-chan error }); ok {
+			lost = events.FirewallLost()
+		}
 		for {
 			select {
 			case <-guardCtx.Done():
+				return
+			case err := <-lost:
+				guardFailed <- err
 				return
 			case <-ticker.C:
 				checkCtx, cancel := context.WithTimeout(guardCtx, 5*time.Second)

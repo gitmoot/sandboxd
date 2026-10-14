@@ -16,6 +16,10 @@ import (
 // A check that observes the table missing or changed is a loss at once.
 const fcFirewallFailures = 2
 
+// fcEventsStable is how long the event subscription must have run for its
+// end to count as a fresh failure rather than the next one in a row.
+const fcEventsStable = 10 * time.Second
+
 // fcFirewallMonitor re-checks the host table once per interval for the whole
 // driver, while anything watches it: running commands and open envd streams.
 // On a loss it destroys every watched VM, then notifies each watcher.
@@ -137,4 +141,91 @@ func (d *FirecrackerDriver) firewallLost(cause error) {
 		w.lost(err)
 		close(w.done)
 	}
+}
+
+// FirewallLost reports the first firewall loss found by the event path
+// (WatchFirewallEvents): the daemon stops guest work on it at once, as it
+// does when its own one-second check fails.
+func (d *FirecrackerDriver) FirewallLost() <-chan error { return d.lost }
+
+// reportLost destroys every watched VM, then tells the daemon, once.
+func (d *FirecrackerDriver) reportLost(cause error) {
+	d.firewallLost(cause)
+	d.lostOnce.Do(func() { d.lost <- cause })
+}
+
+// WatchFirewallEvents re-checks the host table the moment the host's
+// ruleset changes, instead of up to a poll interval later: it subscribes to
+// nftables change events in the host namespace and runs one check per burst
+// of events. It runs until ctx ends; start it after Arm. The polls (the
+// command monitor, and the daemon's own one-second check) stay as backups,
+// for events missed or a subscription that is down.
+//
+// A subscription that stops is restarted, and counts as a failed check
+// under the same tolerance as the poll: fcFirewallFailures failures in a
+// row, each within fcEventsStable of the last start, are reported as a
+// loss. The table cannot be watched, so guests must not keep running.
+func (d *FirecrackerDriver) WatchFirewallEvents(ctx context.Context) {
+	check := make(chan struct{}, 1)
+	trigger := func() {
+		select {
+		case check <- struct{}{}:
+		default: // a check is already due; it reads the table after this event
+		}
+	}
+	checked := make(chan struct{})
+	go func() {
+		defer close(checked)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-check:
+			}
+			checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			err := d.Ready(checkCtx)
+			cancel()
+			switch {
+			case err == nil, ctx.Err() != nil:
+			case errors.Is(err, errFirewallLost):
+				log.Printf("firecracker: host firewall changed (nftables event): %v", err)
+				d.reportLost(err)
+				return
+			default:
+				// An nft run that failed; the polls apply their own tolerance.
+				log.Printf("firecracker: host firewall check after nftables event failed: %v", err)
+			}
+		}
+	}()
+	defer func() { <-checked }()
+	failures := 0
+	for ctx.Err() == nil {
+		started := time.Now()
+		// Check once per subscription start: events from before it are lost.
+		trigger()
+		err := d.host.MonitorRuleset(ctx, trigger)
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(started) >= fcEventsStable {
+			failures = 0
+		}
+		failures++
+		if failures >= fcFirewallFailures {
+			d.reportLost(fmt.Errorf("%w: firewall change events unavailable (%d failures in a row): %v", errFirewallLost, failures, err))
+			return
+		}
+		log.Printf("firecracker: firewall event subscription stopped (%d of %d tolerated), restarting: %v", failures, fcFirewallFailures-1, err)
+		trigger()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(d.eventsRestart()):
+		}
+	}
+}
+
+// eventsRestart is the pause before a stopped subscription is restarted.
+func (d *FirecrackerDriver) eventsRestart() time.Duration {
+	return min(d.firewallEvery, time.Second)
 }
