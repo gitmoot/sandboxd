@@ -1378,8 +1378,12 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
-	if err := os.Chown(disk, cfg.UIDBase, cfg.UIDBase); err != nil {
-		t.Fatal(err)
+	// Ownership drift and a foreign directory owner need chown: root only.
+	asRoot := os.Geteuid() == 0
+	if asRoot {
+		if err := os.Chown(disk, cfg.UIDBase, cfg.UIDBase); err != nil {
+			t.Fatal(err)
+		}
 	}
 	foreign := filepath.Join(cfg.VolumeDir, "vol-"+strings.Repeat("b", 32)+".ext4")
 	if err := os.WriteFile(foreign, []byte("x"), 0o600); err != nil {
@@ -1392,14 +1396,18 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 	if _, err := newFirecrackerDriver(cfg, host); err != nil {
 		t.Fatal(err)
 	}
-	if uid, ok := host.owner(disk); !ok || uid != 0 {
-		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
-	}
 	if _, err := os.Stat(foreign); err != nil {
 		t.Errorf("disk without a record was removed: %v", err)
 	}
 	if info, err := os.Stat(cfg.VolumeDir); err != nil || info.Mode().Perm() != 0o700 {
 		t.Errorf("volume directory mode = %v, %v", info.Mode().Perm(), err)
+	}
+	if !asRoot {
+		t.Log("not root: ownership repair and foreign directory owner not checked")
+		return
+	}
+	if uid, ok := host.owner(disk); !ok || uid != 0 {
+		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
 	}
 	if err := os.Chown(cfg.VolumeDir, 12345, 12345); err != nil {
 		t.Fatal(err)
