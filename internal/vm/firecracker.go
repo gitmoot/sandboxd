@@ -930,7 +930,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 		return Instance{}, errors.New("only e2b guests can be hardened")
 	}
 	if spec.Hardened && spec.Volume != nil && !ValidHardenedMountPath(spec.Volume.Path) {
-		return Instance{}, fmt.Errorf("a hardened guest mounts a volume only below %s, not at %q", guestagent.HardenedHome, spec.Volume.Path)
+		return Instance{}, fmt.Errorf("%w: a hardened guest mounts a volume only below %s, not at %q", ErrVolumeMountPath, guestagent.HardenedHome, spec.Volume.Path)
 	}
 	if err := d.checkVolumeSpec(spec); err != nil {
 		return Instance{}, err

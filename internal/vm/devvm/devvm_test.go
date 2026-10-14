@@ -339,12 +339,13 @@ func TestVolumeAttachRulesAndInUse(t *testing.T) {
 		return vm.Spec{ID: "sandboxd-b", Image: "img", Network: "slot-1", CPUs: 1, MemoryMiB: 256, Envd: envd,
 			Volume: &vm.VolumeMount{ID: id, Path: path}}
 	}
-	for name, s := range map[string]vm.Spec{
-		"plain guest":        spec(false, volume.ID, "/home/user/data"),
-		"outside guest home": spec(true, volume.ID, "/mnt/data"),
-		"the home itself":    spec(true, volume.ID, "/home/user"),
-	} {
-		if _, err := d.Create(ctx, s); err == nil || errors.Is(err, vm.ErrNoEnvd) {
+	if _, err := d.Create(ctx, spec(false, volume.ID, "/home/user/data")); err == nil || errors.Is(err, vm.ErrNoEnvd) {
+		t.Fatalf("plain guest: %v", err)
+	}
+	// A path this driver cannot serve is the client's mistake (400), never
+	// a driver failure (503).
+	for name, path := range map[string]string{"outside guest home": "/mnt/data", "the home itself": "/home/user"} {
+		if _, err := d.Create(ctx, spec(true, volume.ID, path)); !errors.Is(err, vm.ErrVolumeMountPath) {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
