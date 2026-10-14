@@ -63,6 +63,13 @@ var ErrNoEnvd = errors.New("this VM driver does not run envd (e2b-profile) guest
 // cannot boot a hardened guest: hardening is never silently dropped.
 var ErrHardenedUnsupported = errors.New("hardened guests are not supported by this worker")
 
+// HardenedBooter is implemented by drivers whose guest init boots hardened
+// guests (Spec.Hardened). A gateway serves a hardened template only through
+// such a driver: support is declared, never assumed from a driver's name.
+type HardenedBooter interface {
+	BootsHardened()
+}
+
 // Instance is a positive observation of a VM owned by this driver. Network is
 // its only attached network, or "" when it is not attached to exactly one.
 type Instance struct {

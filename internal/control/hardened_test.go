@@ -43,7 +43,7 @@ func TestHardenedSpecReachesDriver(t *testing.T) {
 		templates map[string]Template
 		want      bool
 	}{{hardenedBase, true}, {e2bBase, false}} {
-		driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+		driver := newHardenedDriver()
 		s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, mixedConfig(c.templates, 1))
 		createE2B(t, s, map[string]any{"templateID": "base"})
 		specs := driver.recorded()
@@ -52,7 +52,7 @@ func TestHardenedSpecReachesDriver(t *testing.T) {
 		}
 	}
 	// A strict sandbox is never hardened.
-	driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+	driver := newHardenedDriver()
 	s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, mixedConfig(hardenedBase, 1))
 	if got := request(t, s, http.MethodPost, "/sandboxes", createBody("job-A", 1)); got.Code != http.StatusCreated {
 		t.Fatalf("strict create: %d %s", got.Code, got.Body.String())
@@ -66,7 +66,7 @@ func TestHardenedSpecReachesDriver(t *testing.T) {
 // much room an enrolled worker declaring the template has.
 func TestHardenedSandboxNeverPlacedOnRemoteWorker(t *testing.T) {
 	remote := newFakeWorker(t, "arm-1", "arm64", map[string]string{"sandboxd-base": "linux-arm64-envd"}, 4)
-	driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+	driver := newHardenedDriver()
 	cfg := mixedConfig(hardenedBase, 1)
 	cfg.Arch = "arm64"
 	cfg.Workers = []Remote{{ID: remote.id, Member: remote.client}}
@@ -85,10 +85,20 @@ func TestHardenedSandboxNeverPlacedOnRemoteWorker(t *testing.T) {
 	}
 }
 
+// hardenedDriver is a local driver that declares hardened guest support.
+type hardenedDriver struct{ *specDriver }
+
+func (hardenedDriver) BootsHardened() {}
+
+func newHardenedDriver() hardenedDriver {
+	return hardenedDriver{&specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}}
+}
+
 // A hardened template the local driver cannot serve is a startup error,
-// never a sandbox booted without hardening.
+// never a sandbox booted without hardening. Support is what the driver
+// declares, whatever it is called.
 func TestOpenRefusesUnservableHardenedTemplate(t *testing.T) {
-	for _, name := range []string{"apple", "devvm"} {
+	for _, name := range []string{"apple", "devvm", "firecracker", "future"} {
 		cfg := mixedConfig(hardenedBase, 1)
 		cfg.DriverName = name
 		driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
@@ -100,8 +110,8 @@ func TestOpenRefusesUnservableHardenedTemplate(t *testing.T) {
 		}
 	}
 	cfg := mixedConfig(hardenedBase, 1)
-	cfg.DriverName = "firecracker"
-	driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+	cfg.DriverName = "anything"
+	driver := newHardenedDriver()
 	openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, cfg)
 
 	// Served only by enrolled workers: refused too.
@@ -129,7 +139,7 @@ func TestHardenedVolumePath(t *testing.T) {
 		{e2bBase, "/data", true},
 		{e2bBase, "/home/user/data", true},
 	} {
-		driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+		driver := newHardenedDriver()
 		cfg := mixedConfig(c.templates, 1)
 		cfg.Volumes = &fakeVolumes{}
 		s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, cfg)

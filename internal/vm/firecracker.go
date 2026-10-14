@@ -903,6 +903,12 @@ func (d *FirecrackerDriver) prepareJail(spec Spec, meta fcMeta) error {
 
 // Create boots one VM on spec.Network's slot. Any failure after the record is
 // written destroys every trace it created; once the VMM has been started, the
+
+// BootsHardened declares hardened guest support (HardenedBooter).
+func (d *FirecrackerDriver) BootsHardened() {}
+
+var _ HardenedBooter = (*FirecrackerDriver)(nil)
+
 // error also carries the head of its output (see fcStartup).
 func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if err := validAppleID(spec.ID); err != nil {
