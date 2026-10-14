@@ -32,8 +32,10 @@ const (
 	fcVolumeSyncTime = 5 * time.Second
 )
 
-// fcMkfs are the host mkfs.ext4 candidates; the first trusted one is used.
-var fcMkfs = []string{"/sbin/mkfs.ext4", "/usr/sbin/mkfs.ext4"}
+// fcMkfs are the host mke2fs candidates; the first trusted one is used.
+// mkfs.ext4 is usually a symlink to mke2fs, which TrustedFile refuses, and
+// /sbin a symlink to /usr/sbin on merged-/usr systems.
+var fcMkfs = []string{"/usr/sbin/mke2fs", "/sbin/mke2fs"}
 
 type fcVolume struct {
 	ID      string `json:"id"`
@@ -71,7 +73,7 @@ func (d *FirecrackerDriver) initVolumes() error {
 		untrusted = errors.Join(untrusted, err)
 	}
 	if d.mkfs == "" {
-		return fmt.Errorf("Firecracker volumes need a trusted mkfs.ext4: %w", untrusted)
+		return fmt.Errorf("Firecracker volumes need a trusted mke2fs: %w", untrusted)
 	}
 	if err := mkdirExact(cfg.VolumeDir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err

@@ -177,7 +177,7 @@ REFUSED = {
     "network, internet access, egress proxy": "the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted",
     "IAM": "IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd",
     "template build API": "templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served",
-    "volumes": "volumes are not supported: nothing outlives a sandbox",
+    "volumes": "volumes are served on the Linux Firecracker worker when the operator sets a volume budget, and only mounted in a sandbox; the volume content API answers 501, and the upstream tests mock E2B's API host and cannot reach sandboxd",
     "secrets": "secrets are not supported; pass values in `envVars`",
 }
 REFUSED_ALSO = (

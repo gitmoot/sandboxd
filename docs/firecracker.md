@@ -145,8 +145,9 @@ A create also needs free disk on the volume directory of
 
 Layout: the directory is 0700 root. Each volume is `<id>.ext4` and
 `<id>.json` (`{id, name, sizeMiB}`), both 0600 and owned by root while
-detached. The host formats the file with its own trusted `mkfs.ext4`
-(`/sbin` or `/usr/sbin`); the host never mounts a volume. Leftovers of a
+detached. The host formats the file as ext4 with its own trusted `mke2fs`
+(`/usr/sbin/mke2fs` or `/sbin/mke2fs`, a root-owned regular file, not a
+symlink); the host never mounts a volume. Leftovers of a
 crashed create (`*.ext4.tmp`, a record without its file) are removed at
 startup.
 
@@ -161,7 +162,9 @@ it cannot. The guest never formats it.
 Lifetime: `Destroy` of a running VM first asks the guest agent to sync the
 volume and remount it read-only (5 s, failures logged), then kills the VMM
 and gives the file back to root. The destroy after a lost firewall skips
-that step, so writes the guest had not synced can be lost there. A volume
+that step on purpose (the guest is cut off at once), so writes of the last
+few seconds the guest had not yet flushed (ext4 commits every 5 s) can be
+lost there; the volume's journal keeps it consistent. A volume
 survives its VM's end, a daemon restart or `kill -9` and that destroy;
 only `DELETE /volumes/{id}` removes it.
 

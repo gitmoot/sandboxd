@@ -51,8 +51,8 @@ const (
 // attached volume (the VM's third disk, /dev/vdc): "sandboxd.volume=/data".
 const VolumeArg = "sandboxd.volume="
 
-// volumePathChars matches vm.ValidMountPath's character set; the guest
-// re-checks the path it is given, as it cannot import the host package.
+// volumePathChars is the volume path character set (vm.ValidMountPath uses
+// this rule; the guest re-checks the path it is given).
 var volumePathChars = regexp.MustCompile(`^[a-zA-Z0-9._/-]{2,255}$`)
 
 // ValidVolumePath reports whether p may be a volume mount path: absolute,

@@ -3,9 +3,9 @@ package vm
 import (
 	"context"
 	"errors"
-	"path"
 	"regexp"
-	"strings"
+
+	"github.com/gitmoot/sandboxd/internal/guestagent"
 )
 
 // Volume errors. Drivers wrap them so callers can map them with errors.Is.
@@ -52,9 +52,8 @@ type Volumes interface {
 }
 
 var (
-	volumeName     = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
-	volumeID       = regexp.MustCompile(`^vol-[0-9a-f]{32}$`)
-	mountPathChars = regexp.MustCompile(`^[a-zA-Z0-9._/-]{2,255}$`)
+	volumeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`)
+	volumeID   = regexp.MustCompile(`^vol-[0-9a-f]{32}$`)
 )
 
 // ValidVolumeName reports whether name is an acceptable volume name.
@@ -65,7 +64,5 @@ func ValidVolumeID(id string) bool { return volumeID.MatchString(id) }
 
 // ValidMountPath reports whether p may be a guest mount path: absolute,
 // clean, not "/", and limited to characters that are safe in a kernel
-// command line and need no quoting.
-func ValidMountPath(p string) bool {
-	return mountPathChars.MatchString(p) && strings.HasPrefix(p, "/") && path.Clean(p) == p && p != "/"
-}
+// command line and need no quoting. The guest checks the same rule.
+func ValidMountPath(p string) bool { return guestagent.ValidVolumePath(p) }

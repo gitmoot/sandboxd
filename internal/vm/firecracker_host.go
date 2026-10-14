@@ -128,7 +128,7 @@ func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(
 // on the file itself; nothing is mounted on the host. The root directory
 // belongs to the guest user, as the guest's home disk does.
 func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error {
-	_, err := h.run(ctx, nil, mkfs, "-q", "-F", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "volume", path)
+	_, err := h.run(ctx, nil, mkfs, "-q", "-F", "-t", "ext4", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "volume", path)
 	return err
 }
 
