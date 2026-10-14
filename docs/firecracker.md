@@ -189,13 +189,16 @@ never places a sandbox with a volume on an enrolled worker.
 A create also needs free disk on the volume directory of
 `-fc-disk-floor-mib` plus the volume's size.
 
-Layout: the directory is 0700 root. Each volume is `<id>.ext4` and
+Layout: the directory is 0700 root (startup narrows a wider mode and refuses
+one owned by another user). Each volume is `<id>.ext4` and
 `<id>.json` (`{id, name, sizeMiB}`), both 0600 and owned by root while
 detached. The host formats the file as ext4 with its own trusted `mke2fs`
 (`/usr/sbin/mke2fs` or `/sbin/mke2fs`, a root-owned regular file, not a
 symlink); the host never mounts a volume. Leftovers of a
 crashed create (`*.ext4.tmp`, a record without its file) are removed at
-startup.
+startup. A detached disk still owned by a former VMM UID (a crash during
+release) goes back to root. A disk without its record never comes from
+sandboxd; it is logged and left for the operator.
 
 Isolation: a volume is attached to at most one VM. While attached, its
 file is owned by that VM's VMM UID and hard-linked into that VM's jail

@@ -778,8 +778,14 @@ func (s *Service) launch(ctx context.Context, row *store.Row, place placement) e
 		_ = s.setState(context.Background(), row.ID, "unknown")
 		// The driver alone knows every VM trace holding a volume; the client
 		// learns why, while the row is held exactly as for any failed start.
-		if errors.Is(err, vm.ErrVolumeInUse) {
+		switch {
+		case errors.Is(err, vm.ErrVolumeInUse):
 			return &refusal{http.StatusConflict, "volume is attached to another sandbox"}
+		case errors.Is(err, vm.ErrVolumeNotFound):
+			// Deleted between the name lookup and Create.
+			return &refusal{http.StatusNotFound, "volume not found"}
+		case errors.Is(err, vm.ErrVolumeMountPath):
+			return &refusal{http.StatusBadRequest, "volume mount path not supported by this worker"}
 		}
 		return errLaunch
 	}

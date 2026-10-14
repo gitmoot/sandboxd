@@ -85,6 +85,16 @@ func (d *FirecrackerDriver) initVolumes() error {
 	if !dir.IsDir() {
 		return fmt.Errorf("Firecracker volume directory %s is not a directory", cfg.VolumeDir)
 	}
+	// Only this daemon may reach detached disks: a directory made by hand
+	// with a wider mode is narrowed, one owned by another user refused.
+	if owner := dir.Sys().(*syscall.Stat_t).Uid; int(owner) != os.Geteuid() {
+		return fmt.Errorf("Firecracker volume directory %s is owned by uid %d, not this daemon", cfg.VolumeDir, owner)
+	}
+	if dir.Mode().Perm() != 0o700 {
+		if err := os.Chmod(cfg.VolumeDir, 0o700); err != nil {
+			return err
+		}
+	}
 	root, err := os.Stat(cfg.Root)
 	if err != nil {
 		return err
@@ -105,6 +115,12 @@ func (d *FirecrackerDriver) initVolumes() error {
 			}
 			continue
 		}
+		if id, ok := strings.CutSuffix(name, ".ext4"); ok && ValidVolumeID(id) {
+			if err := d.settleDisk(id); err != nil {
+				return err
+			}
+			continue
+		}
 		id, ok := strings.CutSuffix(name, ".json")
 		if !ok || !ValidVolumeID(id) {
 			continue
@@ -118,6 +134,32 @@ func (d *FirecrackerDriver) initVolumes() error {
 		}
 	}
 	return fcSyncPath(cfg.VolumeDir)
+}
+
+// settleDisk handles one disk at startup. A disk without its record cannot
+// come from the driver's write order (record first on create, disk first on
+// delete), so it is someone else's file: it is reported, never removed. A
+// detached disk (one link) still owned by a former VMM UID, left by a crash
+// between jail removal and the release chown, goes back to root; a disk still
+// linked into a jail belongs to a VM that outlived the daemon and keeps its
+// owner.
+func (d *FirecrackerDriver) settleDisk(id string) error {
+	path := d.volumeDisk(id)
+	if _, err := os.Lstat(d.volumeRecord(id)); errors.Is(err, fs.ErrNotExist) {
+		log.Printf("firecracker: volume disk %s has no record; it is not used, remove it by hand if it is not needed", path)
+		return nil
+	} else if err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Nlink != 1 || stat.Uid == 0 && stat.Gid == 0 {
+		return nil
+	}
+	return d.host.Chown(path, 0, 0)
 }
 
 func (d *FirecrackerDriver) volumesOn() error {
