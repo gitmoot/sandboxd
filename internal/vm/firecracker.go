@@ -1026,7 +1026,7 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 	if guest != nil {
 		d.keepConsole(spec.ID, guest)
 	}
-	if err := d.waitAgent(ctx, spec.ID); err != nil {
+	if err := d.waitAgent(ctx, spec); err != nil {
 		return err
 	}
 	vm, found, err := d.lookup(spec.ID)
@@ -1043,7 +1043,10 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 }
 
 // waitAgent polls the guest agent until it answers or the VMM is gone.
-func (d *FirecrackerDriver) waitAgent(ctx context.Context, id string) error {
+// Once it answers, the guest must report every feature spec asks for: an
+// image whose agent predates a feature boots without it and says nothing.
+func (d *FirecrackerDriver) waitAgent(ctx context.Context, spec Spec) error {
+	id := spec.ID
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.BootTimeout)
 	defer cancel()
 	started := time.Now()
@@ -1051,10 +1054,11 @@ func (d *FirecrackerDriver) waitAgent(ctx context.Context, id string) error {
 	for {
 		conn, err := d.dialAgent(ctx, id)
 		if err == nil {
-			err = guestagent.Ping(ctx, conn)
+			var features []string
+			features, err = guestagent.Ping(ctx, conn)
 			_ = conn.Close()
 			if err == nil {
-				return nil
+				return missingFeatures(spec, features)
 			}
 		}
 		last = err
@@ -1070,6 +1074,20 @@ func (d *FirecrackerDriver) waitAgent(ctx context.Context, id string) error {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+}
+
+func missingFeatures(spec Spec, reported []string) error {
+	var missing []string
+	if spec.Hardened && !slices.Contains(reported, guestagent.FeatureHardened) {
+		missing = append(missing, guestagent.FeatureHardened)
+	}
+	if spec.Volume != nil && !slices.Contains(reported, guestagent.FeatureVolume) {
+		missing = append(missing, guestagent.FeatureVolume)
+	}
+	if len(missing) != 0 {
+		return fmt.Errorf("%w: image %s did not apply %s", ErrImageTooOld, spec.Image, strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func (d *FirecrackerDriver) dialAgent(ctx context.Context, id string) (net.Conn, error) {

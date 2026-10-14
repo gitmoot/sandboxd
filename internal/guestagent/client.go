@@ -58,20 +58,21 @@ func readResult(conn io.Reader) (Result, error) {
 	return result, nil
 }
 
-// Ping confirms the agent is serving.
-func Ping(ctx context.Context, conn io.ReadWriteCloser) error {
+// Ping confirms the agent is serving and returns the features its guest's
+// init applied (none from an agent older than features).
+func Ping(ctx context.Context, conn io.ReadWriteCloser) ([]string, error) {
 	defer closeOnCancel(ctx, conn)()
 	if err := WriteRequest(conn, Request{Op: OpPing}); err != nil {
-		return contextErr(ctx, err)
+		return nil, contextErr(ctx, err)
 	}
 	result, err := readResult(conn)
 	if err != nil {
-		return contextErr(ctx, err)
+		return nil, contextErr(ctx, err)
 	}
 	if result.Error != "" {
-		return errors.New(result.Error)
+		return nil, errors.New(result.Error)
 	}
-	return nil
+	return result.Features, nil
 }
 
 // OpenPort asks the agent to bridge conn to port on the guest loopback. On

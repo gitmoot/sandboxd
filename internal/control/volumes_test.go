@@ -318,6 +318,16 @@ func TestDriverVolumeInUseIsConflict(t *testing.T) {
 	wantFailure(t, "driver mount path", got, http.StatusBadRequest, "mount path not supported")
 }
 
+// A template image too old for the requested features is the operator's
+// to fix: a plain 500, never the 503 clients retry.
+func TestDriverImageTooOldIsNotRetryable(t *testing.T) {
+	s, driver, _ := openVolumes(t, 1)
+	createVolume(t, s, "data")
+	driver.createError = fmt.Errorf("create: %w", vm.ErrImageTooOld)
+	got := request(t, s, http.MethodPost, "/v2/sandboxes", mountBody([]map[string]string{{"name": "data", "path": "/home/user/data"}}))
+	wantFailure(t, "old image", got, http.StatusInternalServerError, "must rebuild")
+}
+
 // A volume deleted between the name lookup and Create is not found, as if
 // it had been gone at the lookup: never a 503.
 func TestDriverVolumeGoneIsNotFound(t *testing.T) {
