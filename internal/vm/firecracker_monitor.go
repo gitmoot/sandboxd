@@ -166,6 +166,10 @@ func (d *FirecrackerDriver) reportLost(cause error) {
 // row, each within fcEventsStable of the last start, are reported as a
 // loss. The table cannot be watched, so guests must not keep running.
 func (d *FirecrackerDriver) WatchFirewallEvents(ctx context.Context) {
+	// Once a loss is reported there is nothing left to watch: the
+	// subscription and its subprocess end with it.
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
 	check := make(chan struct{}, 1)
 	trigger := func() {
 		select {
@@ -190,6 +194,7 @@ func (d *FirecrackerDriver) WatchFirewallEvents(ctx context.Context) {
 			case errors.Is(err, errFirewallLost):
 				log.Printf("firecracker: host firewall changed (nftables event): %v", err)
 				d.reportLost(err)
+				stop()
 				return
 			default:
 				// An nft run that failed; the polls apply their own tolerance.

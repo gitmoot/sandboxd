@@ -52,6 +52,7 @@ type fakeFCHost struct {
 	// ends the subscription. subscriptions counts MonitorRuleset calls.
 	events        chan struct{}
 	subscriptions atomic.Int32
+	active        atomic.Int32 // MonitorRuleset calls still running
 	mu            sync.Mutex
 	t             *testing.T
 	free          uint64
@@ -180,6 +181,8 @@ func (h *fakeFCHost) FirewallState(context.Context) (string, error) {
 }
 func (h *fakeFCHost) MonitorRuleset(ctx context.Context, event func()) error {
 	h.subscriptions.Add(1)
+	h.active.Add(1)
+	defer h.active.Add(-1)
 	h.mu.Lock()
 	events := h.events
 	h.mu.Unlock()
@@ -1075,6 +1078,14 @@ func TestFirecrackerFirewallEvents(t *testing.T) {
 		t.Fatal("VM survived the firewall change event")
 	}
 	t.Logf("event to VM destroyed and loss reported: %v", time.Since(start))
+	// Nothing is left to watch: the subscription ends with the loss, and
+	// later events and stops neither block nor report again.
+	waitFor(t, func() bool { return host.active.Load() == 0 })
+	select {
+	case err := <-d.FirewallLost():
+		t.Fatalf("second loss reported: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
 }
 
 // A stopped subscription is restarted and its table re-checked; it counts
