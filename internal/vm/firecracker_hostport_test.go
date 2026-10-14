@@ -45,7 +45,7 @@ func TestFirecrackerRulesetGolden(t *testing.T) {
 		name string
 		port int
 	}{{"", 0}, {"-hostport-8443", 8443}} {
-		host := fcHostRuleset(2900000, 2901999, d4, d6, tc.port)
+		host := fcHostRuleset(fcHostTable, 2900000, 2901999, d4, d6, tc.port)
 		netns := fcNetnsRuleset(d4, tc.port)
 		checkGolden(t, "fc-host"+tc.name+".nft", host)
 		checkGolden(t, "fc-netns"+tc.name+".nft", netns)
@@ -55,7 +55,7 @@ func TestFirecrackerRulesetGolden(t *testing.T) {
 		// The exception is the only difference, and it is first in its chain.
 		hostRule := "\t\tmeta skuid 2901000-2901999 ip daddr 127.0.0.1 tcp dport 8443 accept\n"
 		netnsRule := "\t\tiifname \"sbxvm0\" oifname \"sbxsl0\" ip daddr 10.0.2.2 tcp dport 8443 accept\n"
-		if strings.Replace(host, hostRule, "", 1) != fcHostRuleset(2900000, 2901999, d4, d6, 0) ||
+		if strings.Replace(host, hostRule, "", 1) != fcHostRuleset(fcHostTable, 2900000, 2901999, d4, d6, 0) ||
 			!strings.Contains(host, "chain guest {\n"+hostRule) {
 			t.Errorf("host table with a host port is not the plain table plus %q first", hostRule)
 		}

@@ -237,7 +237,7 @@ func (d *FirecrackerDriver) ReapplyEgress(ctx context.Context) error {
 // for policy and confirms its readback.
 func (d *FirecrackerDriver) enforceEgress(ctx context.Context, id string, policy *EgressPolicy) error {
 	ruleset, marker := d.netnsRuleset(policy)
-	state, err := d.host.ReplaceNetnsFirewall(ctx, fcNetnsPrefix+id, ruleset)
+	state, err := d.host.ReplaceNetnsFirewall(ctx, d.names.netnsPrefix+id, ruleset)
 	if err != nil {
 		return err
 	}

@@ -22,6 +22,7 @@ type isolatedDriver interface {
 
 // firecrackerFlags configure the Linux/KVM worker (docs/firecracker.md).
 type firecrackerFlags struct {
+	instance                           *string
 	root, firecracker, jailer, kernel  *string
 	uidBase, homeDiskMiB, diskFloorMiB *int
 	hostPort                           *int
@@ -39,11 +40,13 @@ func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 	deny := &egress.PrefixFlags{}
 	flags.Var(deny, "fc-deny-cidr", "firecracker: repeatable extra guest egress deny prefix, e.g. a cloud provider's public metadata endpoint")
 	return firecrackerFlags{
-		root:         flags.String("fc-root", "/var/lib/sandboxd-fc", "firecracker: install and state directory; jails and records live under it"),
+		instance: flags.String("fc-instance", "", "firecracker: name of one of several instances on this host (lowercase, up to 12 characters); "+
+			"empty is the default instance. Each needs its own -fc-root, -fc-uid-base, -listen and -db"),
+		root:         flags.String("fc-root", vm.FirecrackerDefaultRoot, "firecracker: install and state directory; jails and records live under it"),
 		firecracker:  flags.String("fc-firecracker", "", "firecracker: Firecracker binary (default <fc-root>/bin/firecracker)"),
 		jailer:       flags.String("fc-jailer", "", "firecracker: jailer binary (default <fc-root>/bin/jailer)"),
 		kernel:       flags.String("fc-kernel", "", "firecracker: uncompressed guest kernel on the fc-root filesystem"),
-		uidBase:      flags.Int("fc-uid-base", 2900000, "firecracker: first host UID; slot i runs its VMM as base+i and its NAT as base+1000+i"),
+		uidBase:      flags.Int("fc-uid-base", vm.FirecrackerDefaultUIDBase, "firecracker: first host UID; slot i runs its VMM as base+i and its NAT as base+1000+i"),
 		homeDiskMiB:  flags.Int("fc-home-disk-mib", 10240, "firecracker: size of each VM's private writable /home/user disk"),
 		diskFloorMiB: flags.Int("fc-disk-floor-mib", 8192, "firecracker: refuse to create a VM unless this much disk stays free beyond its home disk"),
 		hostPort: flags.Int("fc-host-port", 0, "firecracker: the one host TCP port guests may reach, as 10.0.2.2:<port> = the host's 127.0.0.1:<port> "+

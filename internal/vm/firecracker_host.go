@@ -22,7 +22,7 @@ import (
 
 const (
 	fcCgroupRoot   = "/sys/fs/cgroup"
-	fcCgroupParent = "sbx-fc"
+	fcCgroupParent = "sbx-fc" // the default instance's; see fcInstanceNames
 	fcNetnsDir     = "/run/netns"
 	fcHostPath     = "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
 )
@@ -36,10 +36,13 @@ type fcTools struct {
 type linuxFCHost struct {
 	tools    fcTools
 	toolsErr error
+	// table and cgroupParent are the instance's host table and cgroup
+	// parent (fcInstanceNames).
+	table, cgroupParent string
 }
 
-func newLinuxFCHost() *linuxFCHost {
-	h := &linuxFCHost{}
+func newLinuxFCHost(names fcNames) *linuxFCHost {
+	h := &linuxFCHost{table: names.table, cgroupParent: names.cgroupParent}
 	find := func(name string) string {
 		for _, dir := range []string{"/usr/sbin", "/usr/bin", "/sbin", "/bin"} {
 			path := filepath.Join(dir, name)
@@ -134,7 +137,7 @@ func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error
 
 func (h *linuxFCHost) ApplyFirewall(ctx context.Context, ruleset string) error {
 	// One transaction: the table is replaced atomically, never absent.
-	script := "table inet " + fcHostTable + " {}\ndelete table inet " + fcHostTable + "\n" + ruleset
+	script := "table inet " + h.table + " {}\ndelete table inet " + h.table + "\n" + ruleset
 	_, err := h.run(ctx, []byte(script), h.tools.nft, "-f", "-")
 	return err
 }
@@ -146,10 +149,10 @@ func (h *linuxFCHost) FirewallState(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !strings.Contains("\n"+string(out), "\ntable inet "+fcHostTable+"\n") {
+	if !strings.Contains("\n"+string(out), "\ntable inet "+h.table+"\n") {
 		return "", nil
 	}
-	out, err = h.run(ctx, nil, h.tools.nft, "-s", "list", "table", "inet", fcHostTable)
+	out, err = h.run(ctx, nil, h.tools.nft, "-s", "list", "table", "inet", h.table)
 	return string(out), err
 }
 
@@ -158,26 +161,26 @@ func (h *linuxFCHost) RemoveFirewall(ctx context.Context) error {
 	if err != nil || state == "" {
 		return err
 	}
-	_, err = h.run(ctx, nil, h.tools.nft, "delete", "table", "inet", fcHostTable)
+	_, err = h.run(ctx, nil, h.tools.nft, "delete", "table", "inet", h.table)
 	return err
 }
 
-func cgroupPath(name string) string {
+func (h *linuxFCHost) cgroupPath(name string) string {
 	if name == "" {
-		return filepath.Join(fcCgroupRoot, fcCgroupParent)
+		return filepath.Join(fcCgroupRoot, h.cgroupParent)
 	}
-	return filepath.Join(fcCgroupRoot, fcCgroupParent, name)
+	return filepath.Join(fcCgroupRoot, h.cgroupParent, name)
 }
 
 func (h *linuxFCHost) EnsureCgroupParent() error {
-	if err := os.Mkdir(cgroupPath(""), 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err := os.Mkdir(h.cgroupPath(""), 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
 	}
-	return os.WriteFile(filepath.Join(cgroupPath(""), "cgroup.subtree_control"), []byte("+cpu +memory +pids"), 0)
+	return os.WriteFile(filepath.Join(h.cgroupPath(""), "cgroup.subtree_control"), []byte("+cpu +memory +pids"), 0)
 }
 
 func (h *linuxFCHost) RemoveCgroupParent() error {
-	err := unix.Rmdir(cgroupPath(""))
+	err := unix.Rmdir(h.cgroupPath(""))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -185,7 +188,7 @@ func (h *linuxFCHost) RemoveCgroupParent() error {
 }
 
 func (h *linuxFCHost) Cgroups() ([]string, error) {
-	entries, err := os.ReadDir(cgroupPath(""))
+	entries, err := os.ReadDir(h.cgroupPath(""))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
@@ -202,7 +205,7 @@ func (h *linuxFCHost) Cgroups() ([]string, error) {
 }
 
 func (h *linuxFCHost) CgroupPopulated(name string) (bool, error) {
-	data, err := os.ReadFile(filepath.Join(cgroupPath(name), "cgroup.events"))
+	data, err := os.ReadFile(filepath.Join(h.cgroupPath(name), "cgroup.events"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil
 	}
@@ -226,19 +229,19 @@ func readUint(path string) (uint64, error) {
 }
 
 func (h *linuxFCHost) CgroupStats(name string) (fcCgroupSample, error) {
-	cpu, err := readStatKey(filepath.Join(cgroupPath(name), "cpu.stat"), "usage_usec")
+	cpu, err := readStatKey(filepath.Join(h.cgroupPath(name), "cpu.stat"), "usage_usec")
 	if err != nil {
 		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no CPU usage: %w", name, err)
 	}
-	file, err := readStatKey(filepath.Join(cgroupPath(name), "memory.stat"), "file")
+	file, err := readStatKey(filepath.Join(h.cgroupPath(name), "memory.stat"), "file")
 	if err != nil {
 		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no page cache figure: %w", name, err)
 	}
-	memory, err := readUint(filepath.Join(cgroupPath(name), "memory.current"))
+	memory, err := readUint(filepath.Join(h.cgroupPath(name), "memory.current"))
 	if err != nil {
 		return fcCgroupSample{}, err
 	}
-	limit, err := readUint(filepath.Join(cgroupPath(name), "memory.max"))
+	limit, err := readUint(filepath.Join(h.cgroupPath(name), "memory.max"))
 	if err != nil {
 		return fcCgroupSample{}, fmt.Errorf("cgroup %s has no numeric memory limit: %w", name, err)
 	}
@@ -262,7 +265,7 @@ func readStatKey(path, key string) (uint64, error) {
 // KillCgroup kills every process in the cgroup, waits until it is empty and
 // removes it.
 func (h *linuxFCHost) KillCgroup(ctx context.Context, name string) error {
-	path := cgroupPath(name)
+	path := h.cgroupPath(name)
 	if err := os.WriteFile(filepath.Join(path, "cgroup.kill"), []byte("1"), 0); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
@@ -331,8 +334,8 @@ func (h *linuxFCHost) ReplaceNetnsFirewall(ctx context.Context, netns, ruleset s
 
 // startInCgroup starts c directly inside cgroup name (clone3 CLONE_INTO_CGROUP),
 // so it is never outside the cgroup that Destroy kills.
-func startInCgroup(c *exec.Cmd, name string) error {
-	dir, err := os.Open(cgroupPath(name))
+func (h *linuxFCHost) startInCgroup(c *exec.Cmd, name string) error {
+	dir, err := os.Open(h.cgroupPath(name))
 	if err != nil {
 		return err
 	}
@@ -346,8 +349,8 @@ func startInCgroup(c *exec.Cmd, name string) error {
 	return c.Start()
 }
 
-func writeCgroup(name, file, value string) error {
-	return os.WriteFile(filepath.Join(cgroupPath(name), file), []byte(value), 0)
+func (h *linuxFCHost) writeCgroup(name, file, value string) error {
+	return os.WriteFile(filepath.Join(h.cgroupPath(name), file), []byte(value), 0)
 }
 
 // CreateNetwork builds the VM's network namespace. A holder process, running
@@ -363,12 +366,12 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 	if err := os.MkdirAll(fcNetnsDir, 0o755); err != nil {
 		return err
 	}
-	if err := os.Mkdir(cgroupPath(network.Cgroup), 0o755); err != nil {
+	if err := os.Mkdir(h.cgroupPath(network.Cgroup), 0o755); err != nil {
 		return err
 	}
 	if err := errors.Join(
-		writeCgroup(network.Cgroup, "memory.max", strconv.Itoa(fcNetMemoryMax)),
-		writeCgroup(network.Cgroup, "pids.max", strconv.Itoa(fcNetPids)),
+		h.writeCgroup(network.Cgroup, "memory.max", strconv.Itoa(fcNetMemoryMax)),
+		h.writeCgroup(network.Cgroup, "pids.max", strconv.Itoa(fcNetPids)),
 	); err != nil {
 		return err
 	}
@@ -378,7 +381,7 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 		h.tools.unshare, "--user", "--map-root-user", "--net", "--", h.tools.sleep, "infinity")
 	holder.Env = []string{fcHostPath}
 	holder.Dir = "/"
-	if err := startInCgroup(holder, network.Cgroup); err != nil {
+	if err := h.startInCgroup(holder, network.Cgroup); err != nil {
 		return err
 	}
 	holderPID := holder.Process.Pid
@@ -447,7 +450,7 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 	slirp.Env = []string{fcHostPath}
 	slirp.Dir = "/"
 	slirp.ExtraFiles = []*os.File{readyWrite}
-	err = startInCgroup(slirp, network.Cgroup)
+	err = h.startInCgroup(slirp, network.Cgroup)
 	_ = readyWrite.Close()
 	if err != nil {
 		return err
