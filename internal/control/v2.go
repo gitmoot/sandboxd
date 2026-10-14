@@ -112,8 +112,9 @@ func absent(raw json.RawMessage) bool {
 }
 
 // unsupported names the first requested option sandboxd cannot honour yet.
-// volumeMounts are honoured only with volumes configured.
-func (request createV2Request) unsupported(volumes bool) string {
+// volumeMounts are honoured only with volumes configured; internet access
+// and network egress only with egress policies (egress.go validates them).
+func (request createV2Request) unsupported(volumes, egress bool) string {
 	switch {
 	case request.AutoPause != nil && *request.AutoPause:
 		return "autoPause (pause and resume) is not supported"
@@ -121,8 +122,10 @@ func (request createV2Request) unsupported(volumes bool) string {
 		return "autoResume is not supported"
 	case request.Secure != nil && !*request.Secure:
 		return "every sandbox requires its envd access token; secure=false is not supported"
-	case !absent(request.AllowInternetAccess), !absent(request.Network) && !privateTraffic(request.Network):
+	case !egress && (!absent(request.AllowInternetAccess) || !absent(request.Network) && !privateTraffic(request.Network)):
 		return "network and internet access options are not supported (guest ports are never public: only network.allowPublicTraffic=false is accepted)"
+	case egress && publicTraffic(request.Network):
+		return "public traffic is not supported: guest ports are never public (only network.allowPublicTraffic=false is accepted)"
 	case !absent(request.MCP):
 		return "MCP gateways are not supported"
 	case !absent(request.IAM):
@@ -150,7 +153,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid sandbox request body")
 		return
 	}
-	if reason := request.unsupported(s.volumes != nil); reason != "" {
+	if reason := request.unsupported(s.volumes != nil, s.egress != nil); reason != "" {
 		s.refuse(w, reason)
 		return
 	}
@@ -190,6 +193,13 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid metadata")
 		return
 	}
+	// Without egress policies unsupported refused every egress option, so
+	// createEgress sees only requests it may honour.
+	egress, err := createEgress(request.AllowInternetAccess, request.Network)
+	if err != nil {
+		s.fail(w, ProfileE2B, http.StatusBadRequest, err.Error())
+		return
+	}
 	mount, status, reason := s.volumeMount(r.Context(), request.VolumeMounts)
 	if status != 0 {
 		s.fail(w, ProfileE2B, status, reason)
@@ -206,7 +216,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	row := store.Row{ID: id, TokenHash: hash[:], Metadata: string(encoded), JobID: fence.job,
 		TemplateID: template.ID, Profile: string(ProfileE2B), Attempt: fence.attempt, Generation: fence.generation,
 		Fence: metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row, mount); err != nil {
+	if err := s.launch(r.Context(), &row, placement{volume: mount, egress: egress}); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			s.fail(w, ProfileE2B, refusal.status, refusal.message)

@@ -27,6 +27,10 @@ type Spec struct {
 	// Volume, when set, attaches a durable volume (Volumes) at a guest path;
 	// only Envd guests of a driver implementing Volumes accept it.
 	Volume *VolumeMount
+	// Egress, when set, is the sandbox's own public egress policy; only a
+	// driver implementing EgressPolicies enforces one, every other refuses
+	// it with ErrEgressUnsupported. Nil keeps the driver's default egress.
+	Egress *EgressPolicy
 }
 
 // EnvdPort is the port upstream envd listens on inside an e2b guest.

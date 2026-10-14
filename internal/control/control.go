@@ -65,6 +65,11 @@ type Config struct {
 	// local driver's durable volumes; nil refuses both (501) as unsupported.
 	// A sandbox with a volume runs only on the local worker.
 	Volumes vm.Volumes
+	// Egress, when set, accepts E2B's allow_internet_access and network
+	// allowOut/denyOut at create and serves PUT /sandboxes/{id}/network from
+	// the local driver's per-sandbox egress policies; nil refuses both (501)
+	// as unsupported. A sandbox with a policy runs only on the local worker.
+	Egress vm.EgressPolicies
 }
 
 // Remote is one enrolled worker reached through its own transport.
@@ -99,6 +104,8 @@ type Service struct {
 	signers   map[string]string
 	// volumes is Config.Volumes: nil when volumes are off.
 	volumes vm.Volumes
+	// egress is Config.Egress: nil when egress policies are off.
+	egress vm.EgressPolicies
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -114,6 +121,9 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	}
 	if cfg.Volumes != nil && driver == nil {
 		return nil, errors.New("volumes need a local driver: they are never placed on an enrolled worker")
+	}
+	if cfg.Egress != nil && driver == nil {
+		return nil, errors.New("egress policies need a local driver: they are never enforced by an enrolled worker")
 	}
 	extra := maps.Clone(cfg.Templates)
 	primaryID, primaryImage, localArch := "", "", ""
@@ -179,7 +189,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	}
 	s := &Service{ledger: ledger, cfg: cfg, templates: templates, tokenKey: slices.Clone(cfg.TokenSecret), workers: members, byID: make(map[string]*member, len(members)),
 		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{}),
-		signers: make(map[string]string), volumes: cfg.Volumes}
+		signers: make(map[string]string), volumes: cfg.Volumes, egress: cfg.Egress}
 	rows, err := ledger.Active(ctx)
 	if err != nil {
 		_ = ledger.Close()
@@ -420,6 +430,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		if rest, ok := strings.CutPrefix(path, "/sandboxes/"); ok {
 			id, action, _ := strings.Cut(rest, "/")
+			// With egress policies, network updates are served (egress.go);
+			// without, they stay refused below.
+			if s.egress != nil && action == "network" {
+				if r.Method != http.MethodPut {
+					w.Header().Set("Allow", http.MethodPut)
+					s.fail(w, ProfileE2B, http.StatusMethodNotAllowed, "method not allowed")
+					return
+				}
+				s.updateNetwork(w, r, id)
+				return
+			}
 			if reason := sandboxRefusal(action); reason != "" {
 				if !s.refusable(w, r, id) {
 					return
@@ -551,6 +572,10 @@ type sandbox struct {
 	EnvdVersion string            `json:"envdVersion"`
 	Metadata    map[string]string `json:"metadata"`
 	Domain      string            `json:"domain"`
+	// Set only by GET /sandboxes/{id} for an e2b sandbox whose driver
+	// enforces egress policies (egress.go); never listed.
+	AllowInternetAccess *bool              `json:"allowInternetAccess,omitempty"`
+	Network             *egressNetworkInfo `json:"network,omitempty"`
 }
 
 func (s *Service) describe(row store.Row) sandbox {
@@ -650,7 +675,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	row := store.Row{ID: "sandboxd-" + idBytes, TokenHash: hash[:], Metadata: string(metadata), JobID: owner.job,
 		TemplateID: template.ID, Profile: string(ProfileStrict), Attempt: owner.attempt, Generation: owner.generation,
 		Fence: request.Metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row, nil); err != nil {
+	if err := s.launch(r.Context(), &row, placement{}); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			apiError(w, refusal.status, refusal.message)
@@ -689,14 +714,14 @@ var errLaunch = errors.New("sandbox VM start failed or unproven")
 // launch schedules row onto a worker, starts its VM and marks it running.
 // It returns a *refusal for a request no worker can take, or another error
 // for an unavailable state (store.ErrLegacySlot included: a live pre-slot
-// row blocks admission until reconciliation proves it gone). A non-nil mount
-// attaches that volume and places the VM on the local worker only.
-func (s *Service) launch(ctx context.Context, row *store.Row, mount *vm.VolumeMount) error {
+// row blocks admission until reconciliation proves it gone). A local-only
+// placement (a volume, an egress policy) runs on the local worker only.
+func (s *Service) launch(ctx context.Context, row *store.Row, place placement) error {
 	reconcileCtx, cancel := context.WithTimeout(ctx, workerTimeout)
 	s.reconcileAll(reconcileCtx)
 	cancel()
 	s.mu.Lock()
-	m, spec, err := s.admit(ctx, row, mount)
+	m, spec, err := s.admit(ctx, row, place)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -905,12 +930,14 @@ func statusFor(err error) int {
 }
 
 func (s *Service) get(w http.ResponseWriter, r *http.Request, id string) {
-	row, _, err := s.live(r.Context(), id)
+	row, m, err := s.live(r.Context(), id)
 	if err != nil {
 		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
 		return
 	}
-	jsonResponse(w, http.StatusOK, s.describe(row))
+	described := s.describe(row)
+	s.describeEgress(r.Context(), row, m, &described)
+	jsonResponse(w, http.StatusOK, described)
 }
 
 func (s *Service) renew(w http.ResponseWriter, r *http.Request, id string) {

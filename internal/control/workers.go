@@ -384,11 +384,29 @@ func (s *Service) pushExpiry(ctx context.Context, m *member, id string) error {
 	return m.api.Expire(ctx, id, row.Ends)
 }
 
+// placement carries what a sandbox needs from the gateway's own host: a
+// volume lives there, and only the local driver enforces an egress policy.
+// A row with either goes to the local worker or nowhere.
+type placement struct {
+	volume *vm.VolumeMount
+	egress *vm.EgressPolicy
+}
+
+func (p placement) localOnly() bool { return p.volume != nil || p.egress != nil }
+
+// localOnlyWhat names the reason in refusals.
+func (p placement) localOnlyWhat() string {
+	if p.volume != nil {
+		return "a sandbox with a volume"
+	}
+	return "a sandbox with an egress policy"
+}
+
 // admit schedules row onto the online worker serving its template with the
 // most free capacity, and reserves a slot there under the worker's current
-// lease. A row with a volume mount goes to the local worker or nowhere: the
-// volume lives on the gateway's own host. Callers hold s.mu.
-func (s *Service) admit(ctx context.Context, row *store.Row, mount *vm.VolumeMount) (*member, vm.Spec, error) {
+// lease. A local-only placement goes to the local worker or nowhere.
+// Callers hold s.mu.
+func (s *Service) admit(ctx context.Context, row *store.Row, place placement) (*member, vm.Spec, error) {
 	rows, err := s.ledger.Active(ctx)
 	if err != nil {
 		return nil, vm.Spec{}, err
@@ -418,7 +436,7 @@ func (s *Service) admit(ctx context.Context, row *store.Row, mount *vm.VolumeMou
 	// enrolled has declared nothing, so it may yet serve the template.
 	known, mismatch := false, ""
 	for _, m := range s.workers {
-		if mount != nil && m != s.localMember {
+		if place.localOnly() && m != s.localMember {
 			continue
 		}
 		_, serves := m.serves[row.TemplateID]
@@ -432,11 +450,11 @@ func (s *Service) admit(ctx context.Context, row *store.Row, mount *vm.VolumeMou
 		}
 	}
 	if len(candidates) == 0 {
-		if mount != nil {
+		if place.localOnly() {
 			if local := s.localMember; local != nil && local.online && local.lease != 0 {
-				return nil, vm.Spec{}, &refusal{http.StatusConflict, "a sandbox with a volume runs only on the gateway's local worker, which does not serve template " + row.TemplateID}
+				return nil, vm.Spec{}, &refusal{http.StatusConflict, place.localOnlyWhat() + " runs only on the gateway's local worker, which does not serve template " + row.TemplateID}
 			}
-			return nil, vm.Spec{}, &refusal{http.StatusServiceUnavailable, "a sandbox with a volume runs only on the gateway's local worker, which is unavailable"}
+			return nil, vm.Spec{}, &refusal{http.StatusServiceUnavailable, place.localOnlyWhat() + " runs only on the gateway's local worker, which is unavailable"}
 		}
 		if !known && mismatch != "" {
 			return nil, vm.Spec{}, &refusal{http.StatusBadRequest, "no worker can run template " + row.TemplateID + "; " + mismatch}
@@ -465,7 +483,7 @@ func (s *Service) admit(ctx context.Context, row *store.Row, mount *vm.VolumeMou
 		}
 		row.Slot = slot
 		return c.m, vm.Spec{ID: row.ID, Image: row.Image, Network: slot, CPUs: row.CPUs, MemoryMiB: row.MemoryMiB,
-			Envd: rowProfile(row.Profile) == ProfileE2B, Volume: mount}, nil
+			Envd: rowProfile(row.Profile) == ProfileE2B, Volume: place.volume, Egress: place.egress}, nil
 	}
 	return nil, vm.Spec{}, &refusal{http.StatusConflict, "sandbox capacity exhausted: every compatible worker is full"}
 }

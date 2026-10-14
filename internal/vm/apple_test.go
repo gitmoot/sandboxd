@@ -288,3 +288,21 @@ func TestRequestEnvironmentOverridesTheImage(t *testing.T) {
 		t.Fatalf("executable path containing '=' did not run as itself: %q %v (argv %q)", out, err, argv)
 	}
 }
+
+// PF confines every Apple guest alike, so a per-sandbox egress policy is
+// refused before the CLI runs, never silently ignored.
+func TestAppleRefusesEgressPolicy(t *testing.T) {
+	cli, log := fakeAppleCLI(t, "[]", `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, &fakeGate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{ID: "sandboxd-new", Image: "example/image:arm64", Network: "sandboxd-internal", CPUs: 1, MemoryMiB: 512,
+		Egress: &EgressPolicy{AllowInternet: true}}
+	if _, err := d.Create(context.Background(), spec); !errors.Is(err, ErrEgressUnsupported) {
+		t.Fatalf("create with an egress policy: %v", err)
+	}
+	if calls, err := os.ReadFile(log); err == nil && len(calls) != 0 {
+		t.Fatalf("refused create ran the CLI: %s", calls)
+	}
+}

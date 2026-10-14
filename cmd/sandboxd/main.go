@@ -188,6 +188,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	images := control.Images(*image, registered.Templates)
 	var driver isolatedDriver
 	var volumes vm.Volumes
+	var egressPolicies vm.EgressPolicies
 	switch *driverName {
 	case "apple":
 		gate, err := firewall.NewClient(*pfSocket)
@@ -250,6 +251,12 @@ func run(ctx context.Context, args []string) (runErr error) {
 			}
 			log.Printf("Firecracker volumes on: %d MiB each, %d MiB in total", *fc.volumeMiB, *fc.volumeBudgetMiB)
 		}
+		// Every Firecracker guest can take an egress policy; a sandbox opts
+		// in by asking for one. Worker mode builds no control plane.
+		var ok bool
+		if egressPolicies, ok = firecracker.(vm.EgressPolicies); !ok {
+			return errors.New("this Firecracker driver enforces no egress policies")
+		}
 	}
 	var handler http.Handler
 	if workerMode {
@@ -266,7 +273,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
 	} else {
 		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Templates: templates, TokenSecret: tokenSecret, Workers: remotes,
-			Volumes: volumes}
+			Volumes: volumes, Egress: egressPolicies}
 		var local vm.Driver
 		if driver != nil {
 			local = driver

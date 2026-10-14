@@ -127,13 +127,18 @@ type FirecrackerDriver struct {
 	volumeMu sync.Mutex
 	// mkfs is the trusted host mke2fs, set when volumes are on.
 	mkfs string
+
+	// egressMu orders every egress update and record removal, so an update
+	// never rewrites the record of a VM that Destroy has just removed.
+	egressMu sync.Mutex
 }
 
 var (
-	_ Driver        = (*FirecrackerDriver)(nil)
-	_ ResourceMeter = (*FirecrackerDriver)(nil)
-	_ PortDialer    = (*FirecrackerDriver)(nil)
-	_ Volumes       = (*FirecrackerDriver)(nil)
+	_ Driver         = (*FirecrackerDriver)(nil)
+	_ ResourceMeter  = (*FirecrackerDriver)(nil)
+	_ PortDialer     = (*FirecrackerDriver)(nil)
+	_ Volumes        = (*FirecrackerDriver)(nil)
+	_ EgressPolicies = (*FirecrackerDriver)(nil)
 )
 
 // ErrDiskFloor reports that creating a VM would leave less free disk than the
@@ -165,6 +170,9 @@ type fcHost interface {
 	NetnsPath(name string) string
 	CreateNetwork(ctx context.Context, network fcNetwork) error
 	DeleteNetns(ctx context.Context, name string) error
+	// ReplaceNetnsFirewall atomically replaces the namespace's table with
+	// ruleset in one nft transaction and returns its `nft -s list` readback.
+	ReplaceNetnsFirewall(ctx context.Context, netns, ruleset string) (string, error)
 
 	// StartVMM runs the jailer with console as its and the VMM's stdout and
 	// stderr, the guest serial console.
@@ -185,7 +193,8 @@ type fcCgroupSample struct {
 // namespace of NetUID, the VMM's tap (owned by VMMUID), the namespace's own
 // nftables table, and slirp4netns running as NetUID in Cgroup. A nonzero
 // HostPort enables slirp4netns's host loopback, and the namespace table must
-// then list exactly fcNetnsHostPortRule(HostPort) or the network fails.
+// then list exactly fcNetnsHostPortRule(HostPort) or the network fails. A
+// nonempty Marker (an egress policy table's) must read back too.
 type fcNetwork struct {
 	Netns    string
 	Cgroup   string
@@ -193,6 +202,7 @@ type fcNetwork struct {
 	VMMUID   int
 	Ruleset  string
 	HostPort int
+	Marker   string
 }
 
 // fcMeta is the ownership record of one VM, written before any host state
@@ -214,6 +224,9 @@ type fcMeta struct {
 	Volume     string `json:"volume,omitempty"`
 	VolumePath string `json:"volumePath,omitempty"`
 	VolumeMiB  int    `json:"volumeMiB,omitempty"`
+	// Egress is the VM's egress policy (Spec.Egress, then UpdateEgress);
+	// nil for a VM created without one, whose table is fcNetnsRuleset.
+	Egress *EgressPolicy `json:"egress,omitempty"`
 }
 
 func cleanAbs(path string) bool {
@@ -463,15 +476,22 @@ func fcCheckHostPortState(state string, netLow, netHigh, hostPort int) error {
 
 // fcCheckNetnsHostPortState requires a namespace table's readback to name
 // the NAT's host alias, or any port, only in the host port exception, and
-// to hold that exception exactly when one is configured.
+// to hold that exception exactly when one is configured. Set elements are
+// not rules: an egress policy may list the alias (always denied first).
 func fcCheckNetnsHostPortState(state string, hostPort int) error {
 	want := ""
 	if hostPort != 0 {
 		want = fcNetnsHostPortRule(hostPort)
 	}
-	found := false
+	found, inSet := false, false
 	for line := range strings.Lines(state) {
 		line = strings.TrimSpace(line)
+		// nft prints a set's last element and its closing brace on one
+		// line, so a lone brace ends the set block.
+		if inSet || strings.HasPrefix(line, "set ") && strings.HasSuffix(line, "{") {
+			inSet = line != "}"
+			continue
+		}
 		if !strings.Contains(line, fcHostAlias) && !strings.Contains(line, "dport") {
 			continue
 		}
@@ -578,6 +598,9 @@ func (d *FirecrackerDriver) readMeta(id string) (*fcMeta, error) {
 	}
 	if meta.Volume != "" && (!ValidVolumeID(meta.Volume) || !cleanAbs(meta.VolumePath) ||
 		filepath.Base(meta.VolumePath) != meta.Volume+".ext4" || meta.VolumeMiB < 1) {
+		return nil, nil
+	}
+	if meta.Egress != nil && validEgress(*meta.Egress) != nil {
 		return nil, nil
 	}
 	slot := slices.Index(d.cfg.Slots, meta.Slot)
@@ -895,6 +918,10 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	if err := d.checkVolumeSpec(spec); err != nil {
 		return Instance{}, err
 	}
+	egress, err := d.checkEgressSpec(spec)
+	if err != nil {
+		return Instance{}, err
+	}
 	if err := d.Ready(ctx); err != nil {
 		return Instance{}, fmt.Errorf("firewall is not armed before guest start: %w", err)
 	}
@@ -922,7 +949,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	}
 	meta := fcMeta{
 		ID: spec.ID, Slot: spec.Network, VMMUID: d.cfg.UIDBase + slot, NetUID: d.cfg.UIDBase + fcUIDStride + slot,
-		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd,
+		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Egress: egress,
 	}
 	if err := d.writeRecord(spec, &meta); err != nil {
 		return Instance{}, err
@@ -942,10 +969,11 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
+	ruleset, marker := d.netnsRuleset(meta.Egress)
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: fcNetnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
-		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: fcNetnsRuleset(d.deny4, d.cfg.HostPort),
-		HostPort: d.cfg.HostPort,
+		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: ruleset,
+		HostPort: d.cfg.HostPort, Marker: marker,
 	}); err != nil {
 		return err
 	}
@@ -1292,7 +1320,11 @@ func (d *FirecrackerDriver) destroy(ctx context.Context, id string, syncVolume b
 	if err := d.releaseVolume(vm.meta); err != nil {
 		return err
 	}
-	if err := os.Remove(d.metaPath(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	// Under egressMu: an egress update in flight writes the record first.
+	d.egressMu.Lock()
+	err = os.Remove(d.metaPath(id))
+	d.egressMu.Unlock()
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	if _, still, err := d.lookup(id); err != nil || still {

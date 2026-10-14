@@ -326,6 +326,10 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 	if err := validAppleID(spec.ID); err != nil {
 		return Instance{}, err
 	}
+	if spec.Egress != nil {
+		// PF guards every guest alike; a policy is refused, never ignored.
+		return Instance{}, fmt.Errorf("apple: %w", ErrEgressUnsupported)
+	}
 	if spec.Envd {
 		// The e2b guest (images/e2b-arm64) and its exec-stdio envd channel
 		// are not wired into the Apple driver yet.

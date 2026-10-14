@@ -42,6 +42,7 @@ provider on a Firecracker host.
 | `envVars`, `user="root"` inside the VM | ✅ | ❌ |
 | Gitmoot's pinned client (create, upload, start, delete) | ✅ | ✅ |
 | Internet egress; private ranges and the host blocked | ✅ | ✅ |
+| Per-sandbox egress policy (`allow_internet_access`, `allowOut`/`denyOut`, network update) | ✅ | ❌ |
 | One gateway scheduling onto several enrolled workers | ✅ | ✅ |
 
 The Linux column comes from two sources:
@@ -89,9 +90,15 @@ route by route.
 - **Template builds through the API.** Templates are built with the scripts
   in [`images/`](images) and registered by the operator with
   `-register-template`.
-- **Secrets, IAM, MCP gateways, network policy updates and public guest
-  ports.** Refused with a `501`
+- **Secrets, IAM, MCP gateways, egress proxies, per-host network rules and
+  public guest ports.** Refused with a `501` or `400`
   ([full list](docs/compatibility.md#not-supported)).
+- **Egress policies on the Mac, on enrolled workers, or by hostname.** A
+  Firecracker gateway enforces IPv4 `allowOut`/`denyOut` and
+  `allow_internet_access` on its local worker
+  ([egress policies](docs/compatibility.md#egress-policies)); everywhere
+  else they are refused (`501` without a Firecracker gateway), never
+  ignored.
 - **Volumes on the Mac, on enrolled workers, or through the volume content
   API.** Volumes are off by default; a Firecracker gateway serves them with
   `-fc-volume-budget-mib` ([volumes](docs/compatibility.md#volumes)).
@@ -114,7 +121,9 @@ route by route.
   local service) and other guests are blocked; guest IPv6 is blocked too.
   Linux enforces this with nftables and a per-VM user-mode NAT, the Mac
   with a root PF helper. sandboxd runs no guest work until the rules are in
-  place, and stops if a later check fails.
+  place, and stops if a later check fails. On Linux an `e2b` sandbox can
+  narrow its own egress further (no internet, IPv4 allow/deny lists), never
+  widen it past these blocks.
 - **Root inside an `e2b` guest owns only that VM.** The SDK's
   `user="root"` is allowed; the boundary is the VM.
 - **One API key, one operator.** `X-API-Key` gives full control of every
@@ -411,7 +420,7 @@ have the full provider setup.
 
 ## Roadmap
 
-- Tenants, quotas and egress policy
+- Tenants and quotas
   ([#27](https://github.com/gitmoot/sandboxd/issues/27)).
 - The upstream envd data plane on the Mac, so the stock SDKs work there
   ([#38](https://github.com/gitmoot/sandboxd/issues/38)).

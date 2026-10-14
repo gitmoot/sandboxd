@@ -86,6 +86,12 @@ type fakeFCHost struct {
 	// FormatVolume target.
 	owners    map[string]int
 	formatted []string
+	// tables is the last ruleset each namespace's table was replaced with;
+	// failReplace fails the next replacements, and readback, when set,
+	// is what the replaced table reads back as.
+	tables      map[string]string
+	failReplace int
+	readback    func(ruleset string) string
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
@@ -242,6 +248,26 @@ func (h *fakeFCHost) DeleteNetns(_ context.Context, name string) error {
 	defer h.mu.Unlock()
 	delete(h.netns, name)
 	return nil
+}
+func (h *fakeFCHost) ReplaceNetnsFirewall(_ context.Context, netns, ruleset string) (string, error) {
+	h.record("netns firewall " + netns)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.netns[netns] {
+		return "", fmt.Errorf("no namespace %q", netns)
+	}
+	if h.failReplace > 0 {
+		h.failReplace--
+		return "", errors.New("nft failed")
+	}
+	if h.tables == nil {
+		h.tables = map[string]string{}
+	}
+	h.tables[netns] = ruleset
+	if h.readback != nil {
+		return h.readback(ruleset), nil
+	}
+	return ruleset, nil
 }
 
 func argAfter(args []string, flag string) string {
