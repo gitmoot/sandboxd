@@ -330,6 +330,10 @@ func (d *AppleDriver) Create(ctx context.Context, spec Spec) (Instance, error) {
 		// PF guards every guest alike; a policy is refused, never ignored.
 		return Instance{}, fmt.Errorf("apple: %w", ErrEgressUnsupported)
 	}
+	if spec.Hardened {
+		// Hardening is a Firecracker guest init; refused, never ignored.
+		return Instance{}, fmt.Errorf("apple: %w", ErrHardenedUnsupported)
+	}
 	if spec.Envd {
 		// The e2b guest (images/e2b-arm64) and its exec-stdio envd channel
 		// are not wired into the Apple driver yet.

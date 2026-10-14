@@ -172,6 +172,20 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	if templates.e2b && len(cfg.TokenSecret) < 32 {
 		return nil, errNoTokenSecret
 	}
+	// Hardening is the Firecracker guest init: only the local worker, with
+	// an image for the template, can honour it. Refuse it at startup rather
+	// than every create.
+	for _, id := range slices.Sorted(maps.Keys(templates.byID)) {
+		if !templates.byID[id].Hardened {
+			continue
+		}
+		switch {
+		case driver == nil || templates.byID[id].Image == "":
+			return nil, fmt.Errorf("hardened template %q needs an image for the local worker: it never runs on an enrolled worker", id)
+		case cfg.DriverName == "apple" || cfg.DriverName == "devvm":
+			return nil, fmt.Errorf("hardened template %q needs the firecracker driver; the %s driver cannot boot hardened guests", id, cfg.DriverName)
+		}
+	}
 	for _, remote := range cfg.Workers {
 		if remote.Member == nil || !validWorkerID(remote.ID) {
 			return nil, fmt.Errorf("invalid enrolled worker %q", remote.ID)

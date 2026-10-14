@@ -79,6 +79,22 @@ func VolumePath(cmdline string) (string, error) {
 	return found, nil
 }
 
+// HardenedArg is the kernel argument of a hardened e2b guest (vm.Spec.Hardened):
+// the image stays the read-only, nosuid root and only HardenedHome and bounded
+// tmpfs mounts are writable.
+const HardenedArg = "sandboxd.hardened=1"
+
+// HardenedHome is a hardened guest's writable per-VM disk, the guest user's
+// home.
+const HardenedHome = "/home/user"
+
+// ValidHardenedVolumePath reports whether p may be a hardened guest's volume
+// path: a valid volume path strictly below HardenedHome, the only place its
+// read-only root lets the guest create a mount point.
+func ValidHardenedVolumePath(p string) bool {
+	return ValidVolumePath(p) && strings.HasPrefix(p, HardenedHome+"/")
+}
+
 const (
 	FrameStarted byte = 'S'
 	FrameStdout  byte = 'O'

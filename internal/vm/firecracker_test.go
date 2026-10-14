@@ -1402,7 +1402,7 @@ func TestFirecrackerVolumeAttach(t *testing.T) {
 	if err != nil || json.Unmarshal(data, &config) != nil {
 		t.Fatalf("vm.json: %v %s", err, data)
 	}
-	if want := d.bootArgs(true, "") + " sandboxd.volume=/data"; config.Boot.Args != want {
+	if want := d.bootArgs(Spec{Envd: true}) + " sandboxd.volume=/data"; config.Boot.Args != want {
 		t.Fatalf("boot args = %q, want %q", config.Boot.Args, want)
 	}
 	if len(config.Drives) != 3 || len(config.Drives[0]) != 4 || len(config.Drives[1]) != 4 ||
@@ -1493,5 +1493,58 @@ func TestFirecrackerVolumeConcurrentAttach(t *testing.T) {
 	first, second := <-errs, <-errs
 	if (first == nil) == (second == nil) || !errors.Is(errors.Join(first, second), ErrVolumeInUse) {
 		t.Fatalf("concurrent attach: %v, %v", first, second)
+	}
+}
+
+// Boot arguments are pinned: a VM without hardening boots exactly as before
+// it existed, and only a hardened e2b guest gets sandboxd.hardened=1.
+func TestFirecrackerBootArgs(t *testing.T) {
+	d, _, _ := newTestFirecracker(t)
+	const base = "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd " +
+		"random.trust_cpu=on quiet init=/sbin/sandboxd-agent ip=10.200.0.2::10.200.0.1:255.255.255.252:sandbox:eth0:off"
+	for _, c := range []struct {
+		spec Spec
+		want string
+	}{
+		{Spec{}, base},
+		{Spec{Envd: true}, base + " sandboxd.envd=1"},
+		{Spec{Envd: true, Volume: &VolumeMount{Path: "/data"}}, base + " sandboxd.envd=1 sandboxd.volume=/data"},
+		{Spec{Envd: true, Hardened: true}, base + " sandboxd.envd=1 sandboxd.hardened=1"},
+		{Spec{Envd: true, Hardened: true, Volume: &VolumeMount{Path: "/home/user/data"}},
+			base + " sandboxd.envd=1 sandboxd.hardened=1 sandboxd.volume=/home/user/data"},
+	} {
+		if got := d.bootArgs(c.spec); got != c.want {
+			t.Errorf("bootArgs(%+v) = %q, want %q", c.spec, got, c.want)
+		}
+	}
+}
+
+// A hardened guest boots with its kernel argument and is recorded as such;
+// hardening a strict guest, or a volume path its read-only root cannot
+// hold, is refused before any host state exists.
+func TestFirecrackerHardened(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	for name, spec := range map[string]Spec{
+		"strict guest": {ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Hardened: true},
+		"volume outside home": {ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true, Hardened: true,
+			Volume: &VolumeMount{ID: "vol-" + strings.Repeat("a", 32), Path: "/data"}},
+		"volume at home": {ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true, Hardened: true,
+			Volume: &VolumeMount{ID: "vol-" + strings.Repeat("a", 32), Path: "/home/user"}},
+	} {
+		if _, err := d.Create(ctx, spec); err == nil {
+			t.Fatalf("%s: created", name)
+		}
+		assertNoTraces(t, d, host)
+	}
+	if _, err := d.Create(ctx, Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true, Hardened: true}); err != nil {
+		t.Fatal(err)
+	}
+	config, err := os.ReadFile(filepath.Join(d.chroot(fcTestID), "vm.json"))
+	if err != nil || !strings.Contains(string(config), " sandboxd.envd=1 sandboxd.hardened=1\"") {
+		t.Fatalf("vm.json: %v %s", err, config)
+	}
+	if meta, err := d.readMeta(fcTestID); err != nil || !meta.Hardened || !meta.Envd {
+		t.Fatalf("record = %+v, %v", meta, err)
 	}
 }

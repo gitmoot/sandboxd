@@ -306,3 +306,21 @@ func TestAppleRefusesEgressPolicy(t *testing.T) {
 		t.Fatalf("refused create ran the CLI: %s", calls)
 	}
 }
+
+// Hardening is a Firecracker guest init: the Apple driver refuses it before
+// the CLI runs, never booting the guest without it.
+func TestAppleRefusesHardened(t *testing.T) {
+	cli, log := fakeAppleCLI(t, "[]", `[{"id":"sandboxd-internal","configuration":{"mode":"hostOnly","labels":{"gitmoot.sandboxd.network":"apple-v1"}}}]`)
+	d, err := NewAppleDriver(cli, []string{"example/image:arm64"}, []string{"sandboxd-internal"}, "mac-local", testPinImage, &fakeGate{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := Spec{ID: "sandboxd-new", Image: "example/image:arm64", Network: "sandboxd-internal", CPUs: 1, MemoryMiB: 512,
+		Envd: true, Hardened: true}
+	if _, err := d.Create(context.Background(), spec); !errors.Is(err, ErrHardenedUnsupported) {
+		t.Fatalf("create of a hardened guest: %v", err)
+	}
+	if calls, err := os.ReadFile(log); err == nil && len(calls) != 0 {
+		t.Fatalf("refused create ran the CLI: %s", calls)
+	}
+}

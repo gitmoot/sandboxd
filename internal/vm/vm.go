@@ -24,6 +24,11 @@ type Spec struct {
 	// its entrypoint, reached only through PortDialer. Unset, the guest is
 	// the gitmoot-strict guest the driver has always started.
 	Envd bool
+	// Hardened boots an Envd guest whose system disk stays read-only and
+	// nosuid (no writable overlay root): only its home, a volume below it
+	// and bounded tmpfs mounts are writable. Only Envd specs take it, and a
+	// driver that cannot honour it refuses it.
+	Hardened bool
 	// Volume, when set, attaches a durable volume (Volumes) at a guest path;
 	// only Envd guests of a driver implementing Volumes accept it.
 	Volume *VolumeMount
@@ -53,6 +58,10 @@ func ValidPort(port int) bool {
 
 // ErrNoEnvd reports a driver or worker that cannot run envd guests.
 var ErrNoEnvd = errors.New("this VM driver does not run envd (e2b-profile) guests")
+
+// ErrHardenedUnsupported refuses a Spec.Hardened on a driver or worker that
+// cannot boot a hardened guest: hardening is never silently dropped.
+var ErrHardenedUnsupported = errors.New("hardened guests are not supported by this worker")
 
 // Instance is a positive observation of a VM owned by this driver. Network is
 // its only attached network, or "" when it is not attached to exactly one.

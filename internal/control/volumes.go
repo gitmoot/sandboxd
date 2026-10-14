@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/gitmoot/sandboxd/internal/guestagent"
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
@@ -162,7 +163,9 @@ type volumeMountRequest struct {
 // volumeMount resolves createV2's volumeMounts to the one mount the VM
 // gets, or nil for none. A nonzero status refuses the request before any
 // slot is reserved. Callers have refused volumeMounts unless volumes are on.
-func (s *Service) volumeMount(ctx context.Context, raw json.RawMessage) (*vm.VolumeMount, int, string) {
+// A hardened guest's root is read-only, so its mount point must lie below
+// its writable home.
+func (s *Service) volumeMount(ctx context.Context, raw json.RawMessage, hardened bool) (*vm.VolumeMount, int, string) {
 	if absent(raw) {
 		return nil, 0, ""
 	}
@@ -181,6 +184,9 @@ func (s *Service) volumeMount(ctx context.Context, raw json.RawMessage) (*vm.Vol
 	requested := mounts[0]
 	if !vm.ValidMountPath(requested.Path) {
 		return nil, http.StatusBadRequest, fmt.Sprintf("invalid volume mount path %q: an absolute, clean path other than / of letters, digits and ._/-", requested.Path)
+	}
+	if hardened && !vm.ValidHardenedMountPath(requested.Path) {
+		return nil, http.StatusBadRequest, fmt.Sprintf("invalid volume mount path %q: a hardened template's system disk is read-only, so volumes mount only below %s", requested.Path, guestagent.HardenedHome)
 	}
 	if !vm.ValidVolumeName(requested.Name) {
 		return nil, http.StatusBadRequest, fmt.Sprintf("invalid volume name %q", requested.Name)

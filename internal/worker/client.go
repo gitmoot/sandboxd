@@ -147,8 +147,8 @@ func (c *Client) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 // CreateUntil creates a VM that the worker destroys on its own at ends,
 // capped by the worker's max TTL.
 //
-// A spec with a volume is refused before anything is sent: volumes live on
-// the gateway's own host, and the wire protocol has no way to carry one.
+// A spec with a volume, an egress policy or hardening is refused before
+// anything is sent: the wire protocol has no way to carry them.
 func (c *Client) CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) (vm.Instance, error) {
 	if spec.Volume != nil {
 		return vm.Instance{}, fmt.Errorf("worker %s: create %s: volumes are never placed on an enrolled worker", c.id, spec.ID)
@@ -156,6 +156,10 @@ func (c *Client) CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) 
 	if spec.Egress != nil {
 		// The worker API carries no policy; sending the rest would ignore it.
 		return vm.Instance{}, fmt.Errorf("worker %s: create %s: %w", c.id, spec.ID, vm.ErrEgressUnsupported)
+	}
+	if spec.Hardened {
+		// Nor does it carry hardening; the worker would boot a writable root.
+		return vm.Instance{}, fmt.Errorf("worker %s: create %s: %w", c.id, spec.ID, vm.ErrHardenedUnsupported)
 	}
 	body, err := json.Marshal(createRequest{ID: spec.ID, Image: spec.Image, Network: spec.Network, CPUs: spec.CPUs,
 		MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Ends: ends.UTC()})

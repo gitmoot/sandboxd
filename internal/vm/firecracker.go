@@ -217,6 +217,8 @@ type fcMeta struct {
 	MemoryMiB int    `json:"memoryMiB"`
 	// Envd marks an e2b guest (Spec.Envd); only those serve DialPort.
 	Envd bool `json:"envd,omitempty"`
+	// Hardened marks a hardened e2b guest (Spec.Hardened).
+	Hardened bool `json:"hardened,omitempty"`
 	// Volume is the attached volume's ID, VolumePath its ext4 file on the
 	// host and VolumeMiB its size. The record holds the volume until it is
 	// removed, and lets Destroy return the file to root whatever the
@@ -757,17 +759,20 @@ func (d *FirecrackerDriver) List(ctx context.Context) ([]Instance, error) {
 // overlay root and upstream envd (cmd/sandboxd-guest-agent).
 const fcEnvdBootArg = "sandboxd.envd=1"
 
-// bootArgs names an attached volume's guest path only when there is one, so
-// a VM without a volume boots exactly as before volumes existed.
-func (d *FirecrackerDriver) bootArgs(envd bool, volumePath string) string {
+// bootArgs names hardening and an attached volume's guest path only when the
+// spec asks for them, so any other VM boots exactly as before they existed.
+func (d *FirecrackerDriver) bootArgs(spec Spec) string {
 	args := "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd " +
 		"random.trust_cpu=on quiet init=/sbin/sandboxd-agent " +
 		"ip=" + fcGuestAddr + "::" + fcGatewayAddr + ":255.255.255.252:sandbox:eth0:off"
-	if envd {
+	if spec.Envd {
 		args += " " + fcEnvdBootArg
 	}
-	if volumePath != "" {
-		args += " " + guestagent.VolumeArg + volumePath
+	if spec.Hardened {
+		args += " " + guestagent.HardenedArg
+	}
+	if spec.Volume != nil {
+		args += " " + guestagent.VolumeArg + spec.Volume.Path
 	}
 	return args
 }
@@ -786,13 +791,11 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 		{ID: "rootfs", Path: "/rootfs.ext4", Root: true, ReadOnly: true},
 		{ID: "home", Path: "/home.ext4"},
 	}
-	volumePath := ""
 	if spec.Volume != nil {
-		volumePath = spec.Volume.Path
 		drives = append(drives, drive{ID: fcVolumeDrive, Path: fcVolumeFile, Cache: "Writeback"})
 	}
 	return json.MarshalIndent(map[string]any{
-		"boot-source":    map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec.Envd, volumePath)},
+		"boot-source":    map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec)},
 		"drives":         drives,
 		"machine-config": map[string]any{"vcpu_count": spec.CPUs, "mem_size_mib": spec.MemoryMiB, "smt": false},
 		"network-interfaces": []map[string]any{
@@ -915,6 +918,14 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	if spec.CPUs < 1 || spec.CPUs > fcMaxCPUs || spec.MemoryMiB < fcMinMemoryMiB || spec.MemoryMiB > fcMaxMemoryMiB {
 		return Instance{}, errors.New("Firecracker VM shape out of range")
 	}
+	// The hardened guest init exists only in the e2b path, and its root is
+	// read-only, so a volume needs a mount point below the writable home.
+	if spec.Hardened && !spec.Envd {
+		return Instance{}, errors.New("only e2b guests can be hardened")
+	}
+	if spec.Hardened && spec.Volume != nil && !ValidHardenedMountPath(spec.Volume.Path) {
+		return Instance{}, fmt.Errorf("a hardened guest mounts a volume only below %s, not at %q", guestagent.HardenedHome, spec.Volume.Path)
+	}
 	if err := d.checkVolumeSpec(spec); err != nil {
 		return Instance{}, err
 	}
@@ -949,7 +960,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	}
 	meta := fcMeta{
 		ID: spec.ID, Slot: spec.Network, VMMUID: d.cfg.UIDBase + slot, NetUID: d.cfg.UIDBase + fcUIDStride + slot,
-		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Egress: egress,
+		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Hardened: spec.Hardened, Egress: egress,
 	}
 	if err := d.writeRecord(spec, &meta); err != nil {
 		return Instance{}, err

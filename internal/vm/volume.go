@@ -66,3 +66,8 @@ func ValidVolumeID(id string) bool { return volumeID.MatchString(id) }
 // clean, not "/", and limited to characters that are safe in a kernel
 // command line and need no quoting. The guest checks the same rule.
 func ValidMountPath(p string) bool { return guestagent.ValidVolumePath(p) }
+
+// ValidHardenedMountPath reports whether p may be a hardened guest's mount
+// path (Spec.Hardened): a valid mount path strictly below its writable home,
+// since its root is read-only. The guest checks the same rule.
+func ValidHardenedMountPath(p string) bool { return guestagent.ValidHardenedVolumePath(p) }

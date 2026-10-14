@@ -50,6 +50,10 @@ type Template struct {
 	// EnvdVersion is the semantic version e2b-profile sandboxes report; the
 	// SDKs gate features on it. Strict templates leave it empty.
 	EnvdVersion string
+	// Hardened gives e2b sandboxes a read-only, nosuid system disk (only the
+	// home, a volume below it and bounded tmpfs mounts stay writable). Such
+	// sandboxes run on the local Firecracker worker only. e2b templates only.
+	Hardened bool
 	// Ports are the guest TCP ports (never envd's) clients may reach through
 	// the gateway, with the sandbox's traffic or envd access token. No other
 	// guest port is reachable. e2b templates only.
@@ -157,6 +161,10 @@ func (t Template) validate(id string) error {
 		if len(t.Ports) > 0 || t.StartCmd != "" || t.ReadyCmd != "" {
 			return fmt.Errorf("gitmoot-strict template %q cannot expose ports or run start/ready commands", id)
 		}
+		// The strict guest is always read-only; hardening is an e2b guest init.
+		if t.Hardened {
+			return fmt.Errorf("gitmoot-strict template %q cannot be hardened: hardened=true needs profile=e2b", id)
+		}
 	case ProfileE2B:
 		match := semver.FindStringSubmatch(t.EnvdVersion)
 		if match == nil {
@@ -212,7 +220,7 @@ func rowProfile(profile string) Profile {
 // ParseTemplate parses one operator registration:
 //
 //	id=<id>[,arch=arm64|amd64][,image=<ref>][,profile=gitmoot-strict|e2b][,alias=<name>]...[,envd-version=X.Y.Z]
-//	  [,port=<n>]...[,start-cmd=<command>][,ready-cmd=<command>]
+//	  [,port=<n>]...[,start-cmd=<command>][,ready-cmd=<command>][,hardened=true|false]
 //
 // The profile defaults to gitmoot-strict and the architecture to the local
 // worker's. Without an image only enrolled workers can serve the template.
@@ -248,6 +256,11 @@ func ParseTemplate(spec, fixedImage string) (string, Template, error) {
 			template.Profile = Profile(value)
 		case "envd-version":
 			template.EnvdVersion = value
+		case "hardened":
+			if value != "true" && value != "false" {
+				return "", Template{}, fmt.Errorf("template hardened %q is not true or false", value)
+			}
+			template.Hardened = value == "true"
 		case "port":
 			port, err := strconv.Atoi(value)
 			if err != nil || strconv.Itoa(port) != value {

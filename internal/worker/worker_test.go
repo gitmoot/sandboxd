@@ -330,6 +330,29 @@ func TestClientRefusesEgressSpec(t *testing.T) {
 	}
 }
 
+// No enrolled worker boots a hardened guest: the client refuses the spec
+// without sending anything, never creating a writable-root sandbox instead.
+func TestClientRefusesHardenedSpec(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(ts.Close)
+	client, err := NewClient("linux-1", ts.URL, testKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := spec(vmA)
+	s.Envd, s.Hardened = true, true
+	if _, err := client.CreateUntil(context.Background(), s, time.Now().Add(time.Minute)); !errors.Is(err, vm.ErrHardenedUnsupported) {
+		t.Fatalf("create of a hardened guest: %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("client sent %d requests", n)
+	}
+}
+
 func TestUsageWithoutMeter(t *testing.T) {
 	_, ts := serve(t, plainDriver{newFake()})
 	client := enrolled(t, ts.URL, 1)

@@ -432,3 +432,17 @@ func TestVolumesSurviveRestartAndEmptyStoreIsRemoved(t *testing.T) {
 		t.Fatalf("state directory not left empty: %v", err)
 	}
 }
+
+// Dev guests have no system disk to harden: hardening is refused, and
+// nothing is created.
+func TestCreateRefusesHardened(t *testing.T) {
+	d := newDriver(t)
+	ctx := context.Background()
+	spec := vm.Spec{ID: "sandboxd-a", Image: "img", Network: "slot-0", CPUs: 1, MemoryMiB: 256, Envd: true, Hardened: true}
+	if _, err := d.Create(ctx, spec); !errors.Is(err, vm.ErrHardenedUnsupported) {
+		t.Fatalf("hardened guest: %v", err)
+	}
+	if instances, err := d.List(ctx); err != nil || len(instances) != 0 {
+		t.Fatalf("refused create left %v, %v", instances, err)
+	}
+}

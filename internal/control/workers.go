@@ -185,6 +185,9 @@ func (s *Service) enroll(ctx context.Context, m *member) error {
 			refused[template] = "template is not registered at the gateway"
 		case registered.Arch != decl.Arch:
 			refused[template] = fmt.Sprintf("architecture mismatch: template requires %s, worker runs %s", registered.Arch, decl.Arch)
+		case registered.Hardened && !m.local:
+			// The worker API cannot carry hardening (worker.Client refuses it).
+			refused[template] = "hardened templates run only on the gateway's local worker"
 		default:
 			serves[template] = image
 		}
@@ -385,18 +388,22 @@ func (s *Service) pushExpiry(ctx context.Context, m *member, id string) error {
 }
 
 // placement carries what a sandbox needs from the gateway's own host: a
-// volume lives there, and only the local driver enforces an egress policy.
-// A row with either goes to the local worker or nowhere.
+// volume lives there, and only the local driver enforces an egress policy or
+// boots a hardened guest. A row with any goes to the local worker or nowhere.
 type placement struct {
-	volume *vm.VolumeMount
-	egress *vm.EgressPolicy
+	volume   *vm.VolumeMount
+	egress   *vm.EgressPolicy
+	hardened bool
 }
 
-func (p placement) localOnly() bool { return p.volume != nil || p.egress != nil }
+func (p placement) localOnly() bool { return p.volume != nil || p.egress != nil || p.hardened }
 
 // localOnlyWhat names the reason in refusals.
 func (p placement) localOnlyWhat() string {
-	if p.volume != nil {
+	switch {
+	case p.hardened:
+		return "a hardened sandbox"
+	case p.volume != nil:
 		return "a sandbox with a volume"
 	}
 	return "a sandbox with an egress policy"
@@ -483,7 +490,7 @@ func (s *Service) admit(ctx context.Context, row *store.Row, place placement) (*
 		}
 		row.Slot = slot
 		return c.m, vm.Spec{ID: row.ID, Image: row.Image, Network: slot, CPUs: row.CPUs, MemoryMiB: row.MemoryMiB,
-			Envd: rowProfile(row.Profile) == ProfileE2B, Volume: place.volume, Egress: place.egress}, nil
+			Envd: rowProfile(row.Profile) == ProfileE2B, Hardened: place.hardened, Volume: place.volume, Egress: place.egress}, nil
 	}
 	return nil, vm.Spec{}, &refusal{http.StatusConflict, "sandbox capacity exhausted: every compatible worker is full"}
 }
