@@ -786,6 +786,10 @@ func (s *Service) launch(ctx context.Context, row *store.Row, place placement) e
 			return &refusal{http.StatusNotFound, "volume not found"}
 		case errors.Is(err, vm.ErrVolumeMountPath):
 			return &refusal{http.StatusBadRequest, "volume mount path not supported by this worker"}
+		case errors.Is(err, vm.ErrImageTooOld):
+			// The operator's image, not the request, is wrong; retrying
+			// cannot help, so never the retryable 503.
+			return &refusal{http.StatusInternalServerError, "template image does not support this sandbox's hardening or volume; the operator must rebuild it"}
 		}
 		return errLaunch
 	}
