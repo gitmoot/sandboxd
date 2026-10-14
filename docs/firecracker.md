@@ -148,8 +148,10 @@ readback fails, the previous record and table are put back (best effort),
 the update answers `503`, and the client can retry. Recording first means a
 daemon killed mid-update leaves the record ahead of the kernel, never behind:
 at every start sandboxd installs each running VM's recorded policy again
-(and destroys a VM whose policy it cannot install), so a crash during a
-tightening update never leaves the looser table in force. A VM created with a policy
+(and destroys a VM whose policy it cannot install) before it serves, so a
+crash during a tightening update never leaves the looser table in force once
+the daemon is back. While the daemon is down, such a guest keeps whichever
+table it had (kernel tables outlive the daemon). A VM created with a policy
 gets that table, read back the same way, before its VMM starts. DNS goes to
 the image's public resolvers (1.1.1.1, 8.8.8.8) like any destination, so a
 sandbox without internet has no DNS unless its `allowOut` lists them.

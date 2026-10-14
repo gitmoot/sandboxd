@@ -183,7 +183,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		case driver == nil || templates.byID[id].Image == "":
 			return nil, fmt.Errorf("hardened template %q needs an image for the local worker: it never runs on an enrolled worker", id)
 		case !bootsHardened(driver):
-			return nil, fmt.Errorf("hardened template %q needs the firecracker driver; the %s driver cannot boot hardened guests", id, cfg.DriverName)
+			return nil, fmt.Errorf("hardened template %q needs a driver that boots hardened guests (firecracker); the %s driver does not", id, cfg.DriverName)
 		}
 	}
 	for _, remote := range cfg.Workers {
