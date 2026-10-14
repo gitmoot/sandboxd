@@ -66,8 +66,21 @@ is open, one monitor per daemon re-checks the table once a second for all of
 them (commands and envd dials reuse its result from the last second). A
 check that finds the table missing or changed destroys every watched guest at
 once; a check that fails to complete (an `nft` error or timeout) is tolerated
-once, and a second consecutive failure counts as a loss. On a clean
-shutdown the daemon destroys every guest, then removes the table and the
+once, and a second consecutive failure counts as a loss.
+
+The table is also re-checked the moment anything changes the host's
+ruleset ([#70](https://github.com/gitmoot/sandboxd/issues/70)): the daemon
+runs `nft monitor` in the host namespace and checks the table after each
+burst of events (an event that leaves the table as armed costs one check).
+On real KVM a `delete table` or `flush table` destroyed a guest running a
+command and stopped the daemon about 0.1 s after the change, instead of up
+to a second later. A loss found this way stops the daemon as its own
+one-second check does, so idle guests are destroyed too. The polls stay as
+backups for missed events. If `nft monitor` stops, it is restarted and the
+table re-checked; a second stop in a row (within 10 s of starting) counts as
+a loss. Each per-VM namespace table is checked when it is installed or
+replaced; namespace events are not watched. On a clean shutdown the daemon
+stops the event watch, destroys every guest, then removes the table and the
 cgroup parent.
 
 ### One host port (`-fc-host-port`)

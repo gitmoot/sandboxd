@@ -5,12 +5,16 @@ package vm
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -19,7 +23,8 @@ import (
 // artifacts installed by docs/firecracker.md, and run only when
 // SANDBOXD_FC_KVM=1. SANDBOXD_FC_ROOT (default /var/lib/sandboxd-fc) selects
 // the install; imageEnv (a rootfs path) overrides the one image in
-// <root>/images matching imageGlob.
+// <root>/images matching imageGlob. Beside a running sandboxd, set
+// SANDBOXD_FC_INSTANCE, SANDBOXD_FC_UID_BASE and a separate root (#50).
 func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int) (*FirecrackerDriver, string, context.Context) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_FC_KVM") != "1" {
@@ -41,10 +46,18 @@ func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int) (
 	if len(kernels) != 1 {
 		t.Fatalf("expected one kernel, found %v", kernels)
 	}
+	uidBase := 2900000
+	if base := os.Getenv("SANDBOXD_FC_UID_BASE"); base != "" {
+		var err error
+		if uidBase, err = strconv.Atoi(base); err != nil {
+			t.Fatal(err)
+		}
+	}
 	d, err := NewFirecrackerDriver(FirecrackerConfig{
-		Root: root, Firecracker: filepath.Join(root, "bin", "firecracker"), Jailer: filepath.Join(root, "bin", "jailer"),
+		Instance: os.Getenv("SANDBOXD_FC_INSTANCE"),
+		Root:     root, Firecracker: filepath.Join(root, "bin", "firecracker"), Jailer: filepath.Join(root, "bin", "jailer"),
 		Kernel: kernels[0], Images: []string{image}, Slots: FirecrackerSlotNames(2),
-		UIDBase: 2900000, HomeDiskMiB: 1024, DiskFloorMiB: 4096, BootTimeout: 60 * time.Second,
+		UIDBase: uidBase, HomeDiskMiB: 1024, DiskFloorMiB: 4096, BootTimeout: 60 * time.Second,
 		ConsoleLog: os.Getenv("SANDBOXD_FC_CONSOLE") == "1",
 		// 10.1/16 overlaps 10/8 on purpose: the real tables must accept it.
 		// 1.0.0.1 is public: a configured deny must hold even for the internet.
@@ -292,4 +305,131 @@ go build -o yaml . && ./yaml`)
 		t.Fatalf("go: code=%d out=%q stderr=%q", code, out, stderr)
 	}
 	t.Logf("%s", out)
+}
+
+// A host-table change reaches a guest running a long command through the
+// nftables event path alone (polls an hour apart): the guest is destroyed
+// and the loss reported. The latency is logged; the poll-only baseline is
+// up to a poll interval plus one tolerated failure.
+func TestFirecrackerKVMFirewallEvent(t *testing.T) {
+	for _, change := range []string{"delete table", "flush table"} {
+		t.Run(strings.ReplaceAll(change, " ", "-"), func(t *testing.T) {
+			d, image, ctx := newKVMFirecracker(t, "SANDBOXD_FC_IMAGE", "review-amd64-*.ext4", 0)
+			d.firewallEvery = time.Hour
+			id := "sandboxd-kvm-firewall-event"
+			if _, err := d.Create(ctx, Spec{ID: id, Image: image, Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+				t.Fatal(err)
+			}
+			events, stop := context.WithCancel(ctx)
+			defer stop()
+			go d.WatchFirewallEvents(events)
+			waitForMonitor(t)
+			done := make(chan error, 1)
+			go func() {
+				_, err := d.Run(ctx, id, Command{Args: []string{"sleep", "120"}}, io.Discard, io.Discard)
+				done <- err
+			}()
+			time.Sleep(500 * time.Millisecond) // the command is under way
+			start := time.Now()
+			if out, err := exec.Command("nft", change, "inet", d.HostTable()).CombinedOutput(); err != nil {
+				t.Fatalf("nft %s: %v %s", change, err, out)
+			}
+			select {
+			case err := <-d.FirewallLost():
+				t.Logf("%s: loss reported %v after the change (%v)", change, time.Since(start), err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("no loss reported")
+			}
+			select {
+			case err := <-done:
+				t.Logf("%s: command ended %v after the change: %v", change, time.Since(start), err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("the command outlived the firewall change")
+			}
+			if _, found, err := d.lookup(id); err != nil || found {
+				t.Fatalf("guest still present: %t %v", found, err)
+			}
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Errorf("event path took %v; want well under the 1s poll", elapsed)
+			}
+			// Re-arm so cleanup's Disarm finds the table it removes.
+			if err := d.Arm(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// A killed `nft monitor` is restarted (one tolerated failure); the poll
+// still catches a deleted table on its own.
+func TestFirecrackerKVMFirewallEventMonitorKilled(t *testing.T) {
+	d, _, ctx := newKVMFirecracker(t, "SANDBOXD_FC_IMAGE", "review-amd64-*.ext4", 0)
+	events, stop := context.WithCancel(ctx)
+	defer stop()
+	go d.WatchFirewallEvents(events)
+	first := waitForMonitor(t)
+	if err := syscall.Kill(first, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if pid := monitorPID(); pid != 0 && pid != first {
+			t.Logf("nft monitor restarted: pid %d -> %d", first, pid)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("nft monitor was not restarted")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	select {
+	case err := <-d.FirewallLost():
+		t.Fatalf("one killed monitor reported a loss: %v", err)
+	default:
+	}
+	stop() // events off: only the poll is left
+	if out, err := exec.Command("nft", "delete", "table", "inet", d.HostTable()).CombinedOutput(); err != nil {
+		t.Fatalf("nft delete: %v %s", err, out)
+	}
+	start := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	for {
+		if err := d.Ready(waitCtx); errors.Is(err, errFirewallLost) {
+			t.Logf("poll caught the deleted table after %v", time.Since(start))
+			break
+		}
+		if waitCtx.Err() != nil {
+			t.Fatal("the poll did not catch the deleted table")
+		}
+		time.Sleep(d.firewallEvery)
+	}
+	if err := d.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// monitorPID finds this process's `nft monitor` child, or 0.
+func monitorPID() int {
+	out, _ := exec.Command("pgrep", "-P", strconv.Itoa(os.Getpid()), "-f", "^/[^ ]*nft monitor$").Output()
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return 0
+	}
+	pid, _ := strconv.Atoi(fields[0])
+	return pid
+}
+
+func waitForMonitor(t *testing.T) int {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if pid := monitorPID(); pid != 0 {
+			// The subscription is live once nft has opened its socket; give
+			// it a moment after exec.
+			time.Sleep(200 * time.Millisecond)
+			return pid
+		}
+	}
+	t.Fatal("nft monitor did not start")
+	return 0
 }

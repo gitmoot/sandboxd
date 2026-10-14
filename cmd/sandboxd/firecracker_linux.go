@@ -58,7 +58,17 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 		return nil, nil, err
 	}
 	log.Printf("Firecracker guests confined by nftables table inet %s and per-VM namespaces", driver.HostTable())
+	// Re-check the table the moment the host ruleset changes. It stops
+	// before shutdown, whose own Disarm is not a loss.
+	eventsCtx, stopEvents := context.WithCancel(context.WithoutCancel(ctx))
+	eventsDone := make(chan struct{})
+	go func() {
+		defer close(eventsDone)
+		driver.WatchFirewallEvents(eventsCtx)
+	}()
 	shutdown := func(ctx context.Context) error {
+		stopEvents()
+		<-eventsDone
 		if err := driver.CleanupGuests(ctx); err != nil {
 			return fmt.Errorf("leave firewall armed; guest cleanup failed: %w", err)
 		}

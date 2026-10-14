@@ -3,6 +3,7 @@
 package vm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -133,6 +134,38 @@ func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(
 func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error {
 	_, err := h.run(ctx, nil, mkfs, "-q", "-F", "-t", "ext4", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "volume", path)
 	return err
+}
+
+// MonitorRuleset runs `nft monitor` in the daemon's (host) namespace. Every
+// line it prints is one committed ruleset change; the content does not
+// matter, since the caller re-reads the table itself. The subprocess dies
+// with the daemon (Pdeathsig), and with ctx.
+func (h *linuxFCHost) MonitorRuleset(ctx context.Context, event func()) error {
+	if h.toolsErr != nil {
+		return h.toolsErr
+	}
+	c := exec.CommandContext(ctx, h.tools.nft, "monitor")
+	c.Env = []string{fcHostPath}
+	c.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	var stderr bytes.Buffer
+	c.Stderr = &stderr
+	out, err := c.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := c.Start(); err != nil {
+		return err
+	}
+	lines := bufio.NewScanner(out)
+	lines.Buffer(make([]byte, 64<<10), 1<<20)
+	for lines.Scan() {
+		event()
+	}
+	err = errors.Join(lines.Err(), c.Wait())
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return fmt.Errorf("nft monitor stopped: %v: %s", err, strings.TrimSpace(stderr.String()))
 }
 
 func (h *linuxFCHost) ApplyFirewall(ctx context.Context, ruleset string) error {
