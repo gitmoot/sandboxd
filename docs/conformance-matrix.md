@@ -44,7 +44,7 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 | Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | ❌ 0/33 (+27 offline) | — | — | — |
 | Control plane | IAM | — | ❌ 0/6 (+11 offline) | — | — | — |
 | Control plane | client config and request plumbing | ❌ 0/2 (+6 offline) | ❌ 0/11 (+58 offline) | — | — | — |
-| Control plane | unsupported features refused with 501 (sandboxd tests) | ✅ 10/10 | ✅ 9/9 | — | — | — |
+| Control plane | unsupported features refused with 501 (sandboxd tests) | ✅ 9/9 | ✅ 8/8 | — | — | — |
 | Commands | `commands.run` | ✅ 13/13 | ✅ 6/6 (+13 offline) | — | — | — |
 | Commands | `commands.run` envs | ✅ 8/8 | ✅ 3/3 | — | — | — |
 | Commands | `commands.connect` | ✅ 4/4 | ✅ 2/2 | — | — | — |
@@ -72,6 +72,7 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 | PTY | `pty.send_input` | ✅ 2/2 | ✅ 1/1 | — | — | — |
 | Templates, volumes, secrets | template build API | 🟡 4/33 (+136 offline) | 🟡 1/56 (+28 offline) | — | — | — |
 | Templates, volumes, secrets | volumes | ⚪ (+92 offline, 2 skip) | ❌ 0/52 (+4 offline, 1 skip) | — | — | — |
+| Templates, volumes, secrets | volumes mounted in a sandbox, kept across sandboxes (sandboxd tests) | ✅ 1/1 | ✅ 1/1 | — | — | — |
 | Templates, volumes, secrets | secrets | ⚪ (+30 offline) | ❌ 0/9 (+6 offline) | — | — | — |
 | Code interpreter | `run_code` | — | — | ❌ 0/10 (+5 offline) | ❌ 0/4 | — |
 | Code interpreter | `run_code` streaming and callbacks | — | — | ❌ 0/15 | ❌ 0/7 (+4 offline) | — |
@@ -103,7 +104,7 @@ error (see [compatibility.md](compatibility.md#not-supported)), asserted exactly
 - network, internet access, egress proxy: the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted.
 - IAM: IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd.
 - template build API: templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served.
-- volumes: volumes are not supported: nothing outlives a sandbox.
+- volumes: volumes are served on the Linux Firecracker worker when the operator sets a volume budget, and only mounted in a sandbox; the volume content API answers 501, and the upstream tests mock E2B's API host and cannot reach sandboxd.
 - secrets: secrets are not supported; pass values in `envVars`.
 - `Sandbox.list` (paused sandboxes), `Sandbox.connect` (resuming a paused sandbox) and `Sandbox.create` (auto-pause, MCP gateway) have refused tests too: their paused, auto-pause and MCP cases.
 
