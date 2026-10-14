@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	fcNetnsPrefix  = "sbx-"
+	fcNetnsPrefix  = "sbx-" // the default instance's; see fcInstanceNames
 	fcNetCgroup    = "net-"
 	fcGuestTap     = "sbxvm0"
 	fcSlirpTap     = "sbxsl0"
@@ -34,7 +34,7 @@ const (
 	fcGatewayCIDR  = fcGatewayAddr + "/30"
 	fcGuestMAC     = "06:00:0a:c8:00:02"
 	fcGuestCID     = 3
-	fcHostTable    = "sbx_fc"
+	fcHostTable    = "sbx_fc" // the default instance's; see fcInstanceNames
 	fcNetnsTable   = "sbx_vm"
 	fcUIDStride    = 1000
 	fcMaxSlots     = fcUIDStride
@@ -62,6 +62,13 @@ var fcSlotName = regexp.MustCompile(`^sbx[0-9]{1,3}$`)
 // kernel and images must be on the same filesystem so they can be hard-linked
 // read-only into each jail.
 type FirecrackerConfig struct {
+	// Instance names one of several sandboxd instances on a host (see
+	// ValidateFirecrackerInstance); empty is the default instance, whose
+	// host names are those of a host with one instance.
+	Instance string
+	// ClaimDir holds the instance claims (Claim), on a tmpfs: a claim lasts
+	// until reboot, exactly as long as guests can.
+	ClaimDir    string
 	Root        string
 	Firecracker string
 	Jailer      string
@@ -108,9 +115,12 @@ type FirecrackerDriver struct {
 	images       map[string]struct{}
 	deny4, deny6 []string
 	host         fcHost
+	names        fcNames
 
 	mu    sync.Mutex
 	armed string
+	// claim is the locked claim file (Claim), held until a clean Disarm.
+	claim *os.File
 
 	// firewall is the one monitor that re-checks the host table for every
 	// running command and open envd stream, every firewallEvery.
@@ -237,7 +247,7 @@ func cleanAbs(path string) bool {
 
 // NewFirecrackerDriver validates cfg against the real host.
 func NewFirecrackerDriver(cfg FirecrackerConfig) (*FirecrackerDriver, error) {
-	return newFirecrackerDriver(cfg, newLinuxFCHost())
+	return newFirecrackerDriver(cfg, newLinuxFCHost(fcInstanceNames(cfg.Instance)))
 }
 
 func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDriver, error) {
@@ -272,6 +282,9 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	if err := ValidateFirecrackerHostPort(cfg.HostPort); err != nil {
 		return nil, err
 	}
+	if err := ValidateFirecrackerInstance(cfg.Instance); err != nil {
+		return nil, err
+	}
 	for _, path := range []string{cfg.Firecracker, cfg.Jailer} {
 		if err := host.TrustedFile(path, true); err != nil {
 			return nil, err
@@ -299,7 +312,7 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	cfg.Slots = slices.Clone(cfg.Slots)
 	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
 	d := &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host,
-		firewallEvery: time.Second}
+		names: fcInstanceNames(cfg.Instance), firewallEvery: time.Second}
 	if cfg.VolumeBudgetMiB != 0 {
 		if err := d.initVolumes(); err != nil {
 			return nil, err
@@ -336,7 +349,7 @@ func (d *FirecrackerDriver) uidRange() (int, int) {
 // A nonzero hostPort lets the NAT UIDs (never the VMMs) open TCP connections
 // to 127.0.0.1:hostPort, where slirp4netns sends guest connections to
 // fcHostAlias:hostPort; no other host address or port.
-func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string, hostPort int) string {
+func fcHostRuleset(table string, uidLow, uidHigh int, deny4, deny6 []string, hostPort int) string {
 	exception := ""
 	if hostPort != 0 {
 		exception = "\t\t" + fcHostPortRule(uidLow+fcUIDStride, uidHigh, hostPort) + "\n"
@@ -364,7 +377,7 @@ func fcHostRuleset(uidLow, uidHigh int, deny4, deny6 []string, hostPort int) str
 		ip6 daddr @deny6 counter reject with icmpx type admin-prohibited
 	}
 }
-`, fcHostTable, strings.Join(deny4, ", "), strings.Join(deny6, ", "), uidLow, uidHigh, exception)
+`, table, strings.Join(deny4, ", "), strings.Join(deny6, ", "), uidLow, uidHigh, exception)
 }
 
 // fcHostPortRule is the host table's one exception, exactly as
@@ -425,7 +438,7 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 		return err
 	}
 	low, high := d.uidRange()
-	if err := d.host.ApplyFirewall(ctx, fcHostRuleset(low, high, d.deny4, d.deny6, d.cfg.HostPort)); err != nil {
+	if err := d.host.ApplyFirewall(ctx, fcHostRuleset(d.names.table, low, high, d.deny4, d.deny6, d.cfg.HostPort)); err != nil {
 		return err
 	}
 	state, err := d.host.FirewallState(ctx)
@@ -547,7 +560,11 @@ func (d *FirecrackerDriver) firewallReady(ctx context.Context) error {
 	return d.Ready(ctx)
 }
 
-// Disarm removes the host table and cgroup parent once no VM remains.
+// HostTable is the name of this instance's host nftables table (inet).
+func (d *FirecrackerDriver) HostTable() string { return d.names.table }
+
+// Disarm removes the host table and cgroup parent once no VM remains, then
+// the instance's claim.
 func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	vms, err := d.inventory()
 	if err != nil {
@@ -559,7 +576,10 @@ func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	d.mu.Lock()
 	d.armed = ""
 	d.mu.Unlock()
-	return errors.Join(d.host.RemoveFirewall(ctx), d.host.RemoveCgroupParent())
+	if err := errors.Join(d.host.RemoveFirewall(ctx), d.host.RemoveCgroupParent()); err != nil {
+		return err
+	}
+	return d.releaseClaim()
 }
 
 // CleanupGuests destroys every VM this driver owns.
@@ -678,7 +698,7 @@ func (d *FirecrackerDriver) inventory() ([]fcVM, error) {
 		return nil, err
 	}
 	for _, name := range namespaces {
-		id, ok := strings.CutPrefix(name, fcNetnsPrefix)
+		id, ok := strings.CutPrefix(name, d.names.netnsPrefix)
 		if !ok {
 			continue
 		}
@@ -813,10 +833,10 @@ func (d *FirecrackerDriver) jailerArgs(meta fcMeta) []string {
 		"--exec-file", d.cfg.Firecracker,
 		"--uid", strconv.Itoa(meta.VMMUID), "--gid", strconv.Itoa(meta.VMMUID),
 		"--chroot-base-dir", d.jailBase(),
-		"--netns", d.host.NetnsPath(fcNetnsPrefix + meta.ID),
+		"--netns", d.host.NetnsPath(d.names.netnsPrefix + meta.ID),
 		"--new-pid-ns",
 		"--cgroup-version", "2",
-		"--parent-cgroup", fcCgroupParent,
+		"--parent-cgroup", d.names.cgroupParent,
 		"--cgroup", "memory.max=" + strconv.FormatInt(int64(meta.MemoryMiB+fcVMMOverhead)<<20, 10),
 		"--cgroup", "memory.swap.max=0",
 		"--cgroup", "cpu.max=" + strconv.Itoa(meta.CPUs*100000) + " 100000",
@@ -988,7 +1008,7 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 	}
 	ruleset, marker := d.netnsRuleset(meta.Egress)
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
-		Netns: fcNetnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
+		Netns: d.names.netnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
 		NetUID: meta.NetUID, VMMUID: meta.VMMUID, Ruleset: ruleset,
 		HostPort: d.cfg.HostPort, Marker: marker,
 	}); err != nil {
@@ -1325,7 +1345,7 @@ func (d *FirecrackerDriver) destroy(ctx context.Context, id string, syncVolume b
 		}
 	}
 	if vm.netns {
-		if err := d.host.DeleteNetns(ctx, fcNetnsPrefix+id); err != nil {
+		if err := d.host.DeleteNetns(ctx, d.names.netnsPrefix+id); err != nil {
 			return err
 		}
 	}

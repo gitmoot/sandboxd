@@ -234,7 +234,10 @@ sandboxd -driver firecracker \
 `alias=base` makes the template the SDKs' default. Defaults: at most 2 VMs
 (`-max-vms`, up to 64), 2 vCPUs (`-cpus`), 4096 MiB (`-memory-mib`), a 1 h
 maximum lifetime (`-max-ttl`). A sample systemd unit is in
-[`docs/examples`](docs/examples/sandboxd-firecracker.service).
+[`docs/examples`](docs/examples/sandboxd-firecracker.service). Several
+daemons can share a host with `-fc-instance <name>` and their own
+`-fc-root`, `-fc-uid-base`, `-listen` and `-db`
+([details](docs/firecracker.md#several-instances-on-one-host)).
 
 **5. Use the stock Python SDK.** In another shell on the same host:
 

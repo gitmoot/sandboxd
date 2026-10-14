@@ -157,7 +157,9 @@ sandbox without internet has no DNS unless its `allowOut` lists them.
 ## Recovery
 
 The driver keeps no in-memory state. Its inventory joins the ownership
-records (`<fc-root>/run/<id>.json`), the jails, the `sbx-*` namespaces, and
+records (`<fc-root>/run/<id>.json`), the jails, the instance's namespaces
+(`sbx-*` for the default instance, see
+[Several instances](#several-instances-on-one-host)), and
 the VMM and NAT cgroups. A VM is running only if all of them are present and
 both cgroups have processes. Everything else is reported as stopped. A
 foreign or malformed entry makes `List` fail rather than return an
@@ -542,6 +544,53 @@ ledger (`ledger.sqlite`) and API key (`api-key`, 0600) in
 `/var/lib/sandboxd-linux` (0700). The client uses
 `http://127.0.0.1:43190` as both API and envd base URL; envd requests
 carry `Host: 127.0.0.1:43190`, which `-gateway-host 127.0.0.1` matches.
+
+### Several instances on one host
+
+`-fc-instance <name>` runs one of several independent Firecracker daemons on
+a host, each with its own ledger, templates and guests. The name is 1 to 12
+characters, a lowercase letter then lowercase letters or digits, and not
+`default`. Without the flag a daemon is the default instance, whose host
+names are exactly those of a single-instance host. Every host-global name
+carries the instance name; names inside a VM's own namespace (`inet sbx_vm`,
+the taps) need none:
+
+| | default | `-fc-instance phobos` |
+|---|---|---|
+| Host nftables table | `inet sbx_fc` | `inet sbx_fc_phobos` |
+| cgroup v2 parent (VMM and `net-<id>` cgroups) | `/sys/fs/cgroup/sbx-fc` | `/sys/fs/cgroup/sbx-fc-phobos` |
+| Network namespaces | `/run/netns/sbx-<id>` | `/run/netns/sbi-phobos-<id>` |
+| Claim | `/run/sandboxd-fc/default.json` | `/run/sandboxd-fc/phobos.json` |
+
+A named instance's namespaces start `sbi-`, never `sbx-`, which the default
+instance's inventory owns; each instance's inventory ignores the others'.
+Each instance also needs its own `-fc-root` (and `-fc-volume-dir`, if set),
+a `-fc-uid-base` whose 2000 UIDs overlap no other instance's, its own
+`-listen` port and its own `-db`. Its kernel and images must be on its
+`-fc-root`'s filesystem; installing them into its own root is simplest. Its
+host table lets only its own NAT UIDs reach 127.0.0.1 on its own
+`-fc-host-port`, so each instance's guests reach only their own host port.
+
+Claims keep conflicting instances apart. At startup, before arming its
+table, each instance (the default one included) creates
+`/run/sandboxd-fc` (0700, a tmpfs: a claim lasts until reboot, exactly as
+long as guests can), locks its own claim file for the daemon's life, and
+writes its name, root and UID range there. It refuses to start when its own
+claim is locked (`instance "phobos" is already running`), when another
+claim, live or left by a killed daemon, has the same root or overlapping
+UIDs, or when its own claim left by a killed daemon names another root or
+UIDs (those guests may still run, and the new table would not confine
+them). A daemon that stops cleanly, destroying its guests and removing its
+table, removes its claim. To clear a stale claim, start that instance again
+as it was and stop it cleanly, or remove the file after confirming none of
+its guests remain (no `sbx-<id>`/`sbi-<name>-<id>` namespaces in
+`ip netns`, no processes under its cgroup parent).
+
+A default daemon built before claims writes none. So while
+`/run/sandboxd-fc/default.json` is absent, a named instance also refuses
+the default root `/var/lib/sandboxd-fc` and the default UIDs
+2900000-2901999; a default claim recording another root and UIDs lifts
+that. Upgrade every instance on a host to a binary with claims.
 
 ## Tests
 

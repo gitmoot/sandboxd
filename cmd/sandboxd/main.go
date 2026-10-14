@@ -130,6 +130,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 		if err := checkFirecrackerHostPort(*fc.hostPort, *listen); err != nil {
 			return err
 		}
+		if err := vm.ValidateFirecrackerInstance(*fc.instance); err != nil {
+			return fmt.Errorf("fc-instance: %w", err)
+		}
 		if *maxVMs == 0 {
 			*maxVMs = 2
 		}
@@ -242,7 +245,6 @@ func run(ctx context.Context, args []string) (runErr error) {
 			defer cancel()
 			runErr = errors.Join(runErr, shutdown(cleanupCtx))
 		}()
-		log.Printf("Firecracker guests confined by nftables table inet sbx_fc and per-VM namespaces")
 		driver = firecracker
 		// Volumes exist only on a gateway (worker mode refuses the flags).
 		if *fc.volumeBudgetMiB != 0 {

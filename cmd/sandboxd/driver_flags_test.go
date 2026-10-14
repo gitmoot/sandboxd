@@ -40,6 +40,10 @@ func TestDriverSelectionAndFirecrackerCap(t *testing.T) {
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43190"}, "own listen port 43190"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43180"}, "read API key"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "https"}, "invalid value"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-instance", "phobos"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-instance", "Phobos"}, "fc-instance"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-instance", "default"}, "fc-instance"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-instance", "phobos-2"}, "fc-instance"},
 		// Volume flags belong to a Firecracker gateway only.
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-volume-budget-mib", "4096"}, "read API key"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-volume-mib", "1024", "-fc-volume-dir", "/v"}, "read API key"},
