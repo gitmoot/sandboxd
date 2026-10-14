@@ -146,6 +146,7 @@ OPERATIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "template/methods/make_symlink", "template/methods/run_cmd", "template/methods/to_dockerfile",
         "template/stacktrace", "template/tags", "template/upload_file")),
     ("Templates, volumes, secrets", "volumes", ("volume/file", "volume/http_version", "volume/volume", "volume/volume_content")),
+    ("Templates, volumes, secrets", "volumes mounted in a sandbox, kept across sandboxes (sandboxd tests)", ("sandboxd/volumes",)),
     ("Templates, volumes, secrets", "secrets", ("secret/secret",)),
     ("Code interpreter", "`run_code`", ("ci:basic", "ci:statefulness", "ci:execution_count", "ci:error_diagnostics", "ci:custom_repr_object")),
     ("Code interpreter", "`run_code` streaming and callbacks", ("ci:streaming", "ci:callbacks", "ci:messaging")),
@@ -176,7 +177,7 @@ REFUSED = {
     "network, internet access, egress proxy": "the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted",
     "IAM": "IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd",
     "template build API": "templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served",
-    "volumes": "volumes are not supported: nothing outlives a sandbox",
+    "volumes": "volumes are served on the Linux Firecracker worker when the operator sets a volume budget, and only mounted in a sandbox; the volume content API answers 501, and the upstream tests mock E2B's API host and cannot reach sandboxd",
     "secrets": "secrets are not supported; pass values in `envVars`",
 }
 REFUSED_ALSO = (
@@ -669,6 +670,9 @@ def dev_server(ws: Workspace, suite: str):
         "-api-key-file", str(key_file), "-state-dir", str(state), "-template", STRICT_TEMPLATE,
         "-register-template", f"id={E2B_TEMPLATE},alias={E2B_ALIAS},profile=e2b,envd-version={ENVD_VERSION}",
         "-domain", DOMAIN, "-gateway-host", "127.0.0.1", "-max-vms", "16", "-envd", str(ws.envd),
+        # Volumes on, for the sandboxd volume tests; they must delete every
+        # volume they create, or the server cannot remove its state on exit.
+        "-volume-budget-mib", "4096",
     ], stdout=server_log, stderr=subprocess.STDOUT)
     try:
         deadline = time.monotonic() + 30

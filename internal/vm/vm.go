@@ -24,6 +24,9 @@ type Spec struct {
 	// its entrypoint, reached only through PortDialer. Unset, the guest is
 	// the gitmoot-strict guest the driver has always started.
 	Envd bool
+	// Volume, when set, attaches a durable volume (Volumes) at a guest path;
+	// only Envd guests of a driver implementing Volumes accept it.
+	Volume *VolumeMount
 }
 
 // EnvdPort is the port upstream envd listens on inside an e2b guest.

@@ -33,9 +33,16 @@ import (
 const devImage = "sandboxd-devvm:local-processes"
 
 func main() {
-	// The envd guest root helper (see devvm.Envd) is this binary too.
+	// The envd guest and volume removal root helpers (see devvm.Envd) are
+	// this binary too.
 	if len(os.Args) > 1 && os.Args[1] == devvm.EnvdGuestCommand {
 		if err := devvm.RunEnvdGuest(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == devvm.VolumeRemoveCommand {
+		if err := devvm.RunVolumeRemove(os.Args[2:]); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -74,6 +81,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	memory := flags.Int("memory-mib", 1024, "memory size reported for each guest")
 	envdBinary := flags.String("envd", "", "upstream envd binary for e2b-profile guests; without it e2b sandboxes cannot start. "+
 		"envd guests need root: as root they start directly, otherwise through 'sudo -n'")
+	volumeBudget := flags.Int("volume-budget-mib", 0, "total size of all e2b volumes in MiB; 0 turns volumes off. Dev volumes are directories in -state-dir "+
+		"mounted below /home/user in envd guests; their size is NOT enforced")
+	volumeSize := flags.Int("volume-mib", 512, "size in MiB counted against -volume-budget-mib for each volume")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -92,6 +102,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	if *portStreams < 1 || *readyTimeout <= 0 {
 		return errors.New("port-max-streams must be at least 1 and template-ready-timeout positive")
+	}
+	if *volumeBudget < 0 || (*volumeBudget > 0 && *envdBinary == "") {
+		return errors.New("volume-budget-mib must not be negative, and volumes need -envd: they mount only in e2b guests")
 	}
 	apiKey, err := readKey(*keyFile)
 	if err != nil {
@@ -113,7 +126,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if err != nil {
 		return err
 	}
-	driver, err := devvm.New(root, envdGuests)
+	driver, err := devvm.New(root, envdGuests, devvm.VolumeConfig{BudgetMiB: *volumeBudget, SizeMiB: *volumeSize})
 	if err != nil {
 		return err
 	}
@@ -126,11 +139,15 @@ func run(ctx context.Context, args []string) (runErr error) {
 	for i := range slots {
 		slots[i] = fmt.Sprintf("devvm-slot-%d", i)
 	}
-	service, err := control.Open(ctx, *database, driver, control.Config{
+	config := control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: devImage, Domain: *domain, WorkerID: "sandboxd-devvm",
 		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Slots: slots,
 		DriverName: "devvm", Templates: registered.Templates, TokenSecret: tokenSecret,
-	})
+	}
+	if *volumeBudget > 0 {
+		config.Volumes = driver
+	}
+	service, err := control.Open(ctx, *database, driver, config)
 	if err != nil {
 		return err
 	}

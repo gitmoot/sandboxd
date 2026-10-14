@@ -124,6 +124,14 @@ func (h *linuxFCHost) FreeBytes(path string) (uint64, error) {
 
 func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(path, uid, gid) }
 
+// FormatVolume makes an ext4 filesystem in the volume image file. mkfs works
+// on the file itself; nothing is mounted on the host. The root directory
+// belongs to the guest user, as the guest's home disk does.
+func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error {
+	_, err := h.run(ctx, nil, mkfs, "-q", "-F", "-t", "ext4", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "volume", path)
+	return err
+}
+
 func (h *linuxFCHost) ApplyFirewall(ctx context.Context, ruleset string) error {
 	// One transaction: the table is replaced atomically, never absent.
 	script := "table inet " + fcHostTable + " {}\ndelete table inet " + fcHostTable + "\n" + ruleset

@@ -284,6 +284,29 @@ func TestCreateRefusesUndeclaredSpec(t *testing.T) {
 	}
 }
 
+// A volume never crosses to an enrolled worker: the client refuses the spec
+// without sending anything.
+func TestClientRefusesVolumeSpec(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(ts.Close)
+	client, err := NewClient("linux-1", ts.URL, testKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := spec(vmA)
+	s.Volume = &vm.VolumeMount{ID: "vol-" + strings.Repeat("0", 32), Path: "/data"}
+	if _, err := client.CreateUntil(context.Background(), s, time.Now().Add(time.Minute)); err == nil {
+		t.Fatal("create with a volume accepted")
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("client sent %d requests", n)
+	}
+}
+
 func TestUsageWithoutMeter(t *testing.T) {
 	_, ts := serve(t, plainDriver{newFake()})
 	client := enrolled(t, ts.URL, 1)

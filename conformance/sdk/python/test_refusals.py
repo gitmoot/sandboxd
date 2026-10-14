@@ -6,15 +6,14 @@ Copied by conformance/run.py into the python-e2b suite as tests/sandboxd/."""
 
 import pytest
 
-from e2b import BuildException, Sandbox, SandboxException, Secret, Template, Volume
-from e2b.exceptions import SecretException, VolumeException
+from e2b import BuildException, Sandbox, SandboxException, Secret, Template
+from e2b.exceptions import SecretException
 
 DOC = "; see docs/compatibility.md#not-supported"
 PAUSE = "pause and resume are not supported: sandboxd never pauses a sandbox (deferred, owner decision D7)"
 SNAPSHOTS = "snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)"
 FORK = "fork is not supported: it needs snapshots (deferred with pause, D7)"
 NETWORK = "network updates are not supported: a sandbox's network policy is fixed by the operator"
-VOLUMES = "volumes are not supported: sandboxd keeps no storage beyond a sandbox's lifetime"
 SECRETS = "secrets are not supported: pass values to a sandbox in envVars instead"
 TEMPLATES = ("template builds and template management through the API are not supported: "
              "the operator builds and registers templates with the sandboxd CLI (D8)")
@@ -59,10 +58,6 @@ def test_fork_is_refused(sandbox):
 
 def test_network_update_is_refused(sandbox):
     refused(SandboxException, NETWORK, lambda: sandbox.update_network({}))
-
-
-def test_volumes_are_refused():
-    refused(VolumeException, VOLUMES, lambda: Volume.create("volume"))
 
 
 def test_secrets_are_refused():

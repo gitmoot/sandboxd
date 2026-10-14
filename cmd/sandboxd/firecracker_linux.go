@@ -26,10 +26,15 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 	if *f.kernel == "" {
 		return nil, nil, errors.New("fc-kernel is required for the firecracker driver")
 	}
+	volumeDir := *f.volumeDir
+	if volumeDir == "" {
+		volumeDir = filepath.Join(*f.root, "volumes")
+	}
 	driver, err := vm.NewFirecrackerDriver(vm.FirecrackerConfig{
 		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: images, Slots: slots,
 		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
 		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny, HostPort: *f.hostPort,
+		VolumeBudgetMiB: *f.volumeBudgetMiB, VolumeMiB: *f.volumeMiB, VolumeDir: volumeDir,
 	})
 	if err != nil {
 		return nil, nil, err

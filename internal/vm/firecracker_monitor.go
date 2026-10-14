@@ -124,7 +124,8 @@ func (d *FirecrackerDriver) firewallLost(cause error) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		destroyed[w.id] = d.Destroy(ctx, w.id)
+		// No volume flush: a guest behind a lost firewall stops at once.
+		destroyed[w.id] = d.destroy(ctx, w.id, false)
 		cancel()
 		log.Printf("firecracker: destroyed %s after losing the host firewall: %v", w.id, cause)
 	}

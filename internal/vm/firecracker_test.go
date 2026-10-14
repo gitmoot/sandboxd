@@ -82,12 +82,17 @@ type fakeFCHost struct {
 	// dropAccept installs the host table without its accept rules, as an
 	// nft that silently loses one would.
 	dropAccept bool
+	// owners records the last Chown of each path; formatted, every
+	// FormatVolume target.
+	owners    map[string]int
+	formatted []string
 }
 
 func newFakeFCHost(t *testing.T) *fakeFCHost {
 	h := &fakeFCHost{
 		t: t, free: 100 << 30, untrusted: map[string]bool{}, netns: map[string]bool{},
 		cgroups: map[string]bool{}, guests: map[string]string{}, listeners: map[string]*net.UnixListener{},
+		owners: map[string]int{},
 	}
 	t.Cleanup(func() {
 		h.mu.Lock()
@@ -112,7 +117,30 @@ func (h *fakeFCHost) TrustedFile(path string, _ bool) error {
 	return nil
 }
 func (h *fakeFCHost) FreeBytes(string) (uint64, error) { return h.free, nil }
-func (h *fakeFCHost) Chown(string, int, int) error     { return nil }
+func (h *fakeFCHost) Chown(path string, uid, _ int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.owners[path] = uid
+	return nil
+}
+func (h *fakeFCHost) owner(path string) (int, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	uid, ok := h.owners[path]
+	return uid, ok
+}
+
+// FormatVolume stands in for mkfs: the file must already be the volume's
+// full size, and is left as it is.
+func (h *fakeFCHost) FormatVolume(_ context.Context, mkfs, path string) error {
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.formatted = append(h.formatted, mkfs+" "+path)
+	return nil
+}
 func (h *fakeFCHost) ApplyFirewall(_ context.Context, ruleset string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1152,5 +1180,292 @@ func TestTrustedFileModeRequiresVMMReadableImages(t *testing.T) {
 		if (err == nil) != tc.ok {
 			t.Errorf("mode %v executable=%v: err=%v, want ok=%v", tc.mode, tc.executable, err, tc.ok)
 		}
+	}
+}
+
+func newVolumeFirecracker(t *testing.T) (*FirecrackerDriver, *fakeFCHost, FirecrackerConfig) {
+	t.Helper()
+	return newTestFirecracker(t, func(c *FirecrackerConfig) {
+		c.VolumeBudgetMiB, c.VolumeMiB, c.VolumeDir = 256, 128, filepath.Join(c.Root, "volumes")
+	})
+}
+
+func volumeSpec(cfg FirecrackerConfig, id, slot, volume string) Spec {
+	return Spec{ID: id, Image: cfg.Images[0], Network: slot, CPUs: 1, MemoryMiB: 512, Envd: true,
+		Volume: &VolumeMount{ID: volume, Path: "/data"}}
+}
+
+// Without a volume budget the driver is as it was: no volume directory and
+// every volume request refused.
+func TestFirecrackerVolumesOff(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	if _, err := d.CreateVolume(ctx, "data"); err == nil {
+		t.Fatal("volume created with volumes off")
+	}
+	if _, err := d.Volumes(ctx); err == nil {
+		t.Fatal("volumes listed with volumes off")
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID, "sbx0", "vol-"+strings.Repeat("0", 32))); err == nil {
+		t.Fatal("VM with a volume created with volumes off")
+	}
+	if entries, _ := os.ReadDir(cfg.Root); slices.ContainsFunc(entries, func(e os.DirEntry) bool { return e.Name() == "volumes" }) {
+		t.Fatal("volume directory created with volumes off")
+	}
+	if len(host.formatted) != 0 || len(host.calls) != 0 {
+		t.Fatalf("host touched: %v %v", host.formatted, host.calls)
+	}
+}
+
+func TestFirecrackerVolumeConfigValidation(t *testing.T) {
+	_, _, base := newVolumeFirecracker(t)
+	for name, mutate := range map[string]func(*FirecrackerConfig){
+		"tiny volume":     func(c *FirecrackerConfig) { c.VolumeMiB = 1 },
+		"huge volume":     func(c *FirecrackerConfig) { c.VolumeMiB = 1<<20 + 1 },
+		"budget < size":   func(c *FirecrackerConfig) { c.VolumeBudgetMiB = 64 },
+		"relative dir":    func(c *FirecrackerConfig) { c.VolumeDir = "volumes" },
+		"unclean dir":     func(c *FirecrackerConfig) { c.VolumeDir = c.Root + "/x/../volumes" },
+		"negative budget": func(c *FirecrackerConfig) { c.VolumeBudgetMiB = -1 },
+	} {
+		cfg := base
+		mutate(&cfg)
+		if _, err := newFirecrackerDriver(cfg, newFakeFCHost(t)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	host := newFakeFCHost(t)
+	for _, mkfs := range fcMkfs {
+		host.untrusted[mkfs] = true
+	}
+	if _, err := newFirecrackerDriver(base, host); err == nil {
+		t.Error("untrusted mkfs accepted")
+	}
+}
+
+func TestFirecrackerVolumeCreateListDelete(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	if info, err := os.Lstat(cfg.VolumeDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("volume dir: %v %v", info, err)
+	}
+	b, err := d.CreateVolume(ctx, "b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ValidVolumeID(b.ID) || b.Name != "b" || b.SizeMiB != 128 || b.AttachedTo != "" {
+		t.Fatalf("volume = %+v", b)
+	}
+	disk := filepath.Join(cfg.VolumeDir, b.ID+".ext4")
+	for path, size := range map[string]int64{disk: 128 << 20, filepath.Join(cfg.VolumeDir, b.ID+".json"): -1} {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0o600 || (size >= 0 && info.Size() != size) {
+			t.Fatalf("%s: %v %v", path, info, err)
+		}
+	}
+	if len(host.formatted) != 1 || host.formatted[0] != fcMkfs[0]+" "+disk+".tmp" {
+		t.Fatalf("formatted = %v", host.formatted)
+	}
+	if _, err := d.CreateVolume(ctx, "b"); !errors.Is(err, ErrVolumeExists) {
+		t.Fatalf("duplicate name: %v", err)
+	}
+	if _, err := d.CreateVolume(ctx, "bad name"); err == nil {
+		t.Fatal("invalid name accepted")
+	}
+	a, err := d.CreateVolume(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.CreateVolume(ctx, "c"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("over budget: %v", err)
+	}
+	volumes, err := d.Volumes(ctx)
+	if err != nil || !slices.Equal(volumes, []Volume{a, b}) {
+		t.Fatalf("volumes = %+v %v", volumes, err)
+	}
+	if err := d.DeleteVolume(ctx, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted disk remains: %v", err)
+	}
+	for _, id := range []string{b.ID, "vol-" + strings.Repeat("f", 32), "../../etc/passwd"} {
+		if err := d.DeleteVolume(ctx, id); !errors.Is(err, ErrVolumeNotFound) {
+			t.Fatalf("delete %q: %v", id, err)
+		}
+	}
+	// The host disk floor counts against volumes too.
+	host.free = uint64(cfg.DiskFloorMiB+127) << 20
+	if _, err := d.CreateVolume(ctx, "c"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("below floor: %v", err)
+	}
+	host.free = 100 << 30
+	if _, err := d.CreateVolume(ctx, "c"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A crash during CreateVolume leaves a temporary disk or a record without a
+// disk; the next driver removes both and keeps complete volumes.
+func TestFirecrackerVolumeCrashLeftovers(t *testing.T) {
+	d, _, cfg := newVolumeFirecracker(t)
+	kept, err := d.CreateVolume(context.Background(), "kept")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan := "vol-" + strings.Repeat("a", 32)
+	leftovers := []string{filepath.Join(cfg.VolumeDir, orphan+".json"), filepath.Join(cfg.VolumeDir, orphan+".ext4.tmp")}
+	for _, path := range leftovers {
+		if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d, err = newFirecrackerDriver(cfg, newFakeFCHost(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range leftovers {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s remains: %v", path, err)
+		}
+	}
+	if volumes, err := d.Volumes(context.Background()); err != nil || len(volumes) != 1 || volumes[0] != kept {
+		t.Fatalf("volumes = %+v %v", volumes, err)
+	}
+}
+
+func TestFirecrackerVolumeAttach(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
+	for name, spec := range map[string]Spec{
+		"strict guest": func() Spec { s := volumeSpec(cfg, fcTestID, "sbx1", volume.ID); s.Envd = false; return s }(),
+		"bad path":     func() Spec { s := volumeSpec(cfg, fcTestID, "sbx1", volume.ID); s.Volume.Path = "/a b"; return s }(),
+		"root path":    func() Spec { s := volumeSpec(cfg, fcTestID, "sbx1", volume.ID); s.Volume.Path = "/"; return s }(),
+		"unknown":      volumeSpec(cfg, fcTestID, "sbx1", "vol-"+strings.Repeat("b", 32)),
+		"malformed id": volumeSpec(cfg, fcTestID, "sbx1", "data"),
+	} {
+		if _, err := d.Create(ctx, spec); err == nil {
+			t.Fatalf("%s: created", name)
+		}
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID, "sbx1", volume.ID)); err != nil {
+		t.Fatal(err)
+	}
+	// The jail links the volume itself, owned by the VMM UID.
+	chroot := d.chroot(fcTestID)
+	link := filepath.Join(chroot, "volume.ext4")
+	a, errA := os.Stat(link)
+	b, errB := os.Stat(disk)
+	if errA != nil || errB != nil || !os.SameFile(a, b) {
+		t.Fatalf("volume is not linked into the jail: %v %v", errA, errB)
+	}
+	if uid, _ := host.owner(link); uid != 2900001 {
+		t.Fatalf("volume owner = %d", uid)
+	}
+	var config struct {
+		Boot struct {
+			Args string `json:"boot_args"`
+		} `json:"boot-source"`
+		Drives []map[string]any `json:"drives"`
+	}
+	data, err := os.ReadFile(filepath.Join(chroot, "vm.json"))
+	if err != nil || json.Unmarshal(data, &config) != nil {
+		t.Fatalf("vm.json: %v %s", err, data)
+	}
+	if want := d.bootArgs(true, "") + " sandboxd.volume=/data"; config.Boot.Args != want {
+		t.Fatalf("boot args = %q, want %q", config.Boot.Args, want)
+	}
+	if len(config.Drives) != 3 || len(config.Drives[0]) != 4 || len(config.Drives[1]) != 4 ||
+		config.Drives[2]["drive_id"] != "volume" || config.Drives[2]["path_on_host"] != "/volume.ext4" ||
+		config.Drives[2]["is_root_device"] != false || config.Drives[2]["is_read_only"] != false ||
+		config.Drives[2]["cache_type"] != "Writeback" {
+		t.Fatalf("drives = %v", config.Drives)
+	}
+	if got := argAfter(host.vmmArgs[0], "--resource-limit"); got != fmt.Sprint("fsize=", 1024<<20) {
+		t.Fatalf("fsize = %q", got)
+	}
+
+	if volumes, _ := d.Volumes(ctx); len(volumes) != 1 || volumes[0].AttachedTo != fcTestID {
+		t.Fatalf("volumes = %+v", volumes)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("delete attached: %v", err)
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("second attach: %v", err)
+	}
+	if _, err := os.Stat(d.metaPath(fcTestID2)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused VM left a record: %v", err)
+	}
+	// A stopped VM still holds its volume until it is destroyed.
+	host.mu.Lock()
+	host.cgroups[fcTestID] = false
+	host.mu.Unlock()
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("attach held by a stopped VM: %v", err)
+	}
+	// So does one whose destroy stopped after removing the jail: only its
+	// record still names the volume.
+	if err := os.RemoveAll(d.jailDir(fcTestID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("attach held by a VM record without its jail: %v", err)
+	}
+
+	if err := d.Destroy(ctx, fcTestID); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(disk); err != nil || info.Size() != 128<<20 {
+		t.Fatalf("destroy lost the volume: %v %v", info, err)
+	}
+	if uid, ok := host.owner(disk); !ok || uid != 0 {
+		t.Fatalf("volume owner after destroy = %d %v", uid, ok)
+	}
+	if volumes, _ := d.Volumes(ctx); len(volumes) != 1 || volumes[0].AttachedTo != "" {
+		t.Fatalf("volumes = %+v", volumes)
+	}
+
+	// Any other link (a jail whose record is gone) holds the volume too.
+	stray := filepath.Join(cfg.Root, "stray.ext4")
+	if err := os.Link(disk, stray); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID2, "sbx0", volume.ID)); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("attach of a linked volume: %v", err)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("delete of a linked volume: %v", err)
+	}
+	if err := os.Remove(stray); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Of two concurrent creates attaching one volume, exactly one succeeds.
+func TestFirecrackerVolumeConcurrentAttach(t *testing.T) {
+	d, _, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 2)
+	for _, vm := range [][2]string{{fcTestID, "sbx0"}, {fcTestID2, "sbx1"}} {
+		go func() {
+			_, err := d.Create(ctx, volumeSpec(cfg, vm[0], vm[1], volume.ID))
+			errs <- err
+		}()
+	}
+	first, second := <-errs, <-errs
+	if (first == nil) == (second == nil) || !errors.Is(errors.Join(first, second), ErrVolumeInUse) {
+		t.Fatalf("concurrent attach: %v, %v", first, second)
 	}
 }

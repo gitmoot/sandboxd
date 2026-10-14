@@ -4,14 +4,13 @@
 // the js-e2b suite as tests/sandboxd/.
 import { afterAll, beforeAll, expect, test } from 'vitest'
 
-import { Sandbox, SandboxError, Secret, SecretError, Template, Volume, VolumeError } from '../../src'
+import { Sandbox, SandboxError, Secret, SecretError, Template } from '../../src'
 
 const DOC = '; see docs/compatibility.md#not-supported'
 const PAUSE = 'pause and resume are not supported: sandboxd never pauses a sandbox (deferred, owner decision D7)'
 const SNAPSHOTS = 'snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)'
 const FORK = 'fork is not supported: it needs snapshots (deferred with pause, D7)'
 const NETWORK = "network updates are not supported: a sandbox's network policy is fixed by the operator"
-const VOLUMES = "volumes are not supported: sandboxd keeps no storage beyond a sandbox's lifetime"
 const SECRETS = 'secrets are not supported: pass values to a sandbox in envVars instead'
 
 let sandbox: Sandbox
@@ -57,10 +56,6 @@ test('fork is refused', async () => {
 
 test('network updates are refused', async () => {
   await refused(SandboxError, NETWORK, () => sandbox.updateNetwork({}))
-})
-
-test('volumes are refused', async () => {
-  await refused(VolumeError, VOLUMES, () => Volume.create('volume'))
 })
 
 test('secrets are refused', async () => {

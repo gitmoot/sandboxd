@@ -34,6 +34,9 @@ const (
 	homeDir  = "/home/user"
 	homeDisk = "/dev/vdb"
 	envFile  = "/etc/sandboxd/env"
+	// volumeDisk is an e2b guest's attached volume, when the kernel
+	// command line names one (guestagent.VolumeArg).
+	volumeDisk = "/dev/vdc"
 	// envdKernelArg marks an e2b guest (vm.Spec.Envd): a writable overlay
 	// root on the per-VM disk and upstream envd as its service.
 	envdKernelArg = "sandboxd.envd=1"
@@ -135,6 +138,9 @@ func initGuest() {
 	if err := os.Symlink("pts/ptmx", "/dev/ptmx"); err != nil {
 		halt("ptmx: %v", err)
 	}
+	if envd {
+		mountVolume(string(cmdline))
+	}
 	if !envd {
 		// The writable home disk is fresh for every VM; its root belongs to
 		// the guest user, like the Apple driver's private volume.
@@ -184,6 +190,26 @@ func initGuest() {
 				halt("envd exited: %v", status)
 			}
 		}
+	}
+}
+
+// mountVolume mounts the attached volume (the third disk) where the kernel
+// argument says, after the pivot to the writable root and before envd starts.
+// The host formatted it once; it is never formatted here. A guest that cannot
+// mount its volume must not run without it.
+func mountVolume(cmdline string) {
+	path, err := guestagent.VolumePath(cmdline)
+	if err != nil {
+		halt("volume: %v", err)
+	}
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		halt("mkdir volume %s: %v", path, err)
+	}
+	if err := unix.Mount(volumeDisk, path, "ext4", unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
+		halt("mount volume %s: %v", path, err)
 	}
 }
 
@@ -319,6 +345,14 @@ func serve(envd bool) error {
 	if envd {
 		server.DialHost = "127.0.0.1"
 		server.DiskPath = "/"
+		// Init mounted the volume this names, or halted the VM.
+		cmdline, err := os.ReadFile("/proc/cmdline")
+		if err != nil {
+			return err
+		}
+		if server.VolumePath, err = guestagent.VolumePath(string(cmdline)); err != nil {
+			return err
+		}
 	}
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {

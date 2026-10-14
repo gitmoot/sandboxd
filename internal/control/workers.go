@@ -97,7 +97,8 @@ type member struct {
 	err        string
 }
 
-// refusal is a create that provably allocated nothing.
+// refusal is a create that provably allocated nothing, or one whose volume
+// the driver found in use (its row is then held like any failed start).
 type refusal struct {
 	status  int
 	message string
@@ -385,8 +386,9 @@ func (s *Service) pushExpiry(ctx context.Context, m *member, id string) error {
 
 // admit schedules row onto the online worker serving its template with the
 // most free capacity, and reserves a slot there under the worker's current
-// lease. Callers hold s.mu.
-func (s *Service) admit(ctx context.Context, row *store.Row) (*member, vm.Spec, error) {
+// lease. A row with a volume mount goes to the local worker or nowhere: the
+// volume lives on the gateway's own host. Callers hold s.mu.
+func (s *Service) admit(ctx context.Context, row *store.Row, mount *vm.VolumeMount) (*member, vm.Spec, error) {
 	rows, err := s.ledger.Active(ctx)
 	if err != nil {
 		return nil, vm.Spec{}, err
@@ -416,6 +418,9 @@ func (s *Service) admit(ctx context.Context, row *store.Row) (*member, vm.Spec, 
 	// enrolled has declared nothing, so it may yet serve the template.
 	known, mismatch := false, ""
 	for _, m := range s.workers {
+		if mount != nil && m != s.localMember {
+			continue
+		}
 		_, serves := m.serves[row.TemplateID]
 		known = known || serves || m.decl.ID == ""
 		if serves {
@@ -427,6 +432,12 @@ func (s *Service) admit(ctx context.Context, row *store.Row) (*member, vm.Spec, 
 		}
 	}
 	if len(candidates) == 0 {
+		if mount != nil {
+			if local := s.localMember; local != nil && local.online && local.lease != 0 {
+				return nil, vm.Spec{}, &refusal{http.StatusConflict, "a sandbox with a volume runs only on the gateway's local worker, which does not serve template " + row.TemplateID}
+			}
+			return nil, vm.Spec{}, &refusal{http.StatusServiceUnavailable, "a sandbox with a volume runs only on the gateway's local worker, which is unavailable"}
+		}
 		if !known && mismatch != "" {
 			return nil, vm.Spec{}, &refusal{http.StatusBadRequest, "no worker can run template " + row.TemplateID + "; " + mismatch}
 		}
@@ -454,7 +465,7 @@ func (s *Service) admit(ctx context.Context, row *store.Row) (*member, vm.Spec, 
 		}
 		row.Slot = slot
 		return c.m, vm.Spec{ID: row.ID, Image: row.Image, Network: slot, CPUs: row.CPUs, MemoryMiB: row.MemoryMiB,
-			Envd: rowProfile(row.Profile) == ProfileE2B}, nil
+			Envd: rowProfile(row.Profile) == ProfileE2B, Volume: mount}, nil
 	}
 	return nil, vm.Spec{}, &refusal{http.StatusConflict, "sandbox capacity exhausted: every compatible worker is full"}
 }

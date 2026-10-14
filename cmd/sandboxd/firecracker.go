@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"time"
 
@@ -27,7 +28,12 @@ type firecrackerFlags struct {
 	bootTimeout                        *time.Duration
 	consoleLog                         *bool
 	deny                               *egress.PrefixFlags
+	volumeBudgetMiB, volumeMiB         *int
+	volumeDir                          *string
 }
+
+// fcVolumeFlags are the flags that only a Firecracker gateway takes.
+var fcVolumeFlags = []string{"fc-volume-budget-mib", "fc-volume-mib", "fc-volume-dir"}
 
 func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 	deny := &egress.PrefixFlags{}
@@ -42,10 +48,24 @@ func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 		diskFloorMiB: flags.Int("fc-disk-floor-mib", 8192, "firecracker: refuse to create a VM unless this much disk stays free beyond its home disk"),
 		hostPort: flags.Int("fc-host-port", 0, "firecracker: the one host TCP port guests may reach, as 10.0.2.2:<port> = the host's 127.0.0.1:<port> "+
 			"(e.g. a credential gateway); 0 allows none"),
-		bootTimeout: flags.Duration("fc-boot-timeout", time.Minute, "firecracker: maximum time for the guest agent to answer after boot"),
-		consoleLog:  flags.Bool("fc-console-log", false, "firecracker: keep each guest's serial console in its jail for debugging"),
-		deny:        deny,
+		bootTimeout:     flags.Duration("fc-boot-timeout", time.Minute, "firecracker: maximum time for the guest agent to answer after boot"),
+		consoleLog:      flags.Bool("fc-console-log", false, "firecracker: keep each guest's serial console in its jail for debugging"),
+		deny:            deny,
+		volumeBudgetMiB: flags.Int("fc-volume-budget-mib", 0, "firecracker gateway: total MiB of durable e2b volumes; 0 (the default) disables volumes"),
+		volumeMiB:       flags.Int("fc-volume-mib", 512, "firecracker gateway: size of each new volume"),
+		volumeDir:       flags.String("fc-volume-dir", "", "firecracker gateway: volume directory on the fc-root filesystem (default <fc-root>/volumes)"),
 	}
+}
+
+// checkFirecrackerVolumeFlags refuses volume flags anywhere but on a
+// Firecracker gateway: an enrolled worker or another driver keeps none.
+func checkFirecrackerVolumeFlags(flags *flag.FlagSet, driver string, workerMode bool) error {
+	set := false
+	flags.Visit(func(f *flag.Flag) { set = set || slices.Contains(fcVolumeFlags, f.Name) })
+	if set && (workerMode || driver != "firecracker") {
+		return fmt.Errorf("fc-volume flags apply only to a firecracker gateway, not to a -worker-key-file worker or another driver")
+	}
+	return nil
 }
 
 // checkFirecrackerHostPort validates -fc-host-port: a TCP port other than

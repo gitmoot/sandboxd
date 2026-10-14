@@ -61,6 +61,10 @@ type Config struct {
 	// Workers are enrolled remote workers, in scheduling-preference order
 	// after the local worker.
 	Workers []Remote
+	// Volumes, when set, serves E2B's volume API and volumeMounts from the
+	// local driver's durable volumes; nil refuses both (501) as unsupported.
+	// A sandbox with a volume runs only on the local worker.
+	Volumes vm.Volumes
 }
 
 // Remote is one enrolled worker reached through its own transport.
@@ -93,6 +97,8 @@ type Service struct {
 	// or mu (SignedSandbox). signersMu is taken after mu, never before.
 	signersMu sync.RWMutex
 	signers   map[string]string
+	// volumes is Config.Volumes: nil when volumes are off.
+	volumes vm.Volumes
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -105,6 +111,9 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	}
 	if driver == nil && len(cfg.Workers) == 0 {
 		return nil, errors.New("sandbox control needs a local driver or an enrolled worker")
+	}
+	if cfg.Volumes != nil && driver == nil {
+		return nil, errors.New("volumes need a local driver: they are never placed on an enrolled worker")
 	}
 	extra := maps.Clone(cfg.Templates)
 	primaryID, primaryImage, localArch := "", "", ""
@@ -170,7 +179,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	}
 	s := &Service{ledger: ledger, cfg: cfg, templates: templates, tokenKey: slices.Clone(cfg.TokenSecret), workers: members, byID: make(map[string]*member, len(members)),
 		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{}),
-		signers: make(map[string]string)}
+		signers: make(map[string]string), volumes: cfg.Volumes}
 	rows, err := ledger.Active(ctx)
 	if err != nil {
 		_ = ledger.Close()
@@ -188,7 +197,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		}
 	}
 	s.cfg.APIKey = "" // never retain a second plaintext copy of the control key
-	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret = nil, nil, nil
+	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret, s.cfg.Volumes = nil, nil, nil, nil
 	go s.sweep()
 	return s, nil
 }
@@ -394,11 +403,15 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		s.notFound(w, r)
 		return
 	}
-	// So do the e2b-only routes below: logs, the alias lookup and the
-	// explicit refusals of unsupported E2B features (refusals.go).
+	// So do the e2b-only routes below: logs, the alias lookup, the volume API
+	// when configured (volumes.go) and the explicit refusals of unsupported
+	// E2B features (refusals.go).
 	if s.templates.e2b {
 		if alias, ok := strings.CutPrefix(path, "/templates/aliases/"); ok && r.Method == http.MethodGet && alias != "" && !strings.Contains(alias, "/") {
 			s.templateAlias(w, alias)
+			return
+		}
+		if s.volumes != nil && s.serveVolumes(w, r) {
 			return
 		}
 		if reason := apiRefusal(r); reason != "" {
@@ -637,7 +650,7 @@ func (s *Service) create(w http.ResponseWriter, r *http.Request) {
 	row := store.Row{ID: "sandboxd-" + idBytes, TokenHash: hash[:], Metadata: string(metadata), JobID: owner.job,
 		TemplateID: template.ID, Profile: string(ProfileStrict), Attempt: owner.attempt, Generation: owner.generation,
 		Fence: request.Metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row); err != nil {
+	if err := s.launch(r.Context(), &row, nil); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			apiError(w, refusal.status, refusal.message)
@@ -676,13 +689,14 @@ var errLaunch = errors.New("sandbox VM start failed or unproven")
 // launch schedules row onto a worker, starts its VM and marks it running.
 // It returns a *refusal for a request no worker can take, or another error
 // for an unavailable state (store.ErrLegacySlot included: a live pre-slot
-// row blocks admission until reconciliation proves it gone).
-func (s *Service) launch(ctx context.Context, row *store.Row) error {
+// row blocks admission until reconciliation proves it gone). A non-nil mount
+// attaches that volume and places the VM on the local worker only.
+func (s *Service) launch(ctx context.Context, row *store.Row, mount *vm.VolumeMount) error {
 	reconcileCtx, cancel := context.WithTimeout(ctx, workerTimeout)
 	s.reconcileAll(reconcileCtx)
 	cancel()
 	s.mu.Lock()
-	m, spec, err := s.admit(ctx, row)
+	m, spec, err := s.admit(ctx, row, mount)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -718,6 +732,11 @@ func (s *Service) launch(ctx context.Context, row *store.Row) error {
 		// A failed Create can have allocated a VM. Never release this reservation
 		// until a complete inventory or a successful targeted destroy proves absence.
 		_ = s.setState(context.Background(), row.ID, "unknown")
+		// The driver alone knows every VM trace holding a volume; the client
+		// learns why, while the row is held exactly as for any failed start.
+		if errors.Is(err, vm.ErrVolumeInUse) {
+			return &refusal{http.StatusConflict, "volume is attached to another sandbox"}
+		}
 		return errLaunch
 	}
 	if err := s.setState(context.Background(), row.ID, "running"); err != nil {

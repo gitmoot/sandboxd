@@ -260,3 +260,36 @@ func TestDialClosesIdleHostStreamWhenGuestPortCloses(t *testing.T) {
 		t.Fatal("bridge still running after both ends closed")
 	}
 }
+
+// OpSync always flushes; it reports an error only when the volume cannot be
+// remounted read-only (here: the path is not a mount point).
+func TestSyncRemountsVolume(t *testing.T) {
+	s := testServer(t)
+	if err := Sync(context.Background(), connect(t, s)); err != nil {
+		t.Fatalf("sync without a volume: %v", err)
+	}
+	s.VolumePath = t.TempDir()
+	if err := Sync(context.Background(), connect(t, s)); err == nil || !strings.Contains(err.Error(), "remount volume") {
+		t.Fatalf("sync of an unmounted volume = %v", err)
+	}
+}
+
+func TestVolumePathFromCmdline(t *testing.T) {
+	for cmdline, want := range map[string]string{
+		"console=ttyS0 sandboxd.envd=1":                   "",
+		"console=ttyS0 sandboxd.volume=/data quiet":       "/data",
+		"sandboxd.volume=/home/user/work sandboxd.envd=1": "/home/user/work",
+	} {
+		if got, err := VolumePath(cmdline); err != nil || got != want {
+			t.Errorf("VolumePath(%q) = %q, %v; want %q", cmdline, got, err, want)
+		}
+	}
+	for _, cmdline := range []string{
+		"sandboxd.volume=", "sandboxd.volume=/", "sandboxd.volume=data", "sandboxd.volume=/a/../b",
+		"sandboxd.volume=/a/", "sandboxd.volume=/a sandboxd.volume=/b", "sandboxd.volume=/a$b",
+	} {
+		if got, err := VolumePath(cmdline); err == nil {
+			t.Errorf("VolumePath(%q) = %q, want an error", cmdline, got)
+		}
+	}
+}

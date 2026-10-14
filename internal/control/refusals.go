@@ -28,6 +28,8 @@ const (
 	// DELETE /templates/{id} deletes a template or, for the SDKs'
 	// delete_snapshot, a snapshot.
 	refuseTemplateDelete = "deleting templates or snapshots through the API is not supported: the operator registers templates with the sandboxd CLI (D8) and sandboxd has no snapshots (D7)"
+	// With volumes configured (volumes.go), only their file API is refused.
+	refuseVolumeContent = "the volume content API is not supported: mount the volume in a sandbox (volumeMounts) and use its files there"
 )
 
 // refuse answers a request for a feature sandboxd does not support.
