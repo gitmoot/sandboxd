@@ -42,6 +42,11 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 	if err := driver.Arm(ctx); err != nil {
 		return nil, nil, fmt.Errorf("arm Firecracker host firewall: %w", err)
 	}
+	// A guest whose table may lag its recorded policy must not serve until
+	// the table is brought up to the record.
+	if err := driver.ReapplyEgress(ctx); err != nil {
+		return nil, nil, err
+	}
 	shutdown := func(ctx context.Context) error {
 		if err := driver.CleanupGuests(ctx); err != nil {
 			return fmt.Errorf("leave firewall armed; guest cleanup failed: %w", err)

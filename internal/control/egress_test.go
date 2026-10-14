@@ -142,7 +142,13 @@ func TestCreateEgressPolicy(t *testing.T) {
 		{"private traffic only", map[string]any{"templateID": "base", "network": map[string]any{"allowPublicTraffic": false}}, nil},
 		{"null fields", map[string]any{"templateID": "base", "allow_internet_access": nil, "network": map[string]any{"allowOut": nil}}, nil},
 		{"no internet", map[string]any{"templateID": "base", "allow_internet_access": false}, &vm.EgressPolicy{AllowInternet: false}},
-		{"internet", map[string]any{"templateID": "base", "allow_internet_access": true}, &vm.EgressPolicy{AllowInternet: true}},
+		// Equal to the default: no policy, so the sandbox is not pinned locally.
+		{"internet", map[string]any{"templateID": "base", "allow_internet_access": true}, nil},
+		{"internet, empty lists", map[string]any{"templateID": "base", "allow_internet_access": true,
+			"network": map[string]any{"allowOut": []string{}, "denyOut": []string{}, "allowPublicTraffic": false}}, nil},
+		{"internet with a hole kept for later", map[string]any{"templateID": "base", "allow_internet_access": true,
+			"network": map[string]any{"allowOut": []string{"1.0.0.1"}, "allowPublicTraffic": false}},
+			&vm.EgressPolicy{AllowInternet: true, Allow: prefixes(t, "1.0.0.1/32")}},
 		{"lists", map[string]any{"templateID": "base", "allow_internet_access": false,
 			"network": map[string]any{"allowOut": []string{"8.8.8.8", "1.1.1.0/24", "1.1.1.7/24"}, "denyOut": []string{"203.0.113.0/24"}, "allowPublicTraffic": false}},
 			&vm.EgressPolicy{AllowInternet: false, Allow: prefixes(t, "1.1.1.0/24", "8.8.8.8/32"), Deny: prefixes(t, "203.0.113.0/24")}},
@@ -350,10 +356,12 @@ func TestUpdateNetworkRefusals(t *testing.T) {
 		t.Fatalf("POST network: %d %s", got.Code, got.Body.String())
 	}
 
-	// Unknown and malformed IDs are not found.
+	// Unknown and malformed IDs are not found, whatever the body.
 	for _, other := range []string{"sandboxd-00000000000000000000000000000000", "bogus"} {
-		got := request(t, s, http.MethodPut, "/sandboxes/"+other+"/network", map[string]any{"allow_internet_access": false})
-		wantFailure(t, other, got, http.StatusNotFound, "")
+		for _, body := range []any{map[string]any{"allow_internet_access": false}, map[string]any{"rules": map[string]any{}}} {
+			got := request(t, s, http.MethodPut, "/sandboxes/"+other+"/network", body)
+			wantFailure(t, other, got, http.StatusNotFound, "")
+		}
 	}
 	// A strict sandbox has no network update.
 	strict := request(t, s, http.MethodPost, "/sandboxes", createBody("job-1", 1))

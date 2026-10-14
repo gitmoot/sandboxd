@@ -139,13 +139,17 @@ A policy only narrows what the namespace table forwards; the host table
 
 Guest packets are judged before any conntrack accept, so tightening a
 policy cuts established connections at once; conntrack admits only replies
-to the guest. An update replaces the namespace table in one `nft -f`
+to the guest. An update first records the new policy in the VM's ownership record, then
+replaces the namespace table in one `nft -f`
 transaction (delete and re-add, so the guest is never without a table and
 conntrack's NAT mappings survive), reads it back and requires the policy's
-digest exactly once and the host-port rule exactly as configured, then
-records the policy in the VM's ownership record. If the readback or the
-record fails, the recorded policy's table is put back (best effort), the
-update answers `503`, and the client can retry. A VM created with a policy
+digest exactly once and the host-port rule exactly as configured. If the
+readback fails, the previous record and table are put back (best effort),
+the update answers `503`, and the client can retry. Recording first means a
+daemon killed mid-update leaves the record ahead of the kernel, never behind:
+at every start sandboxd installs each running VM's recorded policy again
+(and destroys a VM whose policy it cannot install), so a crash during a
+tightening update never leaves the looser table in force. A VM created with a policy
 gets that table, read back the same way, before its VMM starts. DNS goes to
 the image's public resolvers (1.1.1.1, 8.8.8.8) like any destination, so a
 sandbox without internet has no DNS unless its `allowOut` lists them.
