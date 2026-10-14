@@ -202,7 +202,11 @@ func (d *FirecrackerDriver) WatchFirewallEvents(ctx context.Context) {
 			}
 		}
 	}()
-	defer func() { <-checked }()
+	// Every return ends the checker too, before waiting for it.
+	defer func() {
+		stop()
+		<-checked
+	}()
 	failures := 0
 	for ctx.Err() == nil {
 		started := time.Now()
