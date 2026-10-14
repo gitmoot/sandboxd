@@ -111,10 +111,13 @@ func createEgress(allowInternet, network json.RawMessage) (*vm.EgressPolicy, err
 			}
 		}
 	}
-	if !named {
+	policy := vm.DefaultEgress().Apply(update)
+	// A policy equal to the default (allow_internet_access:true, empty
+	// lists) changes nothing, so it must not pin the sandbox to the local
+	// worker either.
+	if !named || policy.Equal(vm.DefaultEgress()) {
 		return nil, nil
 	}
-	policy := vm.DefaultEgress().Apply(update)
 	return &policy, nil
 }
 
@@ -163,6 +166,15 @@ func networkUpdate(fields map[string]json.RawMessage) (vm.EgressUpdate, error) {
 // updateNetwork serves PUT /sandboxes/{id}/network for a running e2b sandbox
 // on the local worker, the only one whose driver enforces egress policies.
 func (s *Service) updateNetwork(w http.ResponseWriter, r *http.Request, id string) {
+	// An unknown sandbox is not found whatever the body says.
+	if !validID(id) {
+		s.fail(w, ProfileE2B, http.StatusNotFound, fmt.Sprintf("sandbox %q not found", id))
+		return
+	}
+	if _, _, err := s.live(r.Context(), id); err != nil {
+		s.fail(w, ProfileE2B, statusFor(err), fmt.Sprintf("sandbox %q unavailable", id))
+		return
+	}
 	var fields map[string]json.RawMessage
 	if err := decode(w, r, &fields); !errors.Is(err, io.EOF) || fields == nil {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid network update body")
@@ -171,10 +183,6 @@ func (s *Service) updateNetwork(w http.ResponseWriter, r *http.Request, id strin
 	update, err := networkUpdate(fields)
 	if err != nil {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, err.Error())
-		return
-	}
-	if !validID(id) {
-		s.fail(w, ProfileE2B, http.StatusNotFound, fmt.Sprintf("sandbox %q not found", id))
 		return
 	}
 	row, m, err := s.live(r.Context(), id)

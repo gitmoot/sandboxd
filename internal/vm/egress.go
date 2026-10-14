@@ -27,6 +27,11 @@ type EgressPolicy struct {
 // DefaultEgress is what a sandbox without a policy has: {AllowInternet: true}.
 func DefaultEgress() EgressPolicy { return EgressPolicy{AllowInternet: true} }
 
+// Equal reports whether p and q enforce the same policy (both canonical).
+func (p EgressPolicy) Equal(q EgressPolicy) bool {
+	return p.AllowInternet == q.AllowInternet && slices.Equal(p.Allow, q.Allow) && slices.Equal(p.Deny, q.Deny)
+}
+
 // EgressUpdate changes only the fields that are non-nil; omitted fields keep the current value
 // (sandboxd deliberately differs from E2B, whose update clears omitted fields: an update must never silently reopen the internet).
 type EgressUpdate struct {

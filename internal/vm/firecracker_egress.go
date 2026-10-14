@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -143,10 +144,13 @@ func (d *FirecrackerDriver) Egress(ctx context.Context, id string) (EgressPolicy
 	return *meta.Egress, nil
 }
 
-// UpdateEgress merges u into a running VM's policy, replaces its namespace
-// table with the merged policy's and then rewrites its record. If the table
-// cannot be confirmed or the record not rewritten, the recorded policy's
-// table is put back (best effort), so table and record agree.
+// UpdateEgress merges u into a running VM's policy, records it, then
+// replaces the VM's namespace table with the merged policy's. The record is
+// written first so that a crash in between leaves the record ahead of the
+// kernel, never behind: ReapplyEgress at the next start installs it, so the
+// table ends at the newest requested policy and a crash in a tightening
+// update can never leave the looser one in force. If the table cannot be
+// confirmed, record and table are put back (best effort).
 func (d *FirecrackerDriver) UpdateEgress(ctx context.Context, id string, u EgressUpdate) (EgressPolicy, error) {
 	if err := validAppleID(id); err != nil {
 		return EgressPolicy{}, err
@@ -174,24 +178,54 @@ func (d *FirecrackerDriver) UpdateEgress(ctx context.Context, id string, u Egres
 	if err := validEgress(merged); err != nil {
 		return EgressPolicy{}, err
 	}
-	err = d.enforceEgress(ctx, id, &merged)
-	if err == nil {
-		meta := *vm.meta
-		meta.Egress = &merged
-		if err = d.rewriteRecord(meta); err != nil {
-			err = fmt.Errorf("record egress policy of %q: %w", id, err)
-		}
+	meta := *vm.meta
+	meta.Egress = &merged
+	if err := d.rewriteRecord(meta); err != nil {
+		return EgressPolicy{}, fmt.Errorf("record egress policy of %q: %w", id, err)
 	}
-	if err != nil {
+	if err := d.enforceEgress(ctx, id, &merged); err != nil {
 		// The caller's context may be what failed; the restore gets its own.
 		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
+		if restoreErr := d.rewriteRecord(*vm.meta); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("restore previous egress record of %q: %w", id, restoreErr))
+		}
 		if restoreErr := d.enforceEgress(restoreCtx, id, vm.meta.Egress); restoreErr != nil {
 			err = errors.Join(err, fmt.Errorf("restore previous egress policy of %q: %w", id, restoreErr))
 		}
 		return EgressPolicy{}, err
 	}
 	return merged, nil
+}
+
+// ReapplyEgress installs every running e2b VM's recorded policy again. Run at
+// start, after Arm: a daemon killed during UpdateEgress can leave the record
+// ahead of the kernel table, and this brings the table up to it. A VM whose
+// policy cannot be installed is destroyed, since what its table enforces is
+// unknown. A VM with no recorded policy is left alone: its table was never
+// replaced.
+func (d *FirecrackerDriver) ReapplyEgress(ctx context.Context) error {
+	vms, err := d.inventory()
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, vm := range vms {
+		if !vm.running() || vm.meta.Egress == nil {
+			continue
+		}
+		d.egressMu.Lock()
+		err := d.enforceEgress(ctx, vm.id, vm.meta.Egress)
+		d.egressMu.Unlock()
+		if err == nil {
+			continue
+		}
+		log.Printf("firecracker: destroying %s: its recorded egress policy could not be installed: %v", vm.id, err)
+		if err := d.destroy(ctx, vm.id, false); err != nil {
+			errs = append(errs, fmt.Errorf("destroy %q after failing to reapply its egress policy: %w", vm.id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // enforceEgress atomically replaces VM id's namespace table with the one

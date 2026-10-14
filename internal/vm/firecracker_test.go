@@ -86,7 +86,8 @@ type fakeFCHost struct {
 	// FormatVolume target.
 	owners    map[string]int
 	formatted []string
-	// tables is the last ruleset each namespace's table was replaced with;
+	// tables is each namespace's current table: the one it was created with,
+	// or the last it was replaced with;
 	// failReplace fails the next replacements, and readback, when set,
 	// is what the replaced table reads back as.
 	tables      map[string]string
@@ -240,6 +241,12 @@ func (h *fakeFCHost) CreateNetwork(_ context.Context, network fcNetwork) error {
 	h.networks = append(h.networks, network)
 	h.netns[network.Netns] = true
 	h.cgroups[network.Cgroup] = true
+	if h.failNet == nil {
+		if h.tables == nil {
+			h.tables = map[string]string{}
+		}
+		h.tables[network.Netns] = network.Ruleset
+	}
 	return h.failNet
 }
 func (h *fakeFCHost) DeleteNetns(_ context.Context, name string) error {

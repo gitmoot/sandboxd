@@ -292,6 +292,65 @@ func TestFirecrackerUpdateEgressRollsBack(t *testing.T) {
 	check("nft")
 }
 
+// A daemon killed between recording a policy and installing its table
+// leaves the record ahead of the kernel. The next start installs the record,
+// so the table never stays at the older policy (here: looser). A VM whose
+// recorded policy cannot be installed is destroyed.
+func TestFirecrackerReapplyEgress(t *testing.T) {
+	ctx := context.Background()
+	d, host, cfg := newTestFirecracker(t)
+	open := DefaultEgress()
+	plain := fcEnvdSpec(fcTestID2, "sbx1", nil)
+	plain.Image = cfg.Images[0]
+	spec := fcEnvdSpec(fcTestID, "sbx0", &open)
+	spec.Image = cfg.Images[0]
+	for _, s := range []Spec{spec, plain} {
+		if _, err := d.Create(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	netns, plainNetns := fcNetnsPrefix+fcTestID, fcNetnsPrefix+fcTestID2
+	plainTable := host.tables[plainNetns]
+	// The crash: the tighter policy reached the record, not the table.
+	closed := EgressPolicy{Allow: prefixes(t, "1.0.0.1/32")}
+	meta, err := d.readMeta(fcTestID)
+	if err != nil || meta == nil {
+		t.Fatal(meta, err)
+	}
+	meta.Egress = &closed
+	if err := d.rewriteRecord(*meta); err != nil {
+		t.Fatal(err)
+	}
+	if host.tables[netns] != fcNetnsPolicyRuleset(d.deny4, 0, open) {
+		t.Fatal("setup: table already changed")
+	}
+
+	restarted, err := newFirecrackerDriver(cfg, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ReapplyEgress(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := host.tables[netns]; got != fcNetnsPolicyRuleset(d.deny4, 0, closed) {
+		t.Fatalf("table after reapply:\n%s", got)
+	}
+	if host.tables[plainNetns] != plainTable {
+		t.Fatal("reapply touched a VM without a recorded policy")
+	}
+
+	host.failReplace = 1
+	if err := restarted.ReapplyEgress(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := restarted.lookup(fcTestID); err != nil || found {
+		t.Fatalf("VM whose policy could not be installed still exists: %t %v", found, err)
+	}
+	if _, found, _ := restarted.lookup(fcTestID2); !found {
+		t.Fatal("VM without a recorded policy was destroyed")
+	}
+}
+
 func TestFirecrackerRecordEgressIsStrict(t *testing.T) {
 	ctx := context.Background()
 	d, _, cfg := newTestFirecracker(t)
