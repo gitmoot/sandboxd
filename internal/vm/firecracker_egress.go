@@ -198,12 +198,17 @@ func (d *FirecrackerDriver) UpdateEgress(ctx context.Context, id string, u Egres
 	return merged, nil
 }
 
-// ReapplyEgress installs every running e2b VM's recorded policy again. Run at
-// start, after Arm: a daemon killed during UpdateEgress can leave the record
-// ahead of the kernel table, and this brings the table up to it. A VM whose
-// policy cannot be installed is destroyed, since what its table enforces is
-// unknown. A VM with no recorded policy is left alone: its table was never
-// replaced.
+// ReapplyEgress installs every running e2b VM's recorded policy again. Run it
+// once at start, after Arm and before serving: it snapshots the inventory
+// first, so run while UpdateEgress can be live it could install an older
+// policy over a newer one. A daemon killed during UpdateEgress can leave the
+// record ahead of the kernel table, and this brings the table up to it. A VM
+// whose policy cannot be installed is destroyed, since what its table
+// enforces is unknown; its volume is flushed first (over vsock, not the
+// network, and only while the host firewall is confirmed). A VM with no
+// recorded policy is left alone: its table was never replaced. UpdateEgress
+// always records the merged policy, even one equal to the default, so every
+// replaced table is covered here.
 func (d *FirecrackerDriver) ReapplyEgress(ctx context.Context) error {
 	vms, err := d.inventory()
 	if err != nil {
@@ -221,7 +226,7 @@ func (d *FirecrackerDriver) ReapplyEgress(ctx context.Context) error {
 			continue
 		}
 		log.Printf("firecracker: destroying %s: its recorded egress policy could not be installed: %v", vm.id, err)
-		if err := d.destroy(ctx, vm.id, false); err != nil {
+		if err := d.destroy(ctx, vm.id, true); err != nil {
 			errs = append(errs, fmt.Errorf("destroy %q after failing to reapply its egress policy: %w", vm.id, err))
 		}
 	}
