@@ -316,6 +316,19 @@ func (h *linuxFCHost) DeleteNetns(ctx context.Context, name string) error {
 	return err
 }
 
+// ReplaceNetnsFirewall swaps the namespace's table in one transaction, as
+// ApplyFirewall does the host's: the guest is never without one, and
+// conntrack (with its NAT mappings) survives the swap.
+func (h *linuxFCHost) ReplaceNetnsFirewall(ctx context.Context, netns, ruleset string) (string, error) {
+	ns := "--net=" + h.NetnsPath(netns)
+	script := "table inet " + fcNetnsTable + " {}\ndelete table inet " + fcNetnsTable + "\n" + ruleset
+	if _, err := h.run(ctx, []byte(script), h.tools.nsenter, ns, "--", h.tools.nft, "-f", "-"); err != nil {
+		return "", err
+	}
+	state, err := h.run(ctx, nil, h.tools.nsenter, ns, "--", h.tools.nft, "-s", "list", "table", "inet", fcNetnsTable)
+	return string(state), err
+}
+
 // startInCgroup starts c directly inside cgroup name (clone3 CLONE_INTO_CGROUP),
 // so it is never outside the cgroup that Destroy kills.
 func startInCgroup(c *exec.Cmd, name string) error {
@@ -412,7 +425,7 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 	if err != nil {
 		return err
 	}
-	if err := fcCheckNetnsHostPortState(string(state), network.HostPort); err != nil {
+	if err := fcCheckNetnsState(string(state), network.HostPort, network.Marker); err != nil {
 		return err
 	}
 	ready, readyWrite, err := os.Pipe()

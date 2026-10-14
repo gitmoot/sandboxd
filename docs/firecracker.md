@@ -110,6 +110,46 @@ that guests reach a host listener on the allowed port at 10.0.2.2 and not on
 the host's own addresses, and that a second listener on another port, host
 SSH, UDP to the alias and the rest of the deny list stay unreachable.
 
+### Per-sandbox egress policies
+
+A gateway whose local driver is Firecracker enforces E2B's
+`allow_internet_access` and `network.allowOut`/`denyOut` for `e2b`
+sandboxes, at create and through `PUT /sandboxes/{id}/network` (API
+semantics: [compatibility](compatibility.md#egress-policies)). There is
+nothing to configure: the per-sandbox request is the opt-in. A sandbox
+created without one keeps the namespace table above, byte for byte;
+`gitmoot-strict` sandboxes never get a policy. Enrolled workers, the Mac
+driver and `sandboxd-dev` enforce none, so the gateway refuses such requests
+(or places the sandbox on its local worker only) instead of ignoring them.
+
+A policy only narrows what the namespace table forwards; the host table
+`inet sbx_fc` is the same for every guest. The policy VM's `inet sbx_vm`
+`forward` chain judges every packet from `sbxvm0`, in order:
+
+1. the `-fc-host-port` exception (TCP `10.0.2.2:<port>`), so a sandbox
+   without internet still reaches its gateway;
+2. the always-denied set (set `deny4`: the deny list above plus every
+   `-fc-deny-cidr`), rejected: no policy reopens it, and the host table
+   rejects it again;
+3. the policy's `allowOut` (set `allow4`), accepted;
+4. with internet access, the policy's `denyOut` (set `udeny4`) rejected and
+   every other IPv4 destination accepted; without, nothing more;
+5. everything else rejected (IPv6 included). This last rule carries a
+   comment with a digest of the policy.
+
+Guest packets are judged before any conntrack accept, so tightening a
+policy cuts established connections at once; conntrack admits only replies
+to the guest. An update replaces the namespace table in one `nft -f`
+transaction (delete and re-add, so the guest is never without a table and
+conntrack's NAT mappings survive), reads it back and requires the policy's
+digest exactly once and the host-port rule exactly as configured, then
+records the policy in the VM's ownership record. If the readback or the
+record fails, the recorded policy's table is put back (best effort), the
+update answers `503`, and the client can retry. A VM created with a policy
+gets that table, read back the same way, before its VMM starts. DNS goes to
+the image's public resolvers (1.1.1.1, 8.8.8.8) like any destination, so a
+sandbox without internet has no DNS unless its `allowOut` lists them.
+
 ## Recovery
 
 The driver keeps no in-memory state. Its inventory joins the ownership

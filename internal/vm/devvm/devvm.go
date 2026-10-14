@@ -139,6 +139,10 @@ func (d *Driver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 	if spec.Image == "" || spec.Network == "" || spec.CPUs < 1 || spec.MemoryMiB < 1 {
 		return vm.Instance{}, errors.New("guest image, network, CPU and memory must be set")
 	}
+	if spec.Egress != nil {
+		// Dev guests share the host network; a policy is refused, never ignored.
+		return vm.Instance{}, fmt.Errorf("dev driver: %w", vm.ErrEgressUnsupported)
+	}
 	if err := ctx.Err(); err != nil {
 		return vm.Instance{}, err
 	}

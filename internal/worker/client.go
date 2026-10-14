@@ -153,6 +153,10 @@ func (c *Client) CreateUntil(ctx context.Context, spec vm.Spec, ends time.Time) 
 	if spec.Volume != nil {
 		return vm.Instance{}, fmt.Errorf("worker %s: create %s: volumes are never placed on an enrolled worker", c.id, spec.ID)
 	}
+	if spec.Egress != nil {
+		// The worker API carries no policy; sending the rest would ignore it.
+		return vm.Instance{}, fmt.Errorf("worker %s: create %s: %w", c.id, spec.ID, vm.ErrEgressUnsupported)
+	}
 	body, err := json.Marshal(createRequest{ID: spec.ID, Image: spec.Image, Network: spec.Network, CPUs: spec.CPUs,
 		MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Ends: ends.UTC()})
 	if err != nil {

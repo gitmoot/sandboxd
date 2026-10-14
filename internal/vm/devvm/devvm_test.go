@@ -311,6 +311,21 @@ func TestVolumesOffRefuseEverything(t *testing.T) {
 	}
 }
 
+// The dev driver cannot confine a guest's network: a policy is refused, and
+// nothing is created.
+func TestCreateRefusesEgressPolicy(t *testing.T) {
+	d := newDriver(t)
+	ctx := context.Background()
+	spec := vm.Spec{ID: "sandboxd-a", Image: "img", Network: "slot-0", CPUs: 1, MemoryMiB: 256, Envd: true,
+		Egress: &vm.EgressPolicy{AllowInternet: true}}
+	if _, err := d.Create(ctx, spec); !errors.Is(err, vm.ErrEgressUnsupported) {
+		t.Fatalf("guest with an egress policy: %v", err)
+	}
+	if instances, err := d.List(ctx); err != nil || len(instances) != 0 {
+		t.Fatalf("refused create left %v, %v", instances, err)
+	}
+}
+
 func TestVolumeAttachRulesAndInUse(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "guests")
 	d := newVolumeDriver(t, root)

@@ -307,6 +307,29 @@ func TestClientRefusesVolumeSpec(t *testing.T) {
 	}
 }
 
+// No enrolled worker enforces an egress policy: the client refuses the spec
+// without sending anything, never creating the sandbox with open egress.
+func TestClientRefusesEgressSpec(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(ts.Close)
+	client, err := NewClient("linux-1", ts.URL, testKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := spec(vmA)
+	s.Egress = &vm.EgressPolicy{}
+	if _, err := client.CreateUntil(context.Background(), s, time.Now().Add(time.Minute)); !errors.Is(err, vm.ErrEgressUnsupported) {
+		t.Fatalf("create with an egress policy: %v", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("client sent %d requests", n)
+	}
+}
+
 func TestUsageWithoutMeter(t *testing.T) {
 	_, ts := serve(t, plainDriver{newFake()})
 	client := enrolled(t, ts.URL, 1)
