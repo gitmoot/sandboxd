@@ -97,6 +97,9 @@ func run(ctx context.Context, args []string) (runErr error) {
 		return fmt.Errorf("image, template and worker-id are required for a local driver, plus pin-image and pf-socket for the apple driver; " +
 			"a gateway (no -worker-key-file) also needs db, api-key-file, domain and gateway-host")
 	}
+	if err := checkFirecrackerVolumeFlags(flags, *driverName, workerMode); err != nil {
+		return err
+	}
 	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0 || *tokenSecretFile != "") {
 		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and takes no -enroll, -template-arch or -token-secret-file")
 	}
@@ -184,6 +187,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	// A local driver's image allowlist is exactly the images it serves.
 	images := control.Images(*image, registered.Templates)
 	var driver isolatedDriver
+	var volumes vm.Volumes
 	switch *driverName {
 	case "apple":
 		gate, err := firewall.NewClient(*pfSocket)
@@ -238,6 +242,14 @@ func run(ctx context.Context, args []string) (runErr error) {
 		}()
 		log.Printf("Firecracker guests confined by nftables table inet sbx_fc and per-VM namespaces")
 		driver = firecracker
+		// Volumes exist only on a gateway (worker mode refuses the flags).
+		if *fc.volumeBudgetMiB != 0 {
+			var ok bool
+			if volumes, ok = firecracker.(vm.Volumes); !ok {
+				return errors.New("this Firecracker driver keeps no volumes")
+			}
+			log.Printf("Firecracker volumes on: %d MiB each, %d MiB in total", *fc.volumeMiB, *fc.volumeBudgetMiB)
+		}
 	}
 	var handler http.Handler
 	if workerMode {
@@ -253,7 +265,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 		go server.ReapEvery(reapCtx, time.Second)
 		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
 	} else {
-		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Templates: templates, TokenSecret: tokenSecret, Workers: remotes}
+		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Templates: templates, TokenSecret: tokenSecret, Workers: remotes,
+			Volumes: volumes}
 		var local vm.Driver
 		if driver != nil {
 			local = driver

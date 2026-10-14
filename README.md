@@ -22,8 +22,10 @@ change is needed for the supported operations.
 >   ([#38](https://github.com/gitmoot/sandboxd/issues/38)).
 > - There is **one API key per server** and no tenants or quotas. A server
 >   is meant for one operator or team, not for strangers sharing it.
-> - Pause, resume, snapshots, fork, volumes, secrets and template builds
->   through the API are refused (see [Not supported yet](#not-supported-yet)).
+> - Pause, resume, snapshots, fork, secrets and template builds through the
+>   API are refused (see [Not supported yet](#not-supported-yet)). Volumes
+>   are opt-in on the Linux worker only
+>   ([volumes](docs/compatibility.md#volumes)).
 
 sandboxd runs Gitmoot's opt-in Mac execution provider and its Linux
 provider on a Firecracker host.
@@ -87,9 +89,13 @@ route by route.
 - **Template builds through the API.** Templates are built with the scripts
   in [`images/`](images) and registered by the operator with
   `-register-template`.
-- **Volumes, secrets, IAM, MCP gateways, network policy updates and public
-  guest ports.** Refused with a `501`
+- **Secrets, IAM, MCP gateways, network policy updates and public guest
+  ports.** Refused with a `501`
   ([full list](docs/compatibility.md#not-supported)).
+- **Volumes on the Mac, on enrolled workers, or through the volume content
+  API.** Volumes are off by default; a Firecracker gateway serves them with
+  `-fc-volume-budget-mib` ([volumes](docs/compatibility.md#volumes)).
+  Everywhere else they are refused with a `501`.
 - **Firecracker on arm64 hosts.** The Firecracker worker runs only on
   x86_64. The linux-arm64 release has only `sandboxd`, for a gateway that
   schedules onto enrolled workers.

@@ -112,7 +112,8 @@ func absent(raw json.RawMessage) bool {
 }
 
 // unsupported names the first requested option sandboxd cannot honour yet.
-func (request createV2Request) unsupported() string {
+// volumeMounts are honoured only with volumes configured.
+func (request createV2Request) unsupported(volumes bool) string {
 	switch {
 	case request.AutoPause != nil && *request.AutoPause:
 		return "autoPause (pause and resume) is not supported"
@@ -126,7 +127,7 @@ func (request createV2Request) unsupported() string {
 		return "MCP gateways are not supported"
 	case !absent(request.IAM):
 		return "IAM options are not supported"
-	case !absent(request.VolumeMounts):
+	case !volumes && !absent(request.VolumeMounts):
 		return "volume mounts are not supported"
 	}
 	return ""
@@ -149,7 +150,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid sandbox request body")
 		return
 	}
-	if reason := request.unsupported(); reason != "" {
+	if reason := request.unsupported(s.volumes != nil); reason != "" {
 		s.refuse(w, reason)
 		return
 	}
@@ -189,6 +190,11 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid metadata")
 		return
 	}
+	mount, status, reason := s.volumeMount(r.Context(), request.VolumeMounts)
+	if status != 0 {
+		s.fail(w, ProfileE2B, status, reason)
+		return
+	}
 	idBytes, err := randomHex(16)
 	if err != nil {
 		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "sandbox state unavailable")
@@ -200,7 +206,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	row := store.Row{ID: id, TokenHash: hash[:], Metadata: string(encoded), JobID: fence.job,
 		TemplateID: template.ID, Profile: string(ProfileE2B), Attempt: fence.attempt, Generation: fence.generation,
 		Fence: metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row); err != nil {
+	if err := s.launch(r.Context(), &row, mount); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			s.fail(w, ProfileE2B, refusal.status, refusal.message)

@@ -79,13 +79,19 @@ func (e Envd) validate() error {
 	return nil
 }
 
-// createEnvd starts an envd guest in dir. Callers hold d.mu.
-func (d *Driver) createEnvd(spec vm.Spec, dir string) (*guest, error) {
+// createEnvd starts an envd guest in dir, with the volume directory
+// volumeDir (if not "") mounted at spec.Volume.Path. Callers hold d.mu.
+func (d *Driver) createEnvd(spec vm.Spec, dir, volumeDir string) (*guest, error) {
 	if d.envd.Binary == "" {
 		return nil, fmt.Errorf("dev driver: %w (start sandboxd-dev with -envd)", vm.ErrNoEnvd)
 	}
 	args := append(append([]string{}, d.envd.Helper[1:]...), EnvdGuestCommand, dir, d.envd.Binary,
 		strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid()))
+	var volume string
+	if volumeDir != "" {
+		args = append(args, volumeDir, spec.Volume.Path)
+		volume = spec.Volume.ID
+	}
 	helper := exec.Command(d.envd.Helper[0], args...)
 	helper.Dir = "/"
 	helper.Env = []string{"PATH=" + guestPath}
@@ -105,7 +111,7 @@ func (d *Driver) createEnvd(spec vm.Spec, dir string) (*guest, error) {
 		return nil, err
 	}
 	g := &guest{network: spec.Network, memoryMiB: spec.MemoryMiB, dir: dir, home: filepath.Join(dir, "home"),
-		holder: helper, exited: make(chan struct{}), envd: true, lifeline: lifeline, console: console}
+		holder: helper, exited: make(chan struct{}), envd: true, lifeline: lifeline, console: console, volume: volume}
 	go func() {
 		_ = helper.Wait()
 		close(g.exited)
@@ -179,11 +185,12 @@ func (g *guest) destroyEnvd(ctx context.Context) error {
 }
 
 // RunEnvdGuest is the root helper (args after EnvdGuestCommand: guest
-// directory, envd binary, owner UID and GID). It starts the guest's init in
-// new namespaces and returns when that init exits.
+// directory, envd binary, owner UID and GID, then optionally a volume
+// directory and its guest mount path). It starts the guest's init in new
+// namespaces and returns when that init exits.
 func RunEnvdGuest(args []string) error {
-	if len(args) != 4 {
-		return errors.New("usage: envd-guest <dir> <envd> <uid> <gid>")
+	if len(args) != 4 && len(args) != 6 {
+		return errors.New("usage: envd-guest <dir> <envd> <uid> <gid> [<volume dir> <mount path>]")
 	}
 	if os.Geteuid() != 0 {
 		return errors.New("the envd guest helper must run as root")
@@ -217,10 +224,17 @@ func RunEnvdGuestInit(args []string) (bool, error) {
 
 // envdInit is PID 1 of an envd guest's namespaces.
 func envdInit(args []string) error {
-	if len(args) != 4 || os.Getpid() != 1 {
+	if (len(args) != 4 && len(args) != 6) || os.Getpid() != 1 {
 		return errors.New("envd guest init must be PID 1 of its namespaces")
 	}
 	dir, binary := args[0], args[1]
+	var volume guestVolume
+	if len(args) == 6 {
+		volume = guestVolume{dir: args[4], path: args[5]}
+		if !filepath.IsAbs(volume.dir) || filepath.Clean(volume.dir) != volume.dir || !validGuestMount(volume.path) {
+			return errors.New("invalid envd guest volume arguments")
+		}
+	}
 	uid, err1 := strconv.Atoi(args[2])
 	gid, err2 := strconv.Atoi(args[3])
 	if err := errors.Join(err1, err2); err != nil || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
@@ -260,7 +274,7 @@ func envdInit(args []string) error {
 	defer unix.Close(envdFD)
 	// A guest's default umask, as in E2B's guests.
 	unix.Umask(0o022)
-	if err := setupEnvdGuest(dir); err != nil {
+	if err := setupEnvdGuest(dir, volume); err != nil {
 		return err
 	}
 	children := make(chan os.Signal, 16)
@@ -305,8 +319,13 @@ func envdInit(args []string) error {
 	}
 }
 
-// setupEnvdGuest gives the guest its private directories and identities.
-func setupEnvdGuest(dir string) error {
+// guestVolume is a host volume directory and its guest mount path; the zero
+// value is no volume.
+type guestVolume struct{ dir, path string }
+
+// setupEnvdGuest gives the guest its private directories and identities, and
+// mounts its volume.
+func setupEnvdGuest(dir string, volume guestVolume) error {
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("make mounts private: %w", err)
 	}
@@ -368,6 +387,20 @@ func setupEnvdGuest(dir string) error {
 		defer unix.Close(fd)
 		sources[i] = fd
 	}
+	volumeFD := -1
+	if volume.dir != "" {
+		fd, err := unix.Open(volume.dir, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open volume %s: %w", volume.dir, err)
+		}
+		defer unix.Close(fd)
+		// The guest user owns its volume, as it owns its home.
+		if err := errors.Join(unix.Fchownat(fd, "", guestUID, guestGID, unix.AT_EMPTY_PATH),
+			os.Chmod(fmt.Sprintf("/proc/self/fd/%d", fd), 0o755)); err != nil {
+			return fmt.Errorf("own volume %s: %w", volume.dir, err)
+		}
+		volumeFD = fd
+	}
 	mounts := []struct{ source, target, fstype, data string }{
 		{"tmpfs", "/home", "tmpfs", "mode=0755,size=1m"},
 		{"tmpfs", "/run", "tmpfs", "mode=0755,size=32m"},
@@ -385,7 +418,29 @@ func setupEnvdGuest(dir string) error {
 			return fmt.Errorf("bind %s: %w", bind[1], err)
 		}
 	}
+	if volumeFD >= 0 {
+		if err := mountVolume(volumeFD, volume.path); err != nil {
+			return fmt.Errorf("mount volume at %s: %w", volume.path, err)
+		}
+	}
 	return nil
+}
+
+// mountVolume binds volume directory fd at path below the freshly bound
+// guest home, creating missing directories owned by the guest user. The home
+// is new, so no component can be a symlink yet.
+func mountVolume(fd int, path string) error {
+	current := GuestHome
+	for _, part := range strings.Split(strings.TrimPrefix(path, GuestHome+"/"), "/") {
+		current += "/" + part
+		if err := os.Mkdir(current, 0o755); err != nil {
+			return err
+		}
+		if err := os.Lchown(current, guestUID, guestGID); err != nil {
+			return err
+		}
+	}
+	return unix.Mount(fmt.Sprintf("/proc/self/fd/%d", fd), current, "", unix.MS_BIND, "")
 }
 
 // cleanEnvdGuest removes what the helper created; the guest's processes are

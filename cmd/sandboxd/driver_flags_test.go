@@ -40,6 +40,12 @@ func TestDriverSelectionAndFirecrackerCap(t *testing.T) {
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43190"}, "own listen port 43190"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-listen", "127.0.0.1:43190", "-fc-host-port", "43180"}, "read API key"},
 		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-host-port", "https"}, "invalid value"},
+		// Volume flags belong to a Firecracker gateway only.
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-volume-budget-mib", "4096"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-fc-volume-mib", "1024", "-fc-volume-dir", "/v"}, "read API key"},
+		{[]string{"-driver", "firecracker", "-image", "/x.ext4", "-worker-key-file", "/nonexistent/wk", "-fc-volume-budget-mib", "4096"}, "fc-volume flags apply only"},
+		{[]string{"-driver", "none", "-fc-volume-budget-mib", "4096"}, "fc-volume flags apply only"},
+		{[]string{"-image", "linux-arm64", "-pin-image", "x", "-pf-socket", "/run/pf.sock", "-fc-volume-dir", "/v"}, "fc-volume flags apply only"},
 	} {
 		err := run(context.Background(), append(append([]string(nil), common...), tc.args...))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

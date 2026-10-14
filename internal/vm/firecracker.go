@@ -87,6 +87,14 @@ type FirecrackerConfig struct {
 	// for a host service such as a credential gateway. Every other host
 	// port and address stays denied. Zero (the default) allows none.
 	HostPort int
+	// VolumeBudgetMiB, when nonzero, enables durable volumes (Volumes): the
+	// total MiB all volumes may take. Each volume is a VolumeMiB ext4 file
+	// in VolumeDir, which must be on Root's filesystem (it is hard-linked
+	// into the jail of the VM it is attached to). Zero keeps volumes off;
+	// VolumeDir and VolumeMiB are then ignored.
+	VolumeBudgetMiB int
+	VolumeMiB       int
+	VolumeDir       string
 }
 
 // FirecrackerDriver runs one Firecracker microVM per sandbox under the jailer:
@@ -113,12 +121,19 @@ type FirecrackerDriver struct {
 	// process (see firecracker_console.go).
 	consoleMu sync.Mutex
 	consoles  map[string]*Console
+
+	// volumeMu orders every volume create, delete, attach and release, so
+	// an attach's in-use check and its record write are one step.
+	volumeMu sync.Mutex
+	// mkfs is the trusted host mkfs.ext4, set when volumes are on.
+	mkfs string
 }
 
 var (
 	_ Driver        = (*FirecrackerDriver)(nil)
 	_ ResourceMeter = (*FirecrackerDriver)(nil)
 	_ PortDialer    = (*FirecrackerDriver)(nil)
+	_ Volumes       = (*FirecrackerDriver)(nil)
 )
 
 // ErrDiskFloor reports that creating a VM would leave less free disk than the
@@ -131,6 +146,9 @@ type fcHost interface {
 	TrustedFile(path string, executable bool) error
 	FreeBytes(path string) (uint64, error)
 	Chown(path string, uid, gid int) error
+	// FormatVolume runs the trusted mkfs binary on the volume image file
+	// path; nothing is mounted on the host.
+	FormatVolume(ctx context.Context, mkfs, path string) error
 
 	ApplyFirewall(ctx context.Context, ruleset string) error
 	FirewallState(ctx context.Context) (string, error)
@@ -189,6 +207,13 @@ type fcMeta struct {
 	MemoryMiB int    `json:"memoryMiB"`
 	// Envd marks an e2b guest (Spec.Envd); only those serve DialPort.
 	Envd bool `json:"envd,omitempty"`
+	// Volume is the attached volume's ID, VolumePath its ext4 file on the
+	// host and VolumeMiB its size. The record holds the volume until it is
+	// removed, and lets Destroy return the file to root whatever the
+	// current configuration.
+	Volume     string `json:"volume,omitempty"`
+	VolumePath string `json:"volumePath,omitempty"`
+	VolumeMiB  int    `json:"volumeMiB,omitempty"`
 }
 
 func cleanAbs(path string) bool {
@@ -258,8 +283,14 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	cfg.Images = slices.Clone(cfg.Images)
 	cfg.Slots = slices.Clone(cfg.Slots)
 	cfg.DenyCIDRs = slices.Clone(cfg.DenyCIDRs)
-	return &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host,
-		firewallEvery: time.Second}, nil
+	d := &FirecrackerDriver{cfg: cfg, images: images, deny4: prefixStrings(deny4), deny6: prefixStrings(deny6), host: host,
+		firewallEvery: time.Second}
+	if cfg.VolumeBudgetMiB != 0 {
+		if err := d.initVolumes(); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
 }
 
 func prefixStrings(prefixes []netip.Prefix) []string {
@@ -545,6 +576,10 @@ func (d *FirecrackerDriver) readMeta(id string) (*fcMeta, error) {
 	if json.Unmarshal(data, &meta) != nil || meta.ID != id || !slices.Contains(d.cfg.Slots, meta.Slot) {
 		return nil, nil
 	}
+	if meta.Volume != "" && (!ValidVolumeID(meta.Volume) || !cleanAbs(meta.VolumePath) ||
+		filepath.Base(meta.VolumePath) != meta.Volume+".ext4" || meta.VolumeMiB < 1) {
+		return nil, nil
+	}
 	slot := slices.Index(d.cfg.Slots, meta.Slot)
 	if meta.VMMUID != d.cfg.UIDBase+slot || meta.NetUID != d.cfg.UIDBase+fcUIDStride+slot {
 		return nil, nil
@@ -699,12 +734,17 @@ func (d *FirecrackerDriver) List(ctx context.Context) ([]Instance, error) {
 // overlay root and upstream envd (cmd/sandboxd-guest-agent).
 const fcEnvdBootArg = "sandboxd.envd=1"
 
-func (d *FirecrackerDriver) bootArgs(envd bool) string {
+// bootArgs names an attached volume's guest path only when there is one, so
+// a VM without a volume boots exactly as before volumes existed.
+func (d *FirecrackerDriver) bootArgs(envd bool, volumePath string) string {
 	args := "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux i8042.nomux i8042.dumbkbd " +
 		"random.trust_cpu=on quiet init=/sbin/sandboxd-agent " +
 		"ip=" + fcGuestAddr + "::" + fcGatewayAddr + ":255.255.255.252:sandbox:eth0:off"
 	if envd {
 		args += " " + fcEnvdBootArg
+	}
+	if volumePath != "" {
+		args += " " + guestagent.VolumeArg + volumePath
 	}
 	return args
 }
@@ -715,13 +755,22 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 		Path     string `json:"path_on_host"`
 		Root     bool   `json:"is_root_device"`
 		ReadOnly bool   `json:"is_read_only"`
+		// Cache is set only on the volume: Writeback passes the guest's
+		// flushes to the host file, so a synced volume is on disk.
+		Cache string `json:"cache_type,omitempty"`
+	}
+	drives := []drive{
+		{ID: "rootfs", Path: "/rootfs.ext4", Root: true, ReadOnly: true},
+		{ID: "home", Path: "/home.ext4"},
+	}
+	volumePath := ""
+	if spec.Volume != nil {
+		volumePath = spec.Volume.Path
+		drives = append(drives, drive{ID: fcVolumeDrive, Path: fcVolumeFile, Cache: "Writeback"})
 	}
 	return json.MarshalIndent(map[string]any{
-		"boot-source": map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec.Envd)},
-		"drives": []drive{
-			{ID: "rootfs", Path: "/rootfs.ext4", Root: true, ReadOnly: true},
-			{ID: "home", Path: "/home.ext4"},
-		},
+		"boot-source":    map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec.Envd, volumePath)},
+		"drives":         drives,
 		"machine-config": map[string]any{"vcpu_count": spec.CPUs, "mem_size_mib": spec.MemoryMiB, "smt": false},
 		"network-interfaces": []map[string]any{
 			{"iface_id": "eth0", "host_dev_name": fcGuestTap, "guest_mac": fcGuestMAC},
@@ -731,7 +780,8 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 }
 
 func (d *FirecrackerDriver) jailerArgs(meta fcMeta) []string {
-	home := int64(d.cfg.HomeDiskMiB) << 20
+	// The VMM's file size limit must cover every disk it writes.
+	fsize := int64(max(d.cfg.HomeDiskMiB, meta.VolumeMiB)) << 20
 	return []string{
 		"--id", meta.ID,
 		"--exec-file", d.cfg.Firecracker,
@@ -745,7 +795,7 @@ func (d *FirecrackerDriver) jailerArgs(meta fcMeta) []string {
 		"--cgroup", "memory.swap.max=0",
 		"--cgroup", "cpu.max=" + strconv.Itoa(meta.CPUs*100000) + " 100000",
 		"--cgroup", "pids.max=" + strconv.Itoa(fcVMMPids),
-		"--resource-limit", "fsize=" + strconv.FormatInt(home, 10),
+		"--resource-limit", "fsize=" + strconv.FormatInt(fsize, 10),
 		"--resource-limit", "no-file=256",
 		"--",
 		"--no-api", "--config-file", fcConfigPath, "--level", "Warning",
@@ -813,6 +863,11 @@ func (d *FirecrackerDriver) prepareJail(spec Spec, meta fcMeta) error {
 	if err := d.host.Chown(run, meta.VMMUID, meta.VMMUID); err != nil {
 		return err
 	}
+	if meta.Volume != "" {
+		if err := d.linkVolume(root, meta); err != nil {
+			return err
+		}
+	}
 	config, err := d.vmConfig(spec)
 	if err != nil {
 		return err
@@ -836,6 +891,9 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	}
 	if spec.CPUs < 1 || spec.CPUs > fcMaxCPUs || spec.MemoryMiB < fcMinMemoryMiB || spec.MemoryMiB > fcMaxMemoryMiB {
 		return Instance{}, errors.New("Firecracker VM shape out of range")
+	}
+	if err := d.checkVolumeSpec(spec); err != nil {
+		return Instance{}, err
 	}
 	if err := d.Ready(ctx); err != nil {
 		return Instance{}, fmt.Errorf("firewall is not armed before guest start: %w", err)
@@ -866,14 +924,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 		ID: spec.ID, Slot: spec.Network, VMMUID: d.cfg.UIDBase + slot, NetUID: d.cfg.UIDBase + fcUIDStride + slot,
 		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd,
 	}
-	record, err := json.Marshal(meta)
-	if err != nil {
-		return Instance{}, err
-	}
-	if err := os.MkdirAll(d.runDir(), 0o700); err != nil {
-		return Instance{}, err
-	}
-	if err := writeFileExcl(d.metaPath(spec.ID), record, 0o600); err != nil {
+	if err := d.writeRecord(spec, &meta); err != nil {
 		return Instance{}, err
 	}
 	startup := &fcStartup{}
@@ -1192,8 +1243,16 @@ func (c *fcGuestConn) Close() error {
 // Destroy kills the VMM and network stack, deletes the namespace (and with it
 // the tap), the jail and finally the record, then confirms nothing remains.
 // It is idempotent and works from any partial state, including after a host
-// or daemon restart.
+// or daemon restart. A running guest with a volume first flushes it.
 func (d *FirecrackerDriver) Destroy(ctx context.Context, id string) error {
+	return d.destroy(ctx, id, true)
+}
+
+// destroy is Destroy; syncVolume false skips the guest flush, for a host
+// whose firewall is lost and whose guests must stop at once. Volumes are
+// never removed: only the jail's link to one goes, and the disk returns to
+// root before the record that holds it.
+func (d *FirecrackerDriver) destroy(ctx context.Context, id string, syncVolume bool) error {
 	if err := validAppleID(id); err != nil {
 		return err
 	}
@@ -1206,6 +1265,9 @@ func (d *FirecrackerDriver) Destroy(ctx context.Context, id string) error {
 	}
 	if !found {
 		return nil
+	}
+	if syncVolume && vm.meta != nil && vm.meta.Volume != "" && vm.running() && d.firewallReady(ctx) == nil {
+		d.syncGuest(ctx, id)
 	}
 	if vm.vmm {
 		if err := d.host.KillCgroup(ctx, id); err != nil {
@@ -1226,6 +1288,9 @@ func (d *FirecrackerDriver) Destroy(ctx context.Context, id string) error {
 		if err := os.RemoveAll(d.jailDir(id)); err != nil {
 			return err
 		}
+	}
+	if err := d.releaseVolume(vm.meta); err != nil {
+		return err
 	}
 	if err := os.Remove(d.metaPath(id)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err

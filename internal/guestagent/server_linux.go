@@ -44,6 +44,9 @@ type Server struct {
 	// DiskPath is a path on the guest's writable filesystem, reported by
 	// OpDisk; empty disables OpDisk.
 	DiskPath string
+	// VolumePath is where an attached volume is mounted, "" when none is;
+	// OpSync remounts it read-only.
+	VolumePath string
 
 	next atomic.Int64
 }
@@ -85,6 +88,8 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		}
 	case OpDisk:
 		result = s.disk()
+	case OpSync:
+		result = s.sync()
 	default:
 		result = Result{Error: fmt.Sprintf("unknown guest agent operation %q", request.Op)}
 	}
@@ -137,6 +142,21 @@ func (s *Server) disk() Result {
 	size := uint64(stat.Bsize)
 	total := stat.Blocks * size
 	return Result{DiskTotal: total, DiskUsed: total - stat.Bfree*size}
+}
+
+// sync flushes every filesystem, then remounts the volume read-only so a
+// guest still running until the host kills it cannot dirty it again.
+func (s *Server) sync() Result {
+	syscall.Sync()
+	if s.VolumePath == "" {
+		return Result{}
+	}
+	err := syscall.Mount("", s.VolumePath, "", syscall.MS_REMOUNT|syscall.MS_RDONLY|syscall.MS_NOSUID|syscall.MS_NODEV, "")
+	syscall.Sync()
+	if err != nil {
+		return Result{Error: fmt.Sprintf("remount volume read-only: %v", err)}
+	}
+	return Result{}
 }
 
 func validPath(path string) bool {

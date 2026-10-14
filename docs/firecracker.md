@@ -12,7 +12,7 @@ Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
 | VM | One Firecracker microVM per sandbox, started by the jailer with `--new-pid-ns` |
 | Host identity | Slot *i* runs its VMM as UID/GID `fc-uid-base + i` and its NAT as `fc-uid-base + 1000 + i`. Each VM gets its own chroot under `<fc-root>/jail/firecracker/<id>/root` |
 | Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (home disk size) and `nofile=256` |
-| Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk. The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
+| Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk besides an attached [volume](#volumes). The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
 | Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
 | Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk |
 
@@ -125,6 +125,45 @@ the table. The control plane then keeps the VMs its ledger still owns and
 destroys orphans and partial VMs through `Destroy`, which kills both
 cgroups, deletes the namespace (and with it the tap), and removes the jail
 and the record. `Destroy` is idempotent from any partial state.
+
+## Volumes
+
+Durable volumes ([API](compatibility.md#volumes)) are off unless
+`-fc-volume-budget-mib` is above 0. They exist only for `e2b` sandboxes on
+the gateway's own Firecracker driver: the volume flags are refused in
+worker mode (`-worker-key-file`) and with other drivers, and the gateway
+never places a sandbox with a volume on an enrolled worker.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `-fc-volume-budget-mib` | 0 (off) | Sum of the sizes of all volumes; a create past it is refused |
+| `-fc-volume-mib` | 512 | Size of each new volume (64 to 1048576), a hard limit: it is the block device's size |
+| `-fc-volume-dir` | `<fc-root>/volumes` | Where volumes live. It must be on `fc-root`'s filesystem, since a volume is hard-linked into a jail |
+
+A create also needs free disk on the volume directory of
+`-fc-disk-floor-mib` plus the volume's size.
+
+Layout: the directory is 0700 root. Each volume is `<id>.ext4` and
+`<id>.json` (`{id, name, sizeMiB}`), both 0600 and owned by root while
+detached. The host formats the file with its own trusted `mkfs.ext4`
+(`/sbin` or `/usr/sbin`); the host never mounts a volume. Leftovers of a
+crashed create (`*.ext4.tmp`, a record without its file) are removed at
+startup.
+
+Isolation: a volume is attached to at most one VM. While attached, its
+file is owned by that VM's VMM UID and hard-linked into that VM's jail
+only, as `/volume.ext4`, and the VM's ownership record names it, which
+holds the volume until `Destroy` removes the record. The guest sees it as
+`/dev/vdc`; the guest agent mounts it (ext4, `nosuid,nodev`) at the
+requested path before envd starts, owned by 1000:1000, and the VM halts if
+it cannot. The guest never formats it.
+
+Lifetime: `Destroy` of a running VM first asks the guest agent to sync the
+volume and remount it read-only (5 s, failures logged), then kills the VMM
+and gives the file back to root. The destroy after a lost firewall skips
+that step, so writes the guest had not synced can be lost there. A volume
+survives its VM's end, a daemon restart or `kill -9` and that destroy;
+only `DELETE /volumes/{id}` removes it.
 
 ## Install
 

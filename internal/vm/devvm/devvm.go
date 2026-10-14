@@ -11,6 +11,9 @@
 // the guest data plane can run under conformance suites on machines without
 // Apple container or KVM.
 //
+// Volumes (VolumeConfig) are plain directories bind-mounted into envd guests
+// below the guest home; their size is recorded but not enforced.
+//
 // The package builds only with the sandboxd_devdriver tag, which no production
 // binary uses; cmd/sandboxd has a test proving it never links this package.
 package devvm
@@ -56,12 +59,16 @@ var (
 
 // Driver keeps every guest in memory; a restarted process starts empty and
 // refuses a state directory that still holds guests from an earlier run.
+// Volumes persist on disk (volumes.go).
 type Driver struct {
-	root  string
-	sleep string
-	envd  Envd
-	mu    sync.Mutex
-	vms   map[string]*guest
+	root         string
+	sleep        string
+	envd         Envd
+	volumeConfig VolumeConfig
+	mu           sync.Mutex
+	vms          map[string]*guest
+	// volumes maps a volume ID to its record; nil when volumes are off.
+	volumes map[string]volumeRecord
 }
 
 type guest struct {
@@ -77,6 +84,8 @@ type guest struct {
 	lifeline io.Closer
 	// console keeps an envd guest's console output.
 	console *vm.Console
+	// volume is the ID of the volume mounted in an envd guest, "" for none.
+	volume string
 }
 
 var (
@@ -87,11 +96,13 @@ var (
 
 // New uses root, which must be absent or empty, as the parent of all guest
 // directories. envd configures envd guests; its zero value refuses them.
-func New(root string, envd Envd) (*Driver, error) {
+// volumes configures volumes; with them on, root may already hold the
+// volumes of an earlier run (and nothing else).
+func New(root string, envd Envd, volumes VolumeConfig) (*Driver, error) {
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, errors.New("dev driver state directory must be an absolute clean path")
 	}
-	if err := envd.validate(); err != nil {
+	if err := errors.Join(envd.validate(), volumes.validate()); err != nil {
 		return nil, err
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -101,14 +112,22 @@ func New(root string, envd Envd) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(entries) != 0 {
-		return nil, fmt.Errorf("dev driver state directory %s is not empty; remove stale guests first", root)
+	for _, entry := range entries {
+		if !(volumes.BudgetMiB > 0 && entry.Name() == volumesDir && entry.IsDir()) {
+			return nil, fmt.Errorf("dev driver state directory %s is not empty; remove stale guests first", root)
+		}
 	}
 	sleep, err := exec.LookPath("sleep")
 	if err != nil {
 		return nil, fmt.Errorf("dev driver needs sleep(1) for guest holder processes: %w", err)
 	}
-	return &Driver{root: root, sleep: sleep, envd: envd, vms: map[string]*guest{}}, nil
+	d := &Driver{root: root, sleep: sleep, envd: envd, volumeConfig: volumes, vms: map[string]*guest{}}
+	if volumes.BudgetMiB > 0 {
+		if d.volumes, err = loadVolumes(root); err != nil {
+			return nil, err
+		}
+	}
+	return d, nil
 }
 
 // Create starts a holder process whose process group is the guest: every
@@ -133,13 +152,20 @@ func (d *Driver) Create(ctx context.Context, spec vm.Spec) (vm.Instance, error) 
 			return vm.Instance{}, fmt.Errorf("guest network %q is in use", spec.Network)
 		}
 	}
+	var volumeDir string
+	if spec.Volume != nil {
+		var err error
+		if volumeDir, err = d.attachLocked(spec); err != nil {
+			return vm.Instance{}, err
+		}
+	}
 	dir := filepath.Join(d.root, spec.ID)
 	home := filepath.Join(dir, "home", "user")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return vm.Instance{}, err
 	}
 	if spec.Envd {
-		g, err := d.createEnvd(spec, dir)
+		g, err := d.createEnvd(spec, dir, volumeDir)
 		if err != nil {
 			return vm.Instance{}, errors.Join(err, os.RemoveAll(dir))
 		}
@@ -580,7 +606,8 @@ func removeTree(dir string) error {
 	return os.RemoveAll(dir)
 }
 
-// Close destroys every guest.
+// Close destroys every guest and removes the volume directory if it is
+// empty; volumes themselves stay.
 func (d *Driver) Close(ctx context.Context) error {
 	d.mu.Lock()
 	ids := make([]string, 0, len(d.vms))
@@ -592,6 +619,7 @@ func (d *Driver) Close(ctx context.Context) error {
 	for _, id := range ids {
 		errs = append(errs, d.Destroy(ctx, id))
 	}
+	errs = append(errs, d.closeVolumes())
 	return errors.Join(errs...)
 }
 

@@ -19,6 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
+	"regexp"
+	"strings"
 )
 
 // Port is the guest vsock port the agent listens on.
@@ -38,7 +41,43 @@ const (
 	OpDial = "dial"
 	// OpDisk reports the guest's writable filesystem: DiskTotal and DiskUsed.
 	OpDisk = "disk"
+	// OpSync flushes the guest's filesystems before the host kills the VM,
+	// and remounts an attached volume read-only so nothing more is written
+	// to it. Error reports only a failed remount; the flush always runs.
+	OpSync = "sync"
 )
+
+// VolumeArg is the kernel argument prefix naming the guest path of an
+// attached volume (the VM's third disk, /dev/vdc): "sandboxd.volume=/data".
+const VolumeArg = "sandboxd.volume="
+
+// volumePathChars matches vm.ValidMountPath's character set; the guest
+// re-checks the path it is given, as it cannot import the host package.
+var volumePathChars = regexp.MustCompile(`^[a-zA-Z0-9._/-]{2,255}$`)
+
+// ValidVolumePath reports whether p may be a volume mount path: absolute,
+// clean, not "/", and limited to characters that need no quoting in a
+// kernel command line. It is the same rule as vm.ValidMountPath.
+func ValidVolumePath(p string) bool {
+	return volumePathChars.MatchString(p) && strings.HasPrefix(p, "/") && path.Clean(p) == p && p != "/"
+}
+
+// VolumePath returns the volume path a kernel command line names, "" when it
+// names none. A malformed or repeated argument is an error.
+func VolumePath(cmdline string) (string, error) {
+	found := ""
+	for _, field := range strings.Fields(cmdline) {
+		value, ok := strings.CutPrefix(field, VolumeArg)
+		if !ok {
+			continue
+		}
+		if found != "" || !ValidVolumePath(value) {
+			return "", fmt.Errorf("invalid volume kernel argument %q", field)
+		}
+		found = value
+	}
+	return found, nil
+}
 
 const (
 	FrameStarted byte = 'S'

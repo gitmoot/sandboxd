@@ -113,6 +113,23 @@ func Disk(ctx context.Context, conn io.ReadWriteCloser) (total, used uint64, err
 	return result.DiskTotal, result.DiskUsed, nil
 }
 
+// Sync asks the agent to flush the guest's filesystems and remount an
+// attached volume read-only, before the host kills the VM.
+func Sync(ctx context.Context, conn io.ReadWriteCloser) error {
+	defer closeOnCancel(ctx, conn)()
+	if err := WriteRequest(conn, Request{Op: OpSync}); err != nil {
+		return contextErr(ctx, err)
+	}
+	result, err := readResult(conn)
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	if result.Error != "" {
+		return errors.New(result.Error)
+	}
+	return nil
+}
+
 func contextErr(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
