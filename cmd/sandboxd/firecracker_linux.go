@@ -41,7 +41,7 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: images, Slots: slots,
 		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
 		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny, HostPort: *f.hostPort,
-		VolumeBudgetMiB: *f.volumeBudgetMiB, VolumeMiB: *f.volumeMiB, VolumeDir: volumeDir,
+		VolumeBudgetMiB: *f.volumeBudgetMiB, VolumeMiB: *f.volumeMiB, VolumeDir: volumeDir, Balloon: *f.balloon,
 	})
 	if err != nil {
 		return nil, nil, err

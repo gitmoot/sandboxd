@@ -232,6 +232,44 @@ lost there; the volume's journal keeps it consistent. A volume
 survives its VM's end, a daemon restart or `kill -9` and that destroy;
 only `DELETE /volumes/{id}` removes it.
 
+## Memory return (`-fc-balloon`)
+
+A Firecracker VM keeps every page its guest has ever touched: after a
+burst of work the VMM's resident memory stays at its peak until the VM
+ends, even when the guest itself is using little. `-fc-balloon` (off by
+default) makes running VMs give that memory back:
+
+- Each VM gets a virtio-balloon device with free page reporting (target
+  size 0, statistics off). The guest kernel reports pages it has freed and
+  Firecracker returns them to the host (`MADV_DONTNEED`). The balloon is
+  never inflated, so the host never takes memory the guest is using.
+- The guest is told so on its command line (`sandboxd.balloon=1`). Once
+  it has used under 5% of a CPU for 30 s, the guest agent syncs, drops the
+  page cache and reclaimable slab (`drop_caches=3`) and compacts memory,
+  once per quiet period. Most of what a busy guest holds is page cache
+  (binaries and model files it read), which free page reporting alone does
+  not return. The next read of a dropped file comes from the virtual disk,
+  in practice the host's page cache.
+
+It needs a guest kernel with `CONFIG_VIRTIO_BALLOON` and
+`CONFIG_PAGE_REPORTING` (the pinned `vmlinux-6.1.186` has both) and
+Firecracker 1.11 or later. The idle reclaim needs the guest agent of this
+release in the image; an image with an older agent still gets the balloon,
+which then returns only memory the guest freed by itself. The flag applies
+to every VM of the daemon; to use it for some templates only, run those on
+their own [instance](#several-instances-on-one-host).
+
+Measured on the fleet host with the Phobos image (1536 MiB guest, `omp
+--help` then whisper.cpp small on 60 s of audio): without the flag the VMM
+stayed at 1137 MiB until the VM ended; with it, it was at 270 MiB 50 s
+after the work finished, against 129 MiB the guest was using. A second
+round of the same work took 20.0 s instead of 19.2 s.
+
+The balloon is one more paravirtualized device driven by the untrusted
+guest. A compromised guest driver can only make the host return or keep
+its own guest's pages; Firecracker checks every reported page is inside
+that guest's memory. The VM's cgroup limit (`memory.max`) is unchanged.
+
 ## Install
 
 Host prerequisites: an x86_64 host with `/dev/kvm`, cgroup v2 with

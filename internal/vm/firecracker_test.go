@@ -1829,3 +1829,40 @@ func TestFirecrackerHardened(t *testing.T) {
 		t.Fatalf("record = %+v, %v", meta, err)
 	}
 }
+
+// -fc-balloon adds a balloon that only takes back pages the guest freed
+// (target 0, free page reporting) and tells the guest so on its command
+// line; without it the VM has neither.
+func TestFirecrackerBalloon(t *testing.T) {
+	for _, on := range []bool{false, true} {
+		d, _, cfg := newTestFirecracker(t, func(c *FirecrackerConfig) { c.Balloon = on })
+		if _, err := d.Create(context.Background(), Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512, Envd: true}); err != nil {
+			t.Fatal(err)
+		}
+		var config map[string]json.RawMessage
+		data, err := os.ReadFile(filepath.Join(d.chroot(fcTestID), "vm.json"))
+		if err != nil || json.Unmarshal(data, &config) != nil {
+			t.Fatalf("vm.json: %v %s", err, data)
+		}
+		balloon, present := config["balloon"]
+		if present != on {
+			t.Fatalf("balloon=%v: vm.json balloon = %s", on, balloon)
+		}
+		if strings.Contains(string(data), guestagent.BalloonArg) != on {
+			t.Fatalf("balloon=%v: boot args %s", on, data)
+		}
+		if !on {
+			continue
+		}
+		var got struct {
+			Amount    *int  `json:"amount_mib"`
+			Deflate   *bool `json:"deflate_on_oom"`
+			Stats     *int  `json:"stats_polling_interval_s"`
+			Reporting *bool `json:"free_page_reporting"`
+		}
+		if err := json.Unmarshal(balloon, &got); err != nil || got.Amount == nil || *got.Amount != 0 ||
+			got.Reporting == nil || !*got.Reporting || got.Deflate == nil || !*got.Deflate || got.Stats == nil || *got.Stats != 0 {
+			t.Fatalf("balloon = %s, %v", balloon, err)
+		}
+	}
+}

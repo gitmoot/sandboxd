@@ -197,6 +197,9 @@ func initGuest() {
 	if envd {
 		envdPID = startEnvd()
 	}
+	if slices.Contains(fields, guestagent.BalloonArg) {
+		go idleReclaim()
+	}
 	for range signals {
 		for {
 			var status unix.WaitStatus
