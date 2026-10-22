@@ -15,8 +15,10 @@ import (
 // it writes back dirty pages, drops the page cache and reclaimable slab, and
 // compacts memory: the dropped pages become free, and compaction gathers
 // free pages into the 2 MiB blocks that free page reporting hands back to
-// the host. It never stops the guest: a failure is logged and retried at the
-// next quiet period.
+// the host. It never stops the guest: a failed drop or compaction is logged
+// and tried again at the next quiet period, and if /proc/stat cannot be read
+// the reclaim logs that and ends for the life of the VM (the balloon still
+// returns what the guest frees by itself).
 func idleReclaim() {
 	var policy guestagent.IdleReclaim
 	last, err := cpuBusy()
