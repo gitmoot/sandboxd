@@ -27,7 +27,7 @@ type firecrackerFlags struct {
 	uidBase, homeDiskMiB, diskFloorMiB *int
 	hostPort                           *int
 	bootTimeout                        *time.Duration
-	consoleLog                         *bool
+	consoleLog, balloon                *bool
 	deny                               *egress.PrefixFlags
 	volumeBudgetMiB, volumeMiB         *int
 	volumeDir                          *string
@@ -51,8 +51,10 @@ func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 		diskFloorMiB: flags.Int("fc-disk-floor-mib", 8192, "firecracker: refuse to create a VM unless this much disk stays free beyond its home disk"),
 		hostPort: flags.Int("fc-host-port", 0, "firecracker: the one host TCP port guests may reach, as 10.0.2.2:<port> = the host's 127.0.0.1:<port> "+
 			"(e.g. a credential gateway); 0 allows none"),
-		bootTimeout:     flags.Duration("fc-boot-timeout", time.Minute, "firecracker: maximum time for the guest agent to answer after boot"),
-		consoleLog:      flags.Bool("fc-console-log", false, "firecracker: keep each guest's serial console in its jail for debugging"),
+		bootTimeout: flags.Duration("fc-boot-timeout", time.Minute, "firecracker: maximum time for the guest agent to answer after boot"),
+		consoleLog:  flags.Bool("fc-console-log", false, "firecracker: keep each guest's serial console in its jail for debugging"),
+		balloon: flags.Bool("fc-balloon", false, "firecracker: give each VM a balloon device with free page reporting, "+
+			"and have an idle guest drop its caches, so memory the guest no longer uses goes back to the host (needs CONFIG_PAGE_REPORTING in the guest kernel)"),
 		deny:            deny,
 		volumeBudgetMiB: flags.Int("fc-volume-budget-mib", 0, "firecracker gateway: total MiB of durable e2b volumes; 0 (the default) disables volumes"),
 		volumeMiB:       flags.Int("fc-volume-mib", 512, "firecracker gateway: size of each new volume"),

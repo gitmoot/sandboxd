@@ -102,6 +102,12 @@ type FirecrackerConfig struct {
 	VolumeBudgetMiB int
 	VolumeMiB       int
 	VolumeDir       string
+	// Balloon gives every VM a virtio-balloon device with free page
+	// reporting: the guest kernel hands pages it has freed back to the
+	// host, so a VM's resident memory follows what the guest uses rather
+	// than its peak. The balloon itself is never inflated. Off by default:
+	// every VM then boots exactly as before.
+	Balloon bool
 }
 
 // FirecrackerDriver runs one Firecracker microVM per sandbox under the jailer:
@@ -802,6 +808,9 @@ func (d *FirecrackerDriver) bootArgs(spec Spec) string {
 	if spec.Volume != nil {
 		args += " " + guestagent.VolumeArg + spec.Volume.Path
 	}
+	if d.cfg.Balloon {
+		args += " " + guestagent.BalloonArg
+	}
 	return args
 }
 
@@ -822,7 +831,7 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 	if spec.Volume != nil {
 		drives = append(drives, drive{ID: fcVolumeDrive, Path: fcVolumeFile, Cache: "Writeback"})
 	}
-	return json.MarshalIndent(map[string]any{
+	config := map[string]any{
 		"boot-source":    map[string]any{"kernel_image_path": "/vmlinux", "boot_args": d.bootArgs(spec)},
 		"drives":         drives,
 		"machine-config": map[string]any{"vcpu_count": spec.CPUs, "mem_size_mib": spec.MemoryMiB, "smt": false},
@@ -830,7 +839,18 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 			{"iface_id": "eth0", "host_dev_name": fcGuestTap, "guest_mac": fcGuestMAC},
 		},
 		"vsock": map[string]any{"guest_cid": fcGuestCID, "uds_path": fcVsockPath},
-	}, "", "  ")
+	}
+	if d.cfg.Balloon {
+		// Target size 0: the host never takes memory the guest is using.
+		// Free page reporting only returns pages the guest has freed;
+		// deflate_on_oom is moot at size 0 but keeps a later nonzero
+		// target from causing an out-of-memory kill. No statistics: they
+		// come from the untrusted guest and nothing here reads them.
+		config["balloon"] = map[string]any{
+			"amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 0, "free_page_reporting": true,
+		}
+	}
+	return json.MarshalIndent(config, "", "  ")
 }
 
 func (d *FirecrackerDriver) jailerArgs(meta fcMeta) []string {
