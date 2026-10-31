@@ -1569,10 +1569,15 @@ func TestFirecrackerVolumeCrashLeftovers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	cfg.ClaimDir = filepath.Join(t.TempDir(), "claims")
 	d, err = newFirecrackerDriver(cfg, newFakeFCHost(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := d.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.releaseClaim() })
 	for _, path := range leftovers {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("%s remains: %v", path, err)
@@ -1611,9 +1616,15 @@ func TestFirecrackerVolumeStartupRepairs(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := newFakeFCHost(t)
-	if _, err := newFirecrackerDriver(cfg, host); err != nil {
+	cfg.ClaimDir = filepath.Join(t.TempDir(), "claims")
+	restarted, err := newFirecrackerDriver(cfg, host)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := restarted.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.releaseClaim() })
 	if uid, ok := host.owner(disk); !ok || uid != 0 {
 		t.Errorf("detached disk owner = %d, %t; want root", uid, ok)
 	}
@@ -1864,5 +1875,42 @@ func TestFirecrackerBalloon(t *testing.T) {
 			got.Reporting == nil || !*got.Reporting || got.Deflate == nil || !*got.Deflate || got.Stats == nil || *got.Stats != 0 {
 			t.Fatalf("balloon = %s, %v", balloon, err)
 		}
+	}
+}
+
+// A second daemon must fail its claim before any destructive recovery; a
+// temporary import disk is live work until the owning daemon relinquishes it.
+func TestFirecrackerVolumeRecoveryRequiresClaim(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	cfg.ClaimDir = filepath.Join(t.TempDir(), "claims")
+	d.cfg.ClaimDir = cfg.ClaimDir
+	if err := d.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.releaseClaim() })
+	staging := filepath.Join(cfg.VolumeDir, "vol-"+strings.Repeat("c", 32)+".ext4.tmp")
+	payload := []byte("live incomplete restore")
+	if err := os.WriteFile(staging, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := newFirecrackerDriver(cfg, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Claim(); err == nil {
+		t.Fatal("second daemon stole active storage ownership")
+	}
+	if got, err := os.ReadFile(staging); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("unclaimed constructor erased active restore: %q %v", got, err)
+	}
+	if err := d.releaseClaim(); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Claim(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = restarted.releaseClaim() })
+	if _, err := os.Stat(staging); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("claimed restart did not recover incomplete restore: %v", err)
 	}
 }

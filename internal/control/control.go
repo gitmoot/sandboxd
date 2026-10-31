@@ -105,8 +105,9 @@ type Service struct {
 	// volumes is Config.Volumes: nil when volumes are off.
 	volumes vm.Volumes
 	// egress is Config.Egress: nil when egress policies are off.
-	egress  vm.EgressPolicies
-	tunnels tunnelLeases
+	egress              vm.EgressPolicies
+	tunnels             tunnelLeases
+	volumeTransferSlots chan struct{}
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -205,6 +206,7 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	s := &Service{ledger: ledger, cfg: cfg, templates: templates, tokenKey: slices.Clone(cfg.TokenSecret), workers: members, byID: make(map[string]*member, len(members)),
 		busy: make(map[string]chan struct{}), apiHash: sha256.Sum256([]byte(cfg.APIKey)), stop: make(chan struct{}), done: make(chan struct{}),
 		signers: make(map[string]string), volumes: cfg.Volumes, egress: cfg.Egress}
+	s.volumeTransferSlots = make(chan struct{}, vm.MaxVolumeTransfers)
 	rows, err := ledger.Active(ctx)
 	if err != nil {
 		_ = ledger.Close()
@@ -785,6 +787,8 @@ func (s *Service) launch(ctx context.Context, row *store.Row, place placement) e
 		// The driver alone knows every VM trace holding a volume; the client
 		// learns why, while the row is held exactly as for any failed start.
 		switch {
+		case errors.Is(err, vm.ErrVolumeTransferBusy):
+			return &refusal{http.StatusConflict, "volume storage operation in progress"}
 		case errors.Is(err, vm.ErrVolumeInUse):
 			return &refusal{http.StatusConflict, "volume is attached to another sandbox"}
 		case errors.Is(err, vm.ErrVolumeNotFound):

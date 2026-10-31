@@ -145,7 +145,8 @@ type FirecrackerDriver struct {
 
 	// volumeMu orders every volume create, delete, attach and release, so
 	// an attach's in-use check and its record write are one step.
-	volumeMu sync.Mutex
+	volumeMu        sync.Mutex
+	volumeTransfers map[string]fcVolumeTransfer
 	// mkfs is the trusted host mke2fs, set when volumes are on.
 	mkfs string
 

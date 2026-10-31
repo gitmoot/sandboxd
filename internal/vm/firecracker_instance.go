@@ -154,6 +154,12 @@ func (d *FirecrackerDriver) Claim() error {
 		_ = file.Close()
 		return fmt.Errorf("write Firecracker claim %s: %w", path, err)
 	}
+	if d.cfg.VolumeBudgetMiB > 0 {
+		if err := d.recoverVolumes(); err != nil {
+			_ = file.Close()
+			return fmt.Errorf("recover claimed volume storage: %w", err)
+		}
+	}
 	d.claim = file
 	return nil
 }
