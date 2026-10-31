@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/tunnel"
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
@@ -386,6 +387,20 @@ func (c *Client) Usage(ctx context.Context, id string) (vm.Usage, error) {
 // HTTP/1.1 upgrade the worker bridges to its driver's guest port channel. ctx
 // bounds only the dial; the stream lasts until it is closed.
 func (c *Client) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	return c.dialPort(ctx, id, port, portUpgrade)
+}
+
+const tunnelUpgrade = "sandboxd-tunnel-v1"
+
+func (c *Client) DialTunnel(ctx context.Context, id string, port int) (net.Conn, error) {
+	conn, err := c.dialPort(ctx, id, port, tunnelUpgrade)
+	if err != nil {
+		return nil, err
+	}
+	return tunnel.New(conn, nil), nil
+}
+
+func (c *Client) dialPort(ctx context.Context, id string, port int, upgrade string) (net.Conn, error) {
 	if err := c.checkVM(id); err != nil {
 		return nil, err
 	}
@@ -408,7 +423,7 @@ func (c *Client) DialPort(ctx context.Context, id string, port int) (net.Conn, e
 	req.Header.Set("Authorization", c.auth)
 	req.Header.Set(leaseHeader, strconv.FormatInt(lease, 10))
 	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", portUpgrade)
+	req.Header.Set("Upgrade", upgrade)
 	resp, err := c.client.Do(req)
 	if !stop() {
 		if err == nil {
@@ -427,7 +442,7 @@ func (c *Client) DialPort(ctx context.Context, id string, port int) (net.Conn, e
 		return nil, fmt.Errorf("worker %s: %w", c.id, vm.ErrNoEnvd)
 	}
 	stream, ok := resp.Body.(io.ReadWriteCloser)
-	if resp.StatusCode != http.StatusSwitchingProtocols || !ok || !strings.EqualFold(resp.Header.Get("Upgrade"), portUpgrade) {
+	if resp.StatusCode != http.StatusSwitchingProtocols || !ok || !strings.EqualFold(resp.Header.Get("Upgrade"), upgrade) {
 		defer resp.Body.Close()
 		defer cancel()
 		if resp.StatusCode == http.StatusSwitchingProtocols {

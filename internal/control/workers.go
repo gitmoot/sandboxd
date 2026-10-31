@@ -689,6 +689,7 @@ func (s *Service) ForgetWorker(ctx context.Context, id string) ([]string, error)
 	}
 	s.signersMu.Unlock()
 	for _, sandbox := range ids {
+		s.revokeSandboxTunnels(sandbox)
 		log.Printf("forget-worker %s: sandbox %s released as destroyed-unverified; its VM was NOT proven gone", id, sandbox)
 	}
 	if err != nil {

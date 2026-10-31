@@ -39,6 +39,9 @@ const (
 	// After a successful Result frame the connection carries raw bytes in
 	// both directions until either side closes; no further frames follow.
 	OpDial = "dial"
+	// OpTunnel uses internal/tunnel data and directional EOF frames after
+	// the Result acknowledgement. Unsupported agents reject the operation.
+	OpTunnel = "tunnel"
 	// OpDisk reports the guest's writable filesystem: DiskTotal and DiskUsed.
 	OpDisk = "disk"
 	// OpSync flushes the guest's filesystems before the host kills the VM,

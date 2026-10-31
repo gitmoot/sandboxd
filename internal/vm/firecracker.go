@@ -22,6 +22,7 @@ import (
 
 	"github.com/gitmoot/sandboxd/internal/egress"
 	"github.com/gitmoot/sandboxd/internal/guestagent"
+	"github.com/gitmoot/sandboxd/internal/tunnel"
 )
 
 const (
@@ -1310,6 +1311,14 @@ func (d *FirecrackerDriver) Usage(ctx context.Context, id string) (Usage, error)
 // firewall monitor, as Run is; losing the firewall destroys the VM and ends
 // it.
 func (d *FirecrackerDriver) DialPort(ctx context.Context, id string, port int) (net.Conn, error) {
+	return d.dialPort(ctx, id, port, false)
+}
+
+func (d *FirecrackerDriver) DialTunnel(ctx context.Context, id string, port int) (net.Conn, error) {
+	return d.dialPort(ctx, id, port, true)
+}
+
+func (d *FirecrackerDriver) dialPort(ctx context.Context, id string, port int, framed bool) (net.Conn, error) {
 	if !ValidPort(port) {
 		return nil, fmt.Errorf("invalid guest port %d", port)
 	}
@@ -1330,11 +1339,19 @@ func (d *FirecrackerDriver) DialPort(ctx context.Context, id string, port int) (
 	if err != nil {
 		return nil, err
 	}
-	if err := guestagent.OpenPort(ctx, conn, port); err != nil {
-		return nil, fmt.Errorf("port %d of %q: %w", port, id, err)
+	open := guestagent.OpenPort
+	if framed {
+		open = guestagent.OpenTunnel
+	}
+	if err := open(ctx, conn, port); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	guarded := &fcGuestConn{Conn: conn}
 	guarded.unwatch = d.watchFirewall(id, func(error) { _ = conn.Close() })
+	if framed {
+		return tunnel.New(guarded, nil), nil
+	}
 	return guarded, nil
 }
 

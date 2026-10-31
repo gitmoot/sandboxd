@@ -206,6 +206,14 @@ func (l *local) DialPort(ctx context.Context, id string, port int) (net.Conn, er
 	return dialer.DialPort(ctx, id, port)
 }
 
+func (l *local) DialTunnel(ctx context.Context, id string, port int) (net.Conn, error) {
+	dialer, ok := l.Driver.(vm.TunnelDialer)
+	if !ok {
+		return nil, vm.ErrNoEnvd
+	}
+	return dialer.DialTunnel(ctx, id, port)
+}
+
 func (l *local) CreateUntil(ctx context.Context, spec vm.Spec, _ time.Time) (vm.Instance, error) {
 	return l.Driver.Create(ctx, spec)
 }

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gitmoot/sandboxd/internal/tunnel"
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
@@ -516,18 +517,28 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request, id string, leaseCtx
 // either side closes it, or when a newer lease supersedes the one it was
 // opened under.
 func (s *Server) port(w http.ResponseWriter, r *http.Request, id string, port int, leaseCtx context.Context) {
-	dialer, ok := s.driver.(vm.PortDialer)
-	if !ok {
-		http.Error(w, vm.ErrNoEnvd.Error(), http.StatusNotImplemented)
+	upgrade := r.Header.Get("Upgrade")
+	if !headerHasToken(r.Header, "Connection", "upgrade") ||
+		(!strings.EqualFold(upgrade, portUpgrade) && !strings.EqualFold(upgrade, tunnelUpgrade)) {
+		http.Error(w, "unsupported port stream upgrade", http.StatusBadRequest)
 		return
 	}
-	if !headerHasToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), portUpgrade) {
-		http.Error(w, "a port stream must upgrade to "+portUpgrade, http.StatusBadRequest)
+	framed := strings.EqualFold(upgrade, tunnelUpgrade)
+	var dial func(context.Context, string, int) (net.Conn, error)
+	if framed {
+		if d, ok := s.driver.(vm.TunnelDialer); ok {
+			dial = d.DialTunnel
+		}
+	} else if d, ok := s.driver.(vm.PortDialer); ok {
+		dial = d.DialPort
+	}
+	if dial == nil {
+		http.Error(w, vm.ErrNoEnvd.Error(), http.StatusNotImplemented)
 		return
 	}
 	ctx, cancel := fenced(r, leaseCtx)
 	defer cancel()
-	guest, err := dialer.DialPort(ctx, id, port)
+	guest, err := dial(ctx, id, port)
 	if err != nil {
 		driverFailed(w, "port", err)
 		return
@@ -543,11 +554,16 @@ func (s *Server) port(w http.ResponseWriter, r *http.Request, id string, port in
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		return
 	}
-	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: "+portUpgrade+"\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: "+upgrade+"\r\n\r\n"); err != nil {
 		return
 	}
 	stop := context.AfterFunc(leaseCtx, func() { _ = conn.Close(); _ = guest.Close() })
 	defer stop()
+	if framed {
+		stream := tunnel.New(conn, buffered.Reader)
+		tunnel.Bridge(stream, stream, guest)
+		return
+	}
 	Bridge(conn, buffered.Reader, guest)
 }
 
