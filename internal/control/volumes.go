@@ -47,6 +47,9 @@ func (s *Service) withToken(volume vm.Volume) volumeAndToken {
 // serveVolumes answers E2B's volume API when volumes are configured, and
 // reports whether path was a volume route.
 func (s *Service) serveVolumes(w http.ResponseWriter, r *http.Request) bool {
+	if s.serveVolumeTransfers(w, r) {
+		return true
+	}
 	path := r.URL.Path
 	switch {
 	case path == "/volumecontent" || strings.HasPrefix(path, "/volumecontent/"):
@@ -91,6 +94,10 @@ func (s *Service) volumeFailure(w http.ResponseWriter, action string, err error)
 		s.fail(w, ProfileE2B, http.StatusConflict, "a volume with that name already exists")
 	case errors.Is(err, vm.ErrVolumeInUse):
 		s.fail(w, ProfileE2B, http.StatusConflict, "volume is attached to a sandbox: kill the sandbox first")
+	case errors.Is(err, vm.ErrVolumeTransferBusy):
+		s.fail(w, ProfileE2B, http.StatusConflict, "volume storage operation in progress")
+	case errors.Is(err, vm.ErrVolumeBackupInvalid):
+		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid volume backup")
 	case errors.Is(err, vm.ErrVolumeBudget):
 		// 400 is the only client error the SDKs declare for create.
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "volume budget exhausted: delete a volume first")

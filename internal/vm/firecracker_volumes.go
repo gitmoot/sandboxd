@@ -50,8 +50,8 @@ func (d *FirecrackerDriver) volumeDisk(id string) string {
 	return filepath.Join(d.cfg.VolumeDir, id+".ext4")
 }
 
-// initVolumes validates the volume configuration, creates VolumeDir and
-// removes what a crash during CreateVolume left behind.
+// initVolumes validates configuration and creates VolumeDir. Destructive
+// recovery waits until Claim excludes another daemon with an active import.
 func (d *FirecrackerDriver) initVolumes() error {
 	cfg := d.cfg
 	if !cleanAbs(cfg.VolumeDir) {
@@ -103,6 +103,13 @@ func (d *FirecrackerDriver) initVolumes() error {
 	if dir.Sys().(*syscall.Stat_t).Dev != root.Sys().(*syscall.Stat_t).Dev {
 		return fmt.Errorf("Firecracker volume directory %s must be on the filesystem of %s", cfg.VolumeDir, cfg.Root)
 	}
+	return nil
+}
+
+// recoverVolumes runs only after exclusive instance ownership is established.
+// A competing constructor must not erase a live daemon's transfer staging.
+func (d *FirecrackerDriver) recoverVolumes() error {
+	cfg := d.cfg
 	names, err := readDirNames(cfg.VolumeDir)
 	if err != nil {
 		return err
@@ -231,6 +238,9 @@ func volumeHolders(vms []fcVM) map[string]string {
 // volumeInUse reports whether a VM record or a jail's hard link holds the
 // volume. Callers hold volumeMu.
 func (d *FirecrackerDriver) volumeInUse(id string) error {
+	if _, busy := d.volumeTransfers[id]; busy {
+		return ErrVolumeTransferBusy
+	}
 	vms, err := d.inventory()
 	if err != nil {
 		return err
@@ -262,7 +272,11 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	used := 0
+	reserved, err := d.reservedVolumeMiB(name)
+	if err != nil {
+		return Volume{}, err
+	}
+	used := reserved
 	for _, volume := range volumes {
 		if volume.Name == name {
 			return Volume{}, fmt.Errorf("%w: %q", ErrVolumeExists, name)
@@ -277,7 +291,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	if need := uint64(d.cfg.DiskFloorMiB+size) << 20; free < need {
+	if need := uint64(d.cfg.DiskFloorMiB+size+reserved) << 20; free < need {
 		return Volume{}, fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB volume needed",
 			ErrVolumeBudget, free>>20, d.cfg.DiskFloorMiB, size)
 	}
