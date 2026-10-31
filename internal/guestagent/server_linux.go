@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/gitmoot/sandboxd/internal/tunnel"
 )
 
 var envName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z_0-9]*$`)
@@ -88,6 +90,10 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		if result = s.dial(conn, reader, request.Port); result.Error == "" {
 			return
 		}
+	case OpTunnel:
+		if result = s.dialTunnel(conn, reader, request.Port); result.Error == "" {
+			return
+		}
 	case OpDisk:
 		result = s.disk()
 	case OpSync:
@@ -130,6 +136,23 @@ func (s *Server) dial(conn io.ReadWriteCloser, reader *bufio.Reader, port int) R
 	_ = upstream.Close()
 	_ = conn.Close()
 	<-done
+	return Result{}
+}
+
+func (s *Server) dialTunnel(conn io.ReadWriteCloser, reader *bufio.Reader, port int) Result {
+	if s.DialHost == "" || port < 1 || port > 65535 {
+		return Result{Error: "guest tunnel port unavailable"}
+	}
+	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(s.DialHost, strconv.Itoa(port)), 5*time.Second)
+	if err != nil {
+		return Result{Error: fmt.Sprintf("guest port %d unreachable: %v", port, err)}
+	}
+	defer upstream.Close()
+	if err := WriteJSONFrame(conn, FrameResult, Result{}); err != nil {
+		return Result{}
+	}
+	stream := tunnel.New(conn, reader)
+	tunnel.Bridge(stream, stream, upstream)
 	return Result{}
 }
 

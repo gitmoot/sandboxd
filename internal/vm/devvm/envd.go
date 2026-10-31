@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/gitmoot/sandboxd/internal/tunnel"
 	"github.com/gitmoot/sandboxd/internal/vm"
 )
 
@@ -170,6 +171,11 @@ func (d *Driver) DialPort(ctx context.Context, id string, port int) (net.Conn, e
 		return nil, errors.Join(fmt.Errorf("guest port %d of %q is not open", port, id), err)
 	}
 	return conn, nil
+}
+
+// The dev bridge uses Unix/TCP sockets, both of which preserve CloseWrite.
+func (d *Driver) DialTunnel(ctx context.Context, id string, port int) (net.Conn, error) {
+	return d.DialPort(ctx, id, port)
 }
 
 // destroyEnvd closes the helper's lifeline: it kills every process of the
@@ -516,10 +522,7 @@ func bridgeEnvd(listener net.Listener) {
 			if _, err := client.Write([]byte{bridgeConnected}); err != nil {
 				return
 			}
-			done := make(chan struct{}, 2)
-			go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-			go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
-			<-done
+			tunnel.Bridge(client, client, upstream)
 		}()
 	}
 }

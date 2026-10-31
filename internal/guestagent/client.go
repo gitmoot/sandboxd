@@ -79,8 +79,18 @@ func Ping(ctx context.Context, conn io.ReadWriteCloser) ([]string, error) {
 // success conn carries raw bytes of that port from then on; on failure it is
 // closed.
 func OpenPort(ctx context.Context, conn io.ReadWriteCloser, port int) error {
+	return openPort(ctx, conn, port, OpDial)
+}
+
+// OpenTunnel negotiates a framed, half-close-capable guest port stream.
+// The caller wraps conn with tunnel.New only after this succeeds.
+func OpenTunnel(ctx context.Context, conn io.ReadWriteCloser, port int) error {
+	return openPort(ctx, conn, port, OpTunnel)
+}
+
+func openPort(ctx context.Context, conn io.ReadWriteCloser, port int, op string) error {
 	stop := closeOnCancel(ctx, conn)
-	err := WriteRequest(conn, Request{Op: OpDial, Port: port})
+	err := WriteRequest(conn, Request{Op: op, Port: port})
 	var result Result
 	if err == nil {
 		result, err = readResult(conn)

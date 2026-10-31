@@ -198,6 +198,58 @@ Guest ports other than envd's are **allowlist-only per template** and **never pu
 - `get_host(port)` returns `<port>-<id>.<domain>`; the SDKs never apply `E2B_SANDBOX_URL` to it. That form needs wildcard DNS and TLS for `*.<domain>` in front of sandboxd. Owner decision D2 defers wildcard DNS, so host routing of guest ports is **off by default** in `sandboxd` and `sandboxd-dev` and `get_host` URLs do not resolve in a default deployment; the code-interpreter SDKs use the routing headers instead. `-port-hosts` turns host routing on once an operator has both. The token rules are the same; envd's own `49983-<id>.<domain>` host stays routed as before. For a client on the gateway's own machine, a domain under `localhost` (for example `sbx.localhost:<port>`) resolves without DNS setup on resolvers that implement RFC 6761, but still needs a TLS front.
 - Signed file URLs (`download_url`/`upload_url`) are built from `E2B_SANDBOX_URL` and carry no routing headers. sandboxd routes a `/files` request with a `signature` on the gateway host to the one running e2b sandbox whose envd token made that signature (the signature binds path, operation, user, expiry and token), so no wildcard DNS is needed. Such a request proves nothing until a signature matches, so a signature of the wrong shape or with an unparsable expiration is refused before any lookup, as is an expired one (envd's own `401 {"code":401,"message":"signature is already expired"}`), and the match reads only an in-memory index of running e2b sandboxes (kept on create, delete, reconcile and restart), never the ledger or the control lock.
 - Template start and ready commands: `start-cmd=<command>` runs once per sandbox as root through envd right after `/init`, in the background; `ready-cmd=<command>` then runs as root until it exits 0 before create returns 201. Both together are bounded by `-template-ready-timeout` (default 3m); a sandbox not ready by then is destroyed (503). Give the client's create request a longer timeout than a cold start (the stock SDKs default to 60 s). E2B runs the start command at template build time and snapshots the result; sandboxd has no snapshots, so this is a per-create cold start. The `code-interpreter-v1` image and its registration line are in [firecracker.md](firecracker.md#code-interpreter-image).
+### Raw guest TCP tunnels
+
+HTTP/1.1 CONNECT exposes a template-allowlisted guest-loopback TCP port to a
+trusted adapter (for example, an SSH host/port adapter). It is not an HTTP proxy
+to arbitrary hosts, an exec relay, or a public unauthenticated port. Keep the
+control endpoint on a trusted network or behind authenticated TLS. Customer SSH
+authentication and host-key checking remain end-to-end; the adapter holds the
+tunnel credential, never the guest or customer.
+
+The controller uses its usual `X-API-Key` for these routes:
+
+| Method and path | Request | Result |
+|---|---|---|
+| `POST /sandboxes/{id}/tunnel-leases` | `{"port":22,"ttl":300}` | 201: `leaseID`, `sandboxID`, `port`, `token`, `expiresAt` |
+| `POST /sandboxes/{id}/tunnel-leases/{leaseID}/renew` | `{"ttl":300}` | 200: same identity/token, extended expiry |
+| `DELETE /sandboxes/{id}/tunnel-leases/{leaseID}` | none | 204, idempotent |
+
+TTL is positive integer seconds, capped by the daemon's maximum TTL and the
+sandbox's current expiry. Renew the sandbox first, then its tunnel leases.
+Renewal extends only a still-live lease; expired/revoked leases return 403 and
+cannot revive. There are at most 256 live leases per sandbox. Leases are
+memory-only: daemon restart invalidates all of them. Provision a new lease
+after restart or revocation; renewal preserves established connections.
+
+The adapter opens a dedicated HTTP/1.1 connection and sends:
+
+```http
+CONNECT sandboxd-0123456789abcdef0123456789abcdef:22 HTTP/1.1
+Host: sandboxd-0123456789abcdef0123456789abcdef:22
+E2b-Tunnel-Access-Token: <lease token>
+
+```
+
+After `200 Connection Established`, send raw bytes on that socket. No request
+body, TLS inside the adapter protocol, or WebSocket framing is required by
+CONNECT itself. The gateway resolves only the sandbox ID and its guest-loopback
+port; it never resolves the authority as a host address. The lease must match
+both ID and port. Control keys, traffic tokens, and envd tokens are not fallback
+CONNECT credentials, and no HTTP headers reach the guest.
+
+Directional EOF preserves reverse traffic until the reverse side ends. Errors,
+lease revoke/expiry, sandbox teardown, and daemon shutdown close both directions.
+Disconnect alone releases the stream without deleting the sandbox or lease.
+CONNECT shares the per-sandbox `-port-max-streams` cap with HTTP/WebSocket guest
+ports (429 when full). Invalid/expired/revoked leases return 403; an unavailable
+guest port or unsupported guest tunnel transport returns 502.
+
+Firecracker images must contain the matching guest agent with the framed
+`tunnel` operation. Older agents fail explicitly, without degraded half-close.
+Remote workers must also support `sandboxd-tunnel-v1`; mixed versions refuse
+the upgrade. The Apple driver does not implement this tunnel operation.
+
 
 ### CI conformance gate (dev driver)
 

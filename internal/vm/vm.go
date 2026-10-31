@@ -51,6 +51,12 @@ type PortDialer interface {
 	DialPort(ctx context.Context, id string, port int) (net.Conn, error)
 }
 
+// TunnelDialer opens a guest-loopback stream with directional EOF support.
+// The returned net.Conn must implement CloseWrite; unsupported guests fail.
+type TunnelDialer interface {
+	DialTunnel(ctx context.Context, id string, port int) (net.Conn, error)
+}
+
 // ValidPort reports whether port is a TCP port number DialPort accepts.
 func ValidPort(port int) bool {
 	return port >= 1 && port <= 65535

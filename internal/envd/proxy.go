@@ -193,6 +193,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) bool {
 	if p == nil {
 		return false
 	}
+	if r.Method == http.MethodConnect {
+		p.serveTunnel(w, r)
+		return true
+	}
 	id, port, ok := p.target(r)
 	switch {
 	case ok && port != EnvdPort:

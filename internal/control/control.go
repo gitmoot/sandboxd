@@ -105,7 +105,8 @@ type Service struct {
 	// volumes is Config.Volumes: nil when volumes are off.
 	volumes vm.Volumes
 	// egress is Config.Egress: nil when egress policies are off.
-	egress vm.EgressPolicies
+	egress  vm.EgressPolicies
+	tunnels tunnelLeases
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -236,6 +237,7 @@ func bootsHardened(driver vm.Driver) bool {
 func (s *Service) setState(ctx context.Context, id, state string) error {
 	err := s.ledger.SetState(ctx, id, state)
 	if state != "running" {
+		s.revokeSandboxTunnels(id)
 		s.signersMu.Lock()
 		delete(s.signers, id)
 		s.signersMu.Unlock()
@@ -269,6 +271,7 @@ func (s *Service) clearBusy(id string) {
 }
 
 func (s *Service) Close() error {
+	s.closeTunnels()
 	close(s.stop)
 	<-s.done
 	s.mu.Lock()
@@ -395,6 +398,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.URL.Path
+	if s.templates.e2b && s.serveTunnelLeases(w, r) {
+		return
+	}
 	if path == "/sandboxes" && r.Method == http.MethodPost {
 		s.create(w, r)
 		return
@@ -1028,7 +1034,11 @@ func (s *Service) extend(ctx context.Context, id string, m *member, ends time.Ti
 	if onlyLater {
 		return s.ledger.ExtendAtLeast(ctx, id, ends)
 	}
-	return s.ledger.Extend(ctx, id, ends)
+	if err := s.ledger.Extend(ctx, id, ends); err != nil {
+		return err
+	}
+	s.capTunnelLeases(id, ends)
+	return nil
 }
 
 // delete confirms teardown through the sandbox's own worker. An offline
