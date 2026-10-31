@@ -232,6 +232,76 @@ lost there; the volume's journal keeps it consistent. A volume
 survives its VM's end, a daemon restart or `kill -9` and that destroy;
 only `DELETE /volumes/{id}` removes it.
 
+### Controller-only cold backup and new-volume restore
+
+These operations use the control `X-API-Key`, not a guest token, and are available
+only on a local Firecracker worker with volumes enabled. **Raw ext4 backups are
+credential-bearing**, including possible deleted blocks. They are not sanitized
+customer exports. Store artifacts privately with trusted provenance; SHA-256
+detects corruption, not an attacker replacing both manifest and payload.
+
+`POST /volumes/{volumeID}/backup` takes no body/query and returns
+`application/vnd.sandboxd.volume-backup`. A detached check and per-volume
+reservation atomically exclude guest attachment, deletion and another backup
+(409) until hashing and streaming finish or are cancelled. Unrelated volumes
+can progress; the driver does not hold its global mutex across bulk I/O.
+
+The binary envelope is:
+
+| Bytes | Content |
+|---|---|
+| 8 | ASCII `SBXVOL01` |
+| 4 | Big-endian unsigned JSON manifest length, 1–4096 |
+| manifest length | UTF-8 JSON fields below |
+| exactly `sizeBytes` | Raw ext4 data; no trailing bytes |
+
+Manifest fields: `sourceVolumeID`, integer `sizeBytes`, lowercase hex `sha256`
+of the disk payload, and `applicationConsistency:"not-asserted"`. Disk size must
+be a whole MiB, from 64 MiB through 1 TiB. The server hashes the reserved stable
+disk before emitting the manifest. A receiver must verify exact payload length,
+source ID and digest before atomically publishing its immutable artifact.
+HTTP 200 headers alone do not establish a completed backup.
+
+`POST /volumes/restore?name=<new-name>&sourceVolumeID=<expected-origin-ID>`
+accepts that media type and envelope. The explicitly expected source must match
+the manifest. It returns 201 with the usual volume identity/token response only
+after publishing a complete, synced disk under a **fresh random ID**. Existing
+IDs/names are never overwritten; a duplicate/reserved name returns 409.
+Unknown versions, malformed metadata, truncated/extra data and checksum mismatch
+return 400. An unsupported native backup driver returns 501.
+
+At most two transfers per daemon run concurrently; each has a ten-minute total
+deadline including hashing and transfer. Additional HTTP transfers return 429.
+Native operation conflicts return 409. Imports reserve name and full logical
+capacity before accepting disk bytes; existing budget and disk-floor checks
+apply (400 on insufficient capacity). Disk headroom conservatively reserves the
+full size of concurrent imports even when their staging files are partly written.
+Transfer buffers are fixed-size; no disk-sized in-memory archive is built.
+
+Restore writes root-only staging, validates all bytes, syncs the file, then
+publishes record-before-disk without replacing an existing file. Errors/cancel
+remove staging; restart removes incomplete import leftovers only after obtaining
+the exclusive instance claim. A competing daemon constructor cannot erase an
+active restore before its conflicting claim is rejected. A crash after complete
+durable publication but before
+the response may leave a valid new volume: reconcile by its requested name
+instead of retrying under another name. No untrusted filesystem is mounted on
+the host.
+
+Detached does **not** mean application-quiesced: the guest flush above is
+best-effort. Forge's integration policy stops admission/customer access and
+customer services, verifies their exit, and requires a successful explicit sync;
+failed/unknown quiescence aborts a normal backup. Forge records that separate
+receipt, not a native application-consistency guarantee.
+
+Forge restores into quarantine: no internet, customer route or automatic
+service replay; the original workspace stays stopped/revoked during cutover.
+Capabilities, client enrollment and guest SSH host identity must be rotated.
+Retained service/subscription credentials are cleared through their supported
+interfaces and deliberately re-enrolled before release. Deleting local tokens
+does not prove provider-side revocation. Customer file export remains a separate
+explicit allowlist policy; this raw API makes no secret-free-content promise.
+
 ## Memory return (`-fc-balloon`)
 
 A Firecracker VM keeps every page its guest has ever touched: after a
