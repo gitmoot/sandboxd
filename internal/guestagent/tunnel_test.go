@@ -16,7 +16,7 @@ import (
 // Use the actual accepted-socket wrapper, not net.Pipe's different close
 // semantics. Speak the wire protocol so this test also compiles on old agents.
 func TestTunnelDirectionalEOF(t *testing.T) {
-	for _, first := range []string{"host", "guest"} {
+	for _, first := range []string{"host", "guest", "host-disconnect"} {
 		t.Run(first, func(t *testing.T) {
 			listener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
@@ -24,6 +24,8 @@ func TestTunnelDirectionalEOF(t *testing.T) {
 			}
 			defer listener.Close()
 			payload := bytes.Repeat([]byte("\x00SSH\xff"), 10000)
+			release := make(chan struct{})
+			defer close(release)
 			upstreamDone := make(chan error, 1)
 			go func() {
 				conn, err := listener.Accept()
@@ -50,6 +52,10 @@ func TestTunnelDirectionalEOF(t *testing.T) {
 					_, err = conn.Write(payload)
 				}
 				upstreamDone <- err
+				if first == "host-disconnect" {
+					// Stay open and idle so the guest cannot release the bridge.
+					<-release
+				}
 			}()
 			fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 			if err != nil {
@@ -113,6 +119,19 @@ func TestTunnelDirectionalEOF(t *testing.T) {
 				if !bytes.Equal(got, payload) {
 					t.Fatalf("reverse payload differs: got %d want %d", len(got), len(payload))
 				}
+			}
+			if first == "host-disconnect" {
+				send()
+				if err := <-upstreamDone; err != nil {
+					t.Fatal(err)
+				}
+				_ = host.Close()
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("guest agent retained bridge after host transport close")
+				}
+				return
 			}
 			if first == "host" {
 				send()

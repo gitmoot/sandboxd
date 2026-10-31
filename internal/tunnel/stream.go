@@ -152,29 +152,45 @@ func (addr) String() string  { return "sandboxd-tunnel" }
 func Bridge(client net.Conn, in io.Reader, upstream net.Conn) {
 	defer client.Close()
 	defer upstream.Close()
-	a, aok := client.(interface{ CloseWrite() error })
-	b, bok := upstream.(interface{ CloseWrite() error })
+	_, aok := client.(interface{ CloseWrite() error })
+	_, bok := upstream.(interface{ CloseWrite() error })
 	if !aok || !bok {
 		return
 	}
-	done := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(upstream, in)
+	// Each copy reports directional EOF, then keeps observing a framed source
+	// for transport cancellation. No data is legal after its EOF frame.
+	done := make(chan error, 4)
+	var copies sync.WaitGroup
+	copies.Add(2)
+	copyDirection := func(dst net.Conn, src io.Reader) {
+		defer copies.Done()
+		_, err := io.Copy(dst, src)
 		if err == nil {
-			err = b.CloseWrite()
+			err = dst.(interface{ CloseWrite() error }).CloseWrite()
 		}
 		done <- err
-	}()
-	go func() {
-		_, err := io.Copy(client, upstream)
-		if err == nil {
-			err = a.CloseWrite()
+		if err != nil {
+			return
 		}
-		done <- err
-	}()
-	if err := <-done; err != nil {
-		_ = client.Close()
-		_ = upstream.Close()
+		if framed, ok := src.(*Conn); ok {
+			framed.readMu.Lock()
+			var extra [1]byte
+			_, err = io.ReadFull(framed.reader, extra[:])
+			framed.readMu.Unlock()
+			if err == nil {
+				err = errors.New("data after tunnel EOF")
+			}
+			done <- err
+		}
 	}
-	<-done
+	go copyDirection(upstream, in)
+	go copyDirection(client, upstream)
+	for completed := 0; completed < 2; completed++ {
+		if err := <-done; err != nil {
+			break
+		}
+	}
+	_ = client.Close()
+	_ = upstream.Close()
+	copies.Wait()
 }

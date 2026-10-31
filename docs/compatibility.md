@@ -241,6 +241,9 @@ CONNECT credentials, and no HTTP headers reach the guest.
 Directional EOF preserves reverse traffic until the reverse side ends. Errors,
 lease revoke/expiry, sandbox teardown, and daemon shutdown close both directions.
 Disconnect alone releases the stream without deleting the sandbox or lease.
+Worker and guest-agent framed hops continue observing transport closure after
+directional EOF, so an idle reverse stream cannot retain downstream connections
+after cancellation. Bytes arriving after a framed EOF are a protocol error.
 CONNECT shares the per-sandbox `-port-max-streams` cap with HTTP/WebSocket guest
 ports (429 when full). Invalid/expired/revoked leases return 403; an unavailable
 guest port or unsupported guest tunnel transport returns 502.
