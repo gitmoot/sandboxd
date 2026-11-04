@@ -106,7 +106,7 @@ func (d *FirecrackerDriver) reserveGrowth(volume fcVolume, growth int) error {
 	if err != nil {
 		return err
 	}
-	reserved, err := d.reservedVolumeMiB(volume.Name)
+	reserved, headroom, err := d.reservedVolumeMiB(volume.Name)
 	if err != nil {
 		return err
 	}
@@ -121,7 +121,7 @@ func (d *FirecrackerDriver) reserveGrowth(volume fcVolume, growth int) error {
 	if err != nil {
 		return err
 	}
-	if need := uint64(d.cfg.DiskFloorMiB+growth+reserved) << 20; free < need {
+	if need := uint64(d.cfg.DiskFloorMiB+growth+headroom) << 20; free < need {
 		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB growth needed", ErrVolumeBudget, free>>20, d.cfg.DiskFloorMiB, growth)
 	}
 	return d.reserveVolumeTransfer(volume.ID, fcVolumeTransfer{Name: volume.Name, GrowFrom: volume.SizeMiB, GrowTo: target})

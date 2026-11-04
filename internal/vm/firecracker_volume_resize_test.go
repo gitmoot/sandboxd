@@ -402,3 +402,52 @@ func TestFirecrackerVolumeGrowInFlightChargedOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Extending the disk file is sparse: the space is only used while the tools
+// run. The host disk floor therefore keeps holding the grow's whole growth
+// back until the grow ends, also after the file reached its new size.
+func TestFirecrackerVolumeGrowKeepsDiskHeadroom(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t, func(c *FirecrackerConfig) {
+		c.VolumeBudgetMiB, c.VolumeMiB, c.VolumeDir = 1024, 128, filepath.Join(c.Root, "volumes")
+	})
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	host.resizeGate = gate
+	done := make(chan error, 1)
+	go func() { _, err := d.ResizeVolume(ctx, volume.ID, 192); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		host.mu.Lock()
+		started := len(host.resized) == 1
+		host.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resize did not reach the host")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The file is already 192 MiB, but 64 MiB of it is still unallocated: free
+	// space for the floor plus a new 128 MiB volume is not enough with it.
+	host.mu.Lock()
+	host.free = uint64(cfg.DiskFloorMiB+128+63) << 20
+	host.mu.Unlock()
+	if _, err := d.CreateVolume(ctx, "next"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("a create that would eat the grow's headroom: %v", err)
+	}
+	host.mu.Lock()
+	host.free = uint64(cfg.DiskFloorMiB+128+64) << 20
+	host.mu.Unlock()
+	if _, err := d.CreateVolume(ctx, "next"); err != nil {
+		t.Fatalf("a create that leaves the grow's headroom: %v", err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

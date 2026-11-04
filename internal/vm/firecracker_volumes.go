@@ -272,7 +272,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	reserved, err := d.reservedVolumeMiB(name)
+	reserved, headroom, err := d.reservedVolumeMiB(name)
 	if err != nil {
 		return Volume{}, err
 	}
@@ -291,7 +291,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	if need := uint64(d.cfg.DiskFloorMiB+size+reserved) << 20; free < need {
+	if need := uint64(d.cfg.DiskFloorMiB+size+headroom) << 20; free < need {
 		return Volume{}, fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB volume needed",
 			ErrVolumeBudget, free>>20, d.cfg.DiskFloorMiB, size)
 	}
