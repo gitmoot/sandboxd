@@ -1,0 +1,219 @@
+//go:build linux
+
+package vm
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func volumeDiskSize(t *testing.T, cfg FirecrackerConfig, id string) int64 {
+	t.Helper()
+	info, err := os.Stat(filepath.Join(cfg.VolumeDir, id+".ext4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+func TestFirecrackerVolumeGrow(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
+
+	grown, err := d.ResizeVolume(ctx, volume.ID, 192)
+	if err != nil || grown.SizeMiB != 192 || grown.ID != volume.ID || grown.Name != "data" {
+		t.Fatalf("grow = %+v %v", grown, err)
+	}
+	// The host tools saw the already-extended file, and the record agrees.
+	if want := fcE2fsck[0] + " " + fcResize2fs[0] + " " + disk + " " + "201326592"; len(host.resized) != 1 || host.resized[0] != want {
+		t.Fatalf("resized = %v, want %q", host.resized, want)
+	}
+	if got := volumeDiskSize(t, cfg, volume.ID); got != 192<<20 {
+		t.Fatalf("disk size = %d", got)
+	}
+	volumes, err := d.Volumes(ctx)
+	if err != nil || len(volumes) != 1 || volumes[0].SizeMiB != 192 {
+		t.Fatalf("volumes = %+v %v", volumes, err)
+	}
+	// The grown size counts against the budget (256 MiB): 64 MiB are left.
+	if _, err := d.CreateVolume(ctx, "other"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("create after grow: %v", err)
+	}
+	// The same size again does nothing.
+	if again, err := d.ResizeVolume(ctx, volume.ID, 192); err != nil || again.SizeMiB != 192 || len(host.resized) != 1 {
+		t.Fatalf("repeat = %+v %v calls=%v", again, err, host.resized)
+	}
+	// No stray record temp file is left behind.
+	if _, err := os.Stat(filepath.Join(cfg.VolumeDir, volume.ID+".json.tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("record temp file remains: %v", err)
+	}
+}
+
+func TestFirecrackerVolumeGrowRefusals(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		id   string
+		size int
+		want error
+	}{
+		"shrink":       {volume.ID, 64, ErrVolumeSize},
+		"too small":    {volume.ID, 63, ErrVolumeSize},
+		"too large":    {volume.ID, 1<<20 + 1, ErrVolumeSize},
+		"over budget":  {volume.ID, 300, ErrVolumeBudget},
+		"unknown":      {"vol-" + strings.Repeat("e", 32), 192, ErrVolumeNotFound},
+		"malformed id": {"../data", 192, ErrVolumeNotFound},
+	} {
+		if _, err := d.ResizeVolume(ctx, test.id, test.size); !errors.Is(err, test.want) {
+			t.Fatalf("%s: %v, want %v", name, err, test.want)
+		}
+	}
+	// The host disk floor counts too.
+	host.free = uint64(cfg.DiskFloorMiB+63) << 20
+	if _, err := d.ResizeVolume(ctx, volume.ID, 192); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("below floor: %v", err)
+	}
+	host.free = 100 << 30
+	// An untrusted e2fsck or resize2fs stops the grow before the file moves.
+	for _, tool := range []string{fcE2fsck[0], fcResize2fs[0]} {
+		host.untrusted = map[string]bool{tool: true, fcE2fsck[1]: true, fcResize2fs[1]: true}
+		if _, err := d.ResizeVolume(ctx, volume.ID, 192); err == nil || !strings.Contains(err.Error(), "trusted host tool") {
+			t.Fatalf("untrusted %s: %v", tool, err)
+		}
+	}
+	host.untrusted = nil
+	if len(host.resized) != 0 || volumeDiskSize(t, cfg, volume.ID) != 128<<20 {
+		t.Fatalf("a refused grow changed the volume: calls=%v size=%d", host.resized, volumeDiskSize(t, cfg, volume.ID))
+	}
+	// An attached volume cannot grow.
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID, "sbx1", volume.ID)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResizeVolume(ctx, volume.ID, 192); !errors.Is(err, ErrVolumeInUse) {
+		t.Fatalf("attached: %v", err)
+	}
+	if len(host.resized) != 0 || volumeDiskSize(t, cfg, volume.ID) != 128<<20 {
+		t.Fatal("an attached volume was changed")
+	}
+}
+
+// A filesystem that fails its check is not resized, and its file goes back to
+// the recorded size, so the volume is exactly as before.
+func TestFirecrackerVolumeGrowFsckFailureRestoresDisk(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.resizeErr = fmt.Errorf("%w: exit status 4", errVolumeFsck)
+	if _, err := d.ResizeVolume(ctx, volume.ID, 192); !errors.Is(err, errVolumeFsck) {
+		t.Fatalf("grow of a damaged filesystem: %v", err)
+	}
+	if got := volumeDiskSize(t, cfg, volume.ID); got != 128<<20 {
+		t.Fatalf("disk size after a failed check = %d", got)
+	}
+	host.resizeErr = nil
+	if grown, err := d.ResizeVolume(ctx, volume.ID, 192); err != nil || grown.SizeMiB != 192 {
+		t.Fatalf("grow after the failed check = %+v %v", grown, err)
+	}
+}
+
+// A failed filesystem step leaves the disk file larger than its record. The
+// same grow then completes, since each step can be repeated.
+func TestFirecrackerVolumeGrowRetryAfterFailure(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.resizeErr = errors.New("e2fsck: errors left uncorrected")
+	if _, err := d.ResizeVolume(ctx, volume.ID, 192); err == nil {
+		t.Fatal("failed resize reported success")
+	}
+	if volumes, _ := d.Volumes(ctx); len(volumes) != 1 || volumes[0].SizeMiB != 128 {
+		t.Fatalf("record changed by a failed grow: %+v", volumes)
+	}
+	if got := volumeDiskSize(t, cfg, volume.ID); got != 192<<20 {
+		t.Fatalf("disk size after failure = %d", got)
+	}
+	// The failed grow released its reservation: the volume can be deleted or retried.
+	host.resizeErr = nil
+	grown, err := d.ResizeVolume(ctx, volume.ID, 192)
+	if err != nil || grown.SizeMiB != 192 {
+		t.Fatalf("retry = %+v %v", grown, err)
+	}
+	// A disk already larger than the request is not cut down.
+	if err := os.Truncate(filepath.Join(cfg.VolumeDir, volume.ID+".ext4"), 250<<20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResizeVolume(ctx, volume.ID, 224); !errors.Is(err, ErrVolumeSize) {
+		t.Fatalf("oversized disk: %v", err)
+	}
+}
+
+// While e2fsck and resize2fs run, the volume is held: it cannot be attached,
+// deleted or backed up, and the growth counts against the budget.
+func TestFirecrackerVolumeGrowHoldsVolume(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	host.resizeGate = gate
+	done := make(chan error, 1)
+	go func() { _, err := d.ResizeVolume(ctx, volume.ID, 192); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		host.mu.Lock()
+		started := len(host.resized) == 1
+		host.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resize did not reach the host")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("delete during grow: %v", err)
+	}
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID, "sbx1", volume.ID)); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("attach during grow: %v", err)
+	}
+	if _, err := d.OpenVolumeBackup(ctx, volume.ID); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("backup during grow: %v", err)
+	}
+	if _, err := d.ResizeVolume(ctx, volume.ID, 224); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("second grow: %v", err)
+	}
+	if _, err := d.CreateVolume(ctx, "other"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("create during grow: %v", err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); err != nil {
+		t.Fatalf("delete after grow: %v", err)
+	}
+}

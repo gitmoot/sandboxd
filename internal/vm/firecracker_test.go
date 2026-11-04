@@ -92,6 +92,11 @@ type fakeFCHost struct {
 	// FormatVolume target.
 	owners    map[string]int
 	formatted []string
+	// resized records each ResizeVolume call; resizeGate blocks it until
+	// closed and resizeErr is what it returns.
+	resized    []string
+	resizeGate chan struct{}
+	resizeErr  error
 	// tables is each namespace's current table: the one it was created with,
 	// or the last it was replaced with;
 	// failReplace fails the next replacements, and readback, when set,
@@ -153,6 +158,23 @@ func (h *fakeFCHost) FormatVolume(_ context.Context, mkfs, path string) error {
 	defer h.mu.Unlock()
 	h.formatted = append(h.formatted, mkfs+" "+path)
 	return nil
+}
+
+// ResizeVolume stands in for e2fsck and resize2fs: it records the disk size it
+// was handed, optionally blocks on resizeGate, and fails with resizeErr.
+func (h *fakeFCHost) ResizeVolume(_ context.Context, e2fsck, resize2fs, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	h.resized = append(h.resized, fmt.Sprintf("%s %s %s %d", e2fsck, resize2fs, path, info.Size()))
+	gate, fail := h.resizeGate, h.resizeErr
+	h.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return fail
 }
 func (h *fakeFCHost) ApplyFirewall(_ context.Context, ruleset string) error {
 	h.mu.Lock()

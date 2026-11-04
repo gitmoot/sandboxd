@@ -232,6 +232,38 @@ lost there; the volume's journal keeps it consistent. A volume
 survives its VM's end, a daemon restart or `kill -9` and that destroy;
 only `DELETE /volumes/{id}` removes it.
 
+### Growing a detached volume
+
+`POST /volumes/{id}/resize` with `{"sizeMiB": N}` (control API key, like the
+backup route; sandbox envd tokens cannot reach it) grows a **detached** volume
+in place and answers `200 {"volumeID", "name", "sizeMiB"}`. It never shrinks:
+a smaller size is `400`, the same size is a no-op `200`. An attached,
+backing-up, restoring or already-growing volume is `409`; an unknown ID `404`;
+a grow past `-fc-volume-budget-mib` or below the disk floor (the growth, not
+the whole size, counts) is `400`. The new size must be between 64 MiB and
+1 TiB. Drivers without the capability answer `501`. Use it to raise an
+existing volume after `-fc-volume-mib` was raised, which only affects new
+volumes.
+
+Steps, with the volume held (no attach, delete or backup) throughout: check
+budget and floor, extend the disk file, `e2fsck -f -p`, `resize2fs`, then
+replace the record with one atomic rename. The host uses its own trusted
+`e2fsck` and `resize2fs` (root-owned regular files under `/usr/sbin` or
+`/sbin`, found when a grow runs; `e2fsprogs` ships them with `mke2fs`). Nothing is mounted. If `e2fsck` cannot
+repair the filesystem safely (exit 2 or higher, e.g. `4`) the file goes back to its
+old size and the volume is unchanged. If `resize2fs` fails, or the daemon
+stops mid-grow, the disk file is larger than its record until the same
+request is repeated: the steps are repeatable, and a disk file larger than the
+requested size is refused rather than cut. Until then the volume can still
+be attached (the guest sees a larger device holding the old filesystem) but a
+backup of it is refused.
+
+Trust: `e2fsck` and `resize2fs` run as root on a filesystem the guest wrote,
+which is the one place the host parses guest-controlled metadata (`mke2fs`
+only writes a fresh one). They take an image file, not a mount, and run with
+the daemon's minimal environment. An operator who does not accept that parsing
+should not call the route.
+
 ### Controller-only cold backup and new-volume restore
 
 These operations use the control `X-API-Key`, not a guest token, and are available

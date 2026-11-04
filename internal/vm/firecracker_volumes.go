@@ -116,7 +116,7 @@ func (d *FirecrackerDriver) recoverVolumes() error {
 	}
 	for _, name := range names {
 		path := filepath.Join(cfg.VolumeDir, name)
-		if strings.HasSuffix(name, ".ext4.tmp") {
+		if strings.HasSuffix(name, ".ext4.tmp") || strings.HasSuffix(name, ".json.tmp") {
 			if err := os.Remove(path); err != nil {
 				return err
 			}

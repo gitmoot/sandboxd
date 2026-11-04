@@ -136,6 +136,21 @@ func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error
 	return err
 }
 
+// ResizeVolume checks the volume's filesystem, then grows it to fill the
+// image file. e2fsck exit 1 means it repaired errors, which -p only does when
+// that is safe; anything else stops the grow before resize2fs, with
+// errVolumeFsck so the caller knows the filesystem was not resized.
+func (h *linuxFCHost) ResizeVolume(ctx context.Context, e2fsck, resize2fs, path string) error {
+	if _, err := h.run(ctx, nil, e2fsck, "-f", "-p", path); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return fmt.Errorf("%w: %w", errVolumeFsck, err)
+		}
+	}
+	_, err := h.run(ctx, nil, resize2fs, path)
+	return err
+}
+
 // MonitorRuleset runs `nft monitor` in the daemon's (host) namespace. Every
 // line it prints is one committed ruleset change; the content does not
 // matter, since the caller re-reads the table itself. The subprocess dies

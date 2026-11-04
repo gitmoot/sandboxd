@@ -176,6 +176,9 @@ type fcHost interface {
 	// FormatVolume runs the trusted mkfs binary on the volume image file
 	// path; nothing is mounted on the host.
 	FormatVolume(ctx context.Context, mkfs, path string) error
+	// ResizeVolume runs the trusted e2fsck (-f -p) and resize2fs on a
+	// volume image file already extended to its new size. Nothing is mounted.
+	ResizeVolume(ctx context.Context, e2fsck, resize2fs, path string) error
 
 	ApplyFirewall(ctx context.Context, ruleset string) error
 	FirewallState(ctx context.Context) (string, error)
