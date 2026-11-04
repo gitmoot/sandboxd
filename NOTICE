@@ -46,6 +46,7 @@ Downloaded by images/linux-amd64-fc/install-firecracker.sh
 - Guest kernel vmlinux-6.1.186, built by Firecracker's CI (https://
   s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260930-a738f18a8db0-0/
   x86_64/vmlinux-6.1.186): the Linux kernel, GPL-2.0 WITH Linux-syscall-note.
+  With --kernel 6.18.51 the same CI set's vmlinux-6.18.51, same license.
 
 
 Downloaded by the image builds (images/*)

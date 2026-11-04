@@ -388,6 +388,8 @@ Leave `SANDBOXD_GUEST_AGENT` unset; each image build script then builds
 ```sh
 # Firecracker v1.17.0 + jailer and guest kernel 6.1.186, each SHA-256 pinned.
 images/linux-amd64-fc/install-firecracker.sh /var/lib/sandboxd-fc
+# Optional newer guest kernel (6.18.51, Landlock ABI 7), installed next to 6.1.186:
+images/linux-amd64-fc/install-firecracker.sh --kernel 6.18.51 /var/lib/sandboxd-fc
 # Read-only review root image (debian:bookworm-slim by digest, git, bash, curl,
 # gcc/g++/make, python3, user 1000, plus the guest agent). Prints the path,
 # images/review-amd64-<sha256 prefix>.ext4, about 600 MB.
@@ -401,9 +403,18 @@ images/linux-amd64-fc/build.sh --go126 /var/lib/sandboxd-fc
 | --- | --- |
 | `bin/firecracker`, `bin/jailer` | v1.17.0 x86_64, release tarball SHA-256 `06094a11…de558` |
 | `kernel/vmlinux-6.1.186` | Firecracker CI kernel, SHA-256 `ea0e55d0…f69c8` |
+| `kernel/vmlinux-6.18.51` | Only with `--kernel 6.18.51`: the same CI set, SHA-256 `0545ba17…1ed447` |
 | `images/review-amd64-<sha>.ext4` | The read-only root image, with its `.sha256` |
 | `images/review-go126-amd64-<sha>.ext4` | The read-only Go review image, with its `.sha256` |
 | `jail/`, `run/` | Per-VM state, empty when no VM exists |
+
+A worker opts in to the newer kernel with `-fc-kernel
+/var/lib/sandboxd-fc/kernel/vmlinux-6.18.51`; the choice is per instance, and
+`6.1.186` stays the default. Firecracker's kernel policy lists 6.18 as a
+supported guest since v1.16.1 (6.1 is past its minimum support date). A boot of
+the hardened e2b profile with sandboxd c9c7e070 on Firecracker 1.17.0 reported
+`uname` 6.18.51+ and Landlock ABI 7 (Deimos Forge, 2026-11); the other profiles
+and images have not been exercised on it.
 
 ### Go review image (`--go126`)
 
