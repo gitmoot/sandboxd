@@ -72,7 +72,7 @@ func (d *FirecrackerDriver) ResizeVolume(ctx context.Context, id string, sizeMiB
 			resize2fs, err = d.trustedTool(fcResize2fs)
 		}
 	}
-	growth := sizeMiB - volume.SizeMiB
+	growth := max(sizeMiB-d.volumeFootprintMiB(volume), 0)
 	if err == nil {
 		err = d.reserveGrowth(volume, growth)
 	}
@@ -88,6 +88,8 @@ func (d *FirecrackerDriver) ResizeVolume(ctx context.Context, id string, sizeMiB
 	volume.SizeMiB = sizeMiB
 	d.volumeMu.Lock()
 	defer d.volumeMu.Unlock()
+	// If this fails, the enlarged disk keeps counting against the budget:
+	// accounting reads the disk file's size, not only the record.
 	if err := d.replaceVolumeRecord(volume); err != nil {
 		return Volume{}, err
 	}
@@ -108,7 +110,7 @@ func (d *FirecrackerDriver) reserveGrowth(volume fcVolume, growth int) error {
 	}
 	used := reserved
 	for _, existing := range volumes {
-		used += existing.SizeMiB
+		used += d.volumeFootprintMiB(existing)
 	}
 	if used+growth > d.cfg.VolumeBudgetMiB {
 		return fmt.Errorf("%w: %d of %d MiB used, growing %s takes %d MiB more", ErrVolumeBudget, used, d.cfg.VolumeBudgetMiB, volume.ID, growth)
@@ -140,6 +142,15 @@ func (d *FirecrackerDriver) growDisk(ctx context.Context, id string, oldMiB, new
 	if !ok || !info.Mode().IsRegular() || stat.Nlink != 1 || stat.Uid != uint32(os.Geteuid()) {
 		return errors.New("volume disk is not a detached native disk")
 	}
+	// Fence the disk until the last tool has exited. The tools inherit this
+	// open file, so the lock outlives the daemon if it is killed mid-grow; a
+	// restarted daemon sees the disk as busy (volumeInUse) until they finish.
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return ErrVolumeTransferBusy
+		}
+		return err
+	}
 	size, target := int64(oldMiB)<<20, int64(newMiB)<<20
 	if info.Size() < size || info.Size() > target {
 		return fmt.Errorf("%w: disk is %d bytes, expected %d to %d", ErrVolumeSize, info.Size(), size, target)
@@ -153,7 +164,7 @@ func (d *FirecrackerDriver) growDisk(ctx context.Context, id string, oldMiB, new
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	err = d.host.ResizeVolume(ctx, e2fsck, resize2fs, d.volumeDisk(id))
+	err = d.host.ResizeVolume(ctx, e2fsck, resize2fs, d.volumeDisk(id), file)
 	if errors.Is(err, errVolumeFsck) && extended {
 		// Nothing was resized: put the file back, so the volume still matches
 		// its record and can be backed up or attached.
@@ -185,4 +196,31 @@ func (d *FirecrackerDriver) replaceVolumeRecord(volume fcVolume) error {
 		return errors.Join(err, fcRemoveMissing(tmp))
 	}
 	return fcSyncPath(d.cfg.VolumeDir)
+}
+
+// volumeLocked reports ErrVolumeTransferBusy while any process, this daemon or
+// a e2fsck/resize2fs that outlived a previous one, holds the disk's flock.
+func (d *FirecrackerDriver) volumeLocked(id string) error {
+	fd, err := syscall.Open(d.volumeDisk(id), syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	if err := syscall.Flock(fd, syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return fmt.Errorf("%w: a filesystem tool still holds %s", ErrVolumeTransferBusy, id)
+		}
+		return err
+	}
+	return syscall.Flock(fd, syscall.LOCK_UN)
+}
+
+// volumeFootprintMiB is what a volume costs the budget: its recorded size, or
+// its disk file when that is larger (a grow whose record was not published).
+func (d *FirecrackerDriver) volumeFootprintMiB(volume fcVolume) int {
+	info, err := os.Lstat(d.volumeDisk(volume.ID))
+	if err != nil {
+		return volume.SizeMiB
+	}
+	return max(volume.SizeMiB, int((info.Size()+1<<20-1)>>20))
 }

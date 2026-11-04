@@ -246,7 +246,7 @@ existing volume after `-fc-volume-mib` was raised, which only affects new
 volumes.
 
 Steps, with the volume held (no attach, delete or backup) throughout: check
-budget and floor, extend the disk file, `e2fsck -f -p`, `resize2fs`, then
+budget and floor, take an exclusive `flock` on the disk file, extend it, `e2fsck -f -p`, `resize2fs`, then
 replace the record with one atomic rename. The host uses its own trusted
 `e2fsck` and `resize2fs` (root-owned regular files under `/usr/sbin` or
 `/sbin`, found when a grow runs; `e2fsprogs` ships them with `mke2fs`). Nothing is mounted. If `e2fsck` cannot
@@ -256,7 +256,14 @@ stops mid-grow, the disk file is larger than its record until the same
 request is repeated: the steps are repeatable, and a disk file larger than the
 requested size is refused rather than cut. Until then the volume can still
 be attached (the guest sees a larger device holding the old filesystem) but a
-backup of it is refused.
+backup of it is refused. Budget accounting counts a volume at the larger of
+its record and its disk file, so an unfinished grow is never free space.
+
+`e2fsck` and `resize2fs` do not die with the daemon. They inherit the locked
+disk, so the `flock` outlives a killed daemon until the last tool has exited;
+every disk user (attach, delete, backup, grow) checks it and answers busy
+(`409`) meanwhile. A restarted daemon therefore cannot attach a disk a tool
+is still writing.
 
 Trust: `e2fsck` and `resize2fs` run as root on a filesystem the guest wrote,
 which is the one place the host parses guest-controlled metadata (`mke2fs`

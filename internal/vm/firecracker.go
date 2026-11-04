@@ -178,7 +178,8 @@ type fcHost interface {
 	FormatVolume(ctx context.Context, mkfs, path string) error
 	// ResizeVolume runs the trusted e2fsck (-f -p) and resize2fs on a
 	// volume image file already extended to its new size. Nothing is mounted.
-	ResizeVolume(ctx context.Context, e2fsck, resize2fs, path string) error
+	// lock is the flocked disk file; the tools inherit it (see volumeLocked).
+	ResizeVolume(ctx context.Context, e2fsck, resize2fs, path string, lock *os.File) error
 
 	ApplyFirewall(ctx context.Context, ruleset string) error
 	FirewallState(ctx context.Context) (string, error)

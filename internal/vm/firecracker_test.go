@@ -162,7 +162,7 @@ func (h *fakeFCHost) FormatVolume(_ context.Context, mkfs, path string) error {
 
 // ResizeVolume stands in for e2fsck and resize2fs: it records the disk size it
 // was handed, optionally blocks on resizeGate, and fails with resizeErr.
-func (h *fakeFCHost) ResizeVolume(_ context.Context, e2fsck, resize2fs, path string) error {
+func (h *fakeFCHost) ResizeVolume(_ context.Context, e2fsck, resize2fs, path string, _ *os.File) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err

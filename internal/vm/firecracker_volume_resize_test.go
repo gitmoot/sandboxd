@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -215,5 +216,147 @@ func TestFirecrackerVolumeGrowHoldsVolume(t *testing.T) {
 	}
 	if err := d.DeleteVolume(ctx, volume.ID); err != nil {
 		t.Fatalf("delete after grow: %v", err)
+	}
+}
+
+// A grow whose record could not be published leaves an enlarged disk. It keeps
+// counting against the budget (also after a restart, which re-reads the disk),
+// so a create cannot admit more disk than the budget allows.
+func TestFirecrackerVolumeGrowFailedRecordKeepsBudget(t *testing.T) {
+	d, _, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory where the record's temp file goes makes publication fail.
+	block := filepath.Join(cfg.VolumeDir, volume.ID+".json.tmp")
+	if err := os.Mkdir(block, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.ResizeVolume(ctx, volume.ID, 192); err == nil {
+		t.Fatal("grow reported success although its record was not written")
+	}
+	if got := volumeDiskSize(t, cfg, volume.ID); got != 192<<20 {
+		t.Fatalf("disk size = %d", got)
+	}
+	// Budget 256 MiB: the 192 MiB disk leaves room for no second 128 MiB volume.
+	if _, err := d.CreateVolume(ctx, "other"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("create next to an unrecorded 192 MiB disk: %v", err)
+	}
+	if err := os.Remove(block); err != nil {
+		t.Fatal(err)
+	}
+	// The same request finishes the grow, without counting the extension twice.
+	if grown, err := d.ResizeVolume(ctx, volume.ID, 192); err != nil || grown.SizeMiB != 192 {
+		t.Fatalf("retry = %+v %v", grown, err)
+	}
+}
+
+func lockedByAnother(t *testing.T, path string) bool {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+	if err == nil {
+		return false
+	}
+	if !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatal(err)
+	}
+	return true
+}
+
+// The fence is the disk's flock, not process memory: with the in-memory
+// reservation gone (a restarted daemon has none), a disk a tool still holds
+// cannot be attached, deleted, backed up or grown.
+func TestFirecrackerVolumeGrowFencedByDiskLock(t *testing.T) {
+	d, host, cfg := newVolumeFirecracker(t)
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := filepath.Join(cfg.VolumeDir, volume.ID+".ext4")
+	gate := make(chan struct{})
+	host.resizeGate = gate
+	done := make(chan error, 1)
+	go func() { _, err := d.ResizeVolume(ctx, volume.ID, 192); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !lockedByAnother(t, disk) {
+		if time.Now().After(deadline) {
+			t.Fatal("the disk was not locked while the tools ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	d.volumeMu.Lock()
+	clear(d.volumeTransfers)
+	d.volumeMu.Unlock()
+	if _, err := d.Create(ctx, volumeSpec(cfg, fcTestID, "sbx1", volume.ID)); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("attach with the tools running: %v", err)
+	}
+	if err := d.DeleteVolume(ctx, volume.ID); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("delete with the tools running: %v", err)
+	}
+	if _, err := d.OpenVolumeBackup(ctx, volume.ID); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("backup with the tools running: %v", err)
+	}
+	if _, err := d.ResizeVolume(ctx, volume.ID, 224); !errors.Is(err, ErrVolumeTransferBusy) {
+		t.Fatalf("second grow with the tools running: %v", err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if lockedByAnother(t, disk) {
+		t.Fatal("the disk is still locked after the grow")
+	}
+}
+
+// The real host passes the locked file to e2fsck and resize2fs. The tool keeps
+// working after the daemon's own descriptor is closed, which is what a daemon
+// killed mid-grow leaves behind: here resize2fs leaves a child that still runs
+// after the call returned and the daemon's descriptor was closed.
+func TestLinuxHostResizeToolsKeepDiskLocked(t *testing.T) {
+	dir := t.TempDir()
+	disk := filepath.Join(dir, "v.ext4")
+	if err := os.WriteFile(disk, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := func(name, body string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	fsck := script("e2fsck", "exit 0\n")
+	resize := script("resize2fs", "sleep 1 </dev/null >/dev/null 2>&1 &\nexit 0\n")
+
+	lock, err := os.OpenFile(disk, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&linuxFCHost{}).ResizeVolume(context.Background(), fsck, resize, disk, lock); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !lockedByAnother(t, disk) {
+		t.Fatal("the disk was not locked by the tool after the daemon's descriptor closed")
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for lockedByAnother(t, disk) {
+		if time.Now().After(deadline) {
+			t.Fatal("the disk stayed locked after the tool exited")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

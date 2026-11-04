@@ -255,7 +255,7 @@ func (d *FirecrackerDriver) volumeInUse(id string) error {
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Nlink != 1 {
 		return fmt.Errorf("%w: a jail still links %s", ErrVolumeInUse, id)
 	}
-	return nil
+	return d.volumeLocked(id)
 }
 
 // CreateVolume makes a VolumeMiB ext4 disk named name.
@@ -281,7 +281,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 		if volume.Name == name {
 			return Volume{}, fmt.Errorf("%w: %q", ErrVolumeExists, name)
 		}
-		used += volume.SizeMiB
+		used += d.volumeFootprintMiB(volume)
 	}
 	size := d.cfg.VolumeMiB
 	if used+size > d.cfg.VolumeBudgetMiB {

@@ -287,7 +287,7 @@ func (d *FirecrackerDriver) reserveRestore(ctx context.Context, name string, siz
 		if volume.Name == name {
 			return fcVolume{}, ErrVolumeExists
 		}
-		used += volume.SizeMiB
+		used += d.volumeFootprintMiB(volume)
 	}
 	if used+size > d.cfg.VolumeBudgetMiB {
 		return fcVolume{}, ErrVolumeBudget
