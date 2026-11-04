@@ -17,6 +17,9 @@ var (
 	// ErrVolumeInUse: the volume is attached to a VM (any trace of one: a
 	// running, stopped or half-destroyed VM still holds it).
 	ErrVolumeInUse = errors.New("volume is attached to a sandbox")
+	// ErrVolumeSize: the requested volume size is invalid, or smaller than
+	// the current one.
+	ErrVolumeSize = errors.New("invalid volume size")
 	// ErrVolumeBudget: creating the volume would exceed the total volume
 	// budget or the host disk floor.
 	ErrVolumeBudget = errors.New("volume budget exhausted")
@@ -51,6 +54,15 @@ type Volumes interface {
 	// Volumes lists every volume, sorted by name.
 	Volumes(ctx context.Context) ([]Volume, error)
 	DeleteVolume(ctx context.Context, id string) error
+}
+
+// VolumeResizer is implemented by drivers that can grow a detached volume in
+// place (the Linux Firecracker driver). It never shrinks: a smaller size
+// fails with ErrVolumeSize, the same size is a no-op, and an attached,
+// transferring or missing volume fails with ErrVolumeInUse,
+// ErrVolumeTransferBusy or ErrVolumeNotFound.
+type VolumeResizer interface {
+	ResizeVolume(ctx context.Context, id string, sizeMiB int) (Volume, error)
 }
 
 var (

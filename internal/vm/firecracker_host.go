@@ -62,11 +62,21 @@ func newLinuxFCHost(names fcNames) *linuxFCHost {
 }
 
 func (h *linuxFCHost) run(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
+	return h.runInheriting(ctx, nil, stdin, name, args...)
+}
+
+// runInheriting runs a tool that also inherits keep as its fd 3. A flock on
+// keep is held by the open file description, which the child shares: it stays
+// locked until the tool exits, even if the daemon dies first.
+func (h *linuxFCHost) runInheriting(ctx context.Context, keep *os.File, stdin []byte, name string, args ...string) ([]byte, error) {
 	if h.toolsErr != nil {
 		return nil, h.toolsErr
 	}
 	c := exec.CommandContext(ctx, name, args...)
 	c.Env = []string{fcHostPath}
+	if keep != nil {
+		c.ExtraFiles = []*os.File{keep}
+	}
 	if stdin != nil {
 		c.Stdin = bytes.NewReader(stdin)
 	}
@@ -133,6 +143,24 @@ func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(
 // belongs to the guest user, as the guest's home disk does.
 func (h *linuxFCHost) FormatVolume(ctx context.Context, mkfs, path string) error {
 	_, err := h.run(ctx, nil, mkfs, "-q", "-F", "-t", "ext4", "-m", "0", "-E", "root_owner=1000:1000,lazy_itable_init=1", "-L", "volume", path)
+	return err
+}
+
+// ResizeVolume checks the volume's filesystem, then grows it to fill the
+// image file. e2fsck exit 1 means it repaired errors, which -p only does when
+// that is safe; anything else stops the grow before resize2fs, with
+// errVolumeFsck so the caller knows the filesystem was not resized. lock is
+// the caller's open, flocked file for path; each tool inherits it, so the
+// disk stays fenced while a tool runs, even if the daemon dies (the tools do
+// not die with it).
+func (h *linuxFCHost) ResizeVolume(ctx context.Context, e2fsck, resize2fs, path string, lock *os.File) error {
+	if _, err := h.runInheriting(ctx, lock, nil, e2fsck, "-f", "-p", path); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return fmt.Errorf("%w: %w", errVolumeFsck, err)
+		}
+	}
+	_, err := h.runInheriting(ctx, lock, nil, resize2fs, path)
 	return err
 }
 

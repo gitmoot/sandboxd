@@ -116,7 +116,7 @@ func (d *FirecrackerDriver) recoverVolumes() error {
 	}
 	for _, name := range names {
 		path := filepath.Join(cfg.VolumeDir, name)
-		if strings.HasSuffix(name, ".ext4.tmp") {
+		if strings.HasSuffix(name, ".ext4.tmp") || strings.HasSuffix(name, ".json.tmp") {
 			if err := os.Remove(path); err != nil {
 				return err
 			}
@@ -255,7 +255,7 @@ func (d *FirecrackerDriver) volumeInUse(id string) error {
 	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Nlink != 1 {
 		return fmt.Errorf("%w: a jail still links %s", ErrVolumeInUse, id)
 	}
-	return nil
+	return d.volumeLocked(id)
 }
 
 // CreateVolume makes a VolumeMiB ext4 disk named name.
@@ -272,7 +272,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	reserved, err := d.reservedVolumeMiB(name)
+	reserved, headroom, err := d.reservedVolumeMiB(name)
 	if err != nil {
 		return Volume{}, err
 	}
@@ -281,7 +281,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 		if volume.Name == name {
 			return Volume{}, fmt.Errorf("%w: %q", ErrVolumeExists, name)
 		}
-		used += volume.SizeMiB
+		used += d.volumeFootprintMiB(volume)
 	}
 	size := d.cfg.VolumeMiB
 	if used+size > d.cfg.VolumeBudgetMiB {
@@ -291,7 +291,7 @@ func (d *FirecrackerDriver) CreateVolume(ctx context.Context, name string) (Volu
 	if err != nil {
 		return Volume{}, err
 	}
-	if need := uint64(d.cfg.DiskFloorMiB+size+reserved) << 20; free < need {
+	if need := uint64(d.cfg.DiskFloorMiB+size+headroom) << 20; free < need {
 		return Volume{}, fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB volume needed",
 			ErrVolumeBudget, free>>20, d.cfg.DiskFloorMiB, size)
 	}

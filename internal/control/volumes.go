@@ -33,6 +33,17 @@ type newVolumeRequest struct {
 	Name string `json:"name"`
 }
 
+// resizeVolumeRequest asks to grow a detached volume to SizeMiB.
+type resizeVolumeRequest struct {
+	SizeMiB int `json:"sizeMiB"`
+}
+
+// resizedVolume is the grow response: the volume with its new size.
+type resizedVolume struct {
+	volumeEntry
+	SizeMiB int `json:"sizeMiB"`
+}
+
 // volumeToken is the token the SDKs require with a volume. It grants
 // nothing: the volume content API it would authorize is refused, and a
 // volume's data is reached only from a sandbox it is mounted in.
@@ -47,7 +58,7 @@ func (s *Service) withToken(volume vm.Volume) volumeAndToken {
 // serveVolumes answers E2B's volume API when volumes are configured, and
 // reports whether path was a volume route.
 func (s *Service) serveVolumes(w http.ResponseWriter, r *http.Request) bool {
-	if s.serveVolumeTransfers(w, r) {
+	if s.serveVolumeTransfers(w, r) || s.serveVolumeResize(w, r) {
 		return true
 	}
 	path := r.URL.Path
@@ -96,6 +107,8 @@ func (s *Service) volumeFailure(w http.ResponseWriter, action string, err error)
 		s.fail(w, ProfileE2B, http.StatusConflict, "volume is attached to a sandbox: kill the sandbox first")
 	case errors.Is(err, vm.ErrVolumeTransferBusy):
 		s.fail(w, ProfileE2B, http.StatusConflict, "volume storage operation in progress")
+	case errors.Is(err, vm.ErrVolumeSize):
+		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid volume size: it can only grow, between 64 MiB and 1 TiB")
 	case errors.Is(err, vm.ErrVolumeBackupInvalid):
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid volume backup")
 	case errors.Is(err, vm.ErrVolumeBudget):
@@ -215,4 +228,39 @@ func (s *Service) volumeMount(ctx context.Context, raw json.RawMessage, hardened
 		return &vm.VolumeMount{ID: volume.ID, Path: requested.Path}, 0, ""
 	}
 	return nil, http.StatusNotFound, fmt.Sprintf("volume %q not found", requested.Name)
+}
+
+// serveVolumeResize answers POST /volumes/{id}/resize, an operator route
+// behind the control API key like backup: it grows a detached volume and never
+// shrinks one. Customers, who hold only a sandbox's envd token, cannot reach it.
+func (s *Service) serveVolumeResize(w http.ResponseWriter, r *http.Request) bool {
+	id, ok := strings.CutSuffix(strings.TrimPrefix(r.URL.Path, "/volumes/"), "/resize")
+	if !ok || !strings.HasPrefix(r.URL.Path, "/volumes/") {
+		return false
+	}
+	if r.Method != http.MethodPost {
+		s.fail(w, ProfileE2B, http.StatusMethodNotAllowed, "method not allowed")
+		return true
+	}
+	resizer, ok := s.volumes.(vm.VolumeResizer)
+	if !ok {
+		s.fail(w, ProfileE2B, http.StatusNotImplemented, "volume grow unavailable")
+		return true
+	}
+	if !vm.ValidVolumeID(id) {
+		s.fail(w, ProfileE2B, http.StatusNotFound, "volume not found")
+		return true
+	}
+	var request resizeVolumeRequest
+	if err := decode(w, r, &request); !errors.Is(err, io.EOF) {
+		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid volume resize body")
+		return true
+	}
+	volume, err := resizer.ResizeVolume(r.Context(), id, request.SizeMiB)
+	if err != nil {
+		s.volumeFailure(w, "resize", err)
+		return true
+	}
+	jsonResponse(w, http.StatusOK, resizedVolume{volumeEntry{volume.ID, volume.Name}, volume.SizeMiB})
+	return true
 }

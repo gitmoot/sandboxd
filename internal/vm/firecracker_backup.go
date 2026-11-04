@@ -17,12 +17,14 @@ import (
 )
 
 // volumeTransfers is protected by volumeMu. A zero SizeMiB is a backup of an
-// existing volume; a positive size reserves a new name and restore capacity.
+// existing volume; a positive size reserves a new name and restore capacity;
+// GrowTo > 0 is a grow of an existing volume from GrowFrom MiB to GrowTo MiB.
 // Reservations are process-local: the daemon's instance/ledger claim excludes
 // other writers, and restart removes incomplete .ext4.tmp imports.
 type fcVolumeTransfer struct {
-	Name    string
-	SizeMiB int
+	Name             string
+	SizeMiB          int
+	GrowFrom, GrowTo int
 }
 
 func (d *FirecrackerDriver) reserveVolumeTransfer(id string, transfer fcVolumeTransfer) error {
@@ -48,18 +50,30 @@ func (d *FirecrackerDriver) releaseVolumeTransfer(id string) {
 // reservedVolumeMiB also rejects names reserved by an in-flight restore. Count
 // full restore sizes against disk headroom conservatively, even if a stream has
 // partially allocated its staging file; a slow import must never overcommit it.
-func (d *FirecrackerDriver) reservedVolumeMiB(name string) (int, error) {
-	reserved := 0
-	for _, transfer := range d.volumeTransfers {
+//
+// It returns two figures. budget is what the volume budget must add to the
+// volumes' footprints: restore sizes, and the part of a grow the disk file has
+// not been extended by yet (the extended part is in the footprint). headroom is
+// what the host disk floor must hold back: restore sizes and each grow's whole
+// growth until it finishes, because extending the file is sparse and the
+// allocation only happens while e2fsck and resize2fs run.
+func (d *FirecrackerDriver) reservedVolumeMiB(name string) (budget, headroom int, err error) {
+	for id, transfer := range d.volumeTransfers {
+		if transfer.GrowTo > 0 {
+			budget += max(transfer.GrowTo-max(transfer.GrowFrom, d.diskMiB(id)), 0)
+			headroom += transfer.GrowTo - transfer.GrowFrom
+			continue
+		}
 		if transfer.SizeMiB == 0 {
 			continue
 		}
 		if transfer.Name == name {
-			return 0, ErrVolumeExists
+			return 0, 0, ErrVolumeExists
 		}
-		reserved += transfer.SizeMiB
+		budget += transfer.SizeMiB
+		headroom += transfer.SizeMiB
 	}
-	return reserved, nil
+	return budget, headroom, nil
 }
 
 func (d *FirecrackerDriver) OpenVolumeBackup(ctx context.Context, id string) (VolumeBackup, error) {
@@ -274,7 +288,7 @@ func (d *FirecrackerDriver) reserveRestore(ctx context.Context, name string, siz
 	if len(d.volumeTransfers) >= MaxVolumeTransfers {
 		return fcVolume{}, ErrVolumeTransferBusy
 	}
-	reserved, err := d.reservedVolumeMiB(name)
+	reserved, headroom, err := d.reservedVolumeMiB(name)
 	if err != nil {
 		return fcVolume{}, err
 	}
@@ -287,7 +301,7 @@ func (d *FirecrackerDriver) reserveRestore(ctx context.Context, name string, siz
 		if volume.Name == name {
 			return fcVolume{}, ErrVolumeExists
 		}
-		used += volume.SizeMiB
+		used += d.volumeFootprintMiB(volume)
 	}
 	if used+size > d.cfg.VolumeBudgetMiB {
 		return fcVolume{}, ErrVolumeBudget
@@ -296,7 +310,7 @@ func (d *FirecrackerDriver) reserveRestore(ctx context.Context, name string, siz
 	if err != nil {
 		return fcVolume{}, err
 	}
-	if free < uint64(d.cfg.DiskFloorMiB+size+reserved)<<20 {
+	if free < uint64(d.cfg.DiskFloorMiB+size+headroom)<<20 {
 		return fcVolume{}, ErrVolumeBudget
 	}
 	var random [16]byte

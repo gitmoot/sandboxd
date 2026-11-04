@@ -75,6 +75,32 @@ func (f *fakeVolumes) DeleteVolume(_ context.Context, id string) error {
 	return fmt.Errorf("volume %s: %w", id, vm.ErrVolumeNotFound)
 }
 
+// ResizeVolume grows like the driver: only larger, only detached.
+func (f *fakeVolumes) ResizeVolume(_ context.Context, id string, sizeMiB int) (vm.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.volumes {
+		volume := &f.volumes[i]
+		if volume.ID != id {
+			continue
+		}
+		switch {
+		case volume.AttachedTo != "":
+			return vm.Volume{}, fmt.Errorf("volume %s: %w", id, vm.ErrVolumeInUse)
+		case sizeMiB < volume.SizeMiB:
+			return vm.Volume{}, fmt.Errorf("volume %s: %w", id, vm.ErrVolumeSize)
+		}
+		volume.SizeMiB = sizeMiB
+		return *volume, nil
+	}
+	return vm.Volume{}, fmt.Errorf("volume %s: %w", id, vm.ErrVolumeNotFound)
+}
+
+// plainVolumes is a store that cannot grow volumes.
+type plainVolumes struct{ *fakeVolumes }
+
+func (plainVolumes) ResizeVolume() {}
+
 func (f *fakeVolumes) attach(name, sandbox string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -395,4 +421,49 @@ func TestVolumesNeedLocalDriver(t *testing.T) {
 	if err == nil {
 		t.Fatal("volumes accepted without a local driver")
 	}
+}
+
+func TestVolumeGrowAPI(t *testing.T) {
+	s, _, volumes := openVolumes(t, 1)
+	data := createVolume(t, s, "data")
+	path := "/volumes/" + data.ID + "/resize"
+
+	got := request(t, s, http.MethodPost, path, map[string]any{"sizeMiB": 1024})
+	if want := fmt.Sprintf(`{"volumeID":%q,"name":"data","sizeMiB":1024}`+"\n", data.ID); got.Code != http.StatusOK || got.Body.String() != want {
+		t.Fatalf("grow: %d %s, want %s", got.Code, got.Body.String(), want)
+	}
+	if list, _ := volumes.Volumes(context.Background()); list[0].SizeMiB != 1024 {
+		t.Fatalf("driver size = %d", list[0].SizeMiB)
+	}
+	volumes.attach("data", "sbx-1")
+	for _, c := range []struct {
+		label, method, path string
+		body                any
+		status              int
+		message             string
+	}{
+		{"attached", http.MethodPost, path, map[string]any{"sizeMiB": 2048}, http.StatusConflict, "attached to a sandbox"},
+		{"unknown volume", http.MethodPost, "/volumes/vol-ffffffffffffffffffffffffffffffff/resize", map[string]any{"sizeMiB": 2048}, http.StatusNotFound, "volume not found"},
+		{"malformed id", http.MethodPost, "/volumes/data/resize", map[string]any{"sizeMiB": 2048}, http.StatusNotFound, "volume not found"},
+		{"wrong method", http.MethodGet, path, nil, http.StatusMethodNotAllowed, "method not allowed"},
+		{"unknown field", http.MethodPost, path, map[string]any{"sizeMiB": 2048, "force": true}, http.StatusBadRequest, "invalid volume resize body"},
+	} {
+		wantFailure(t, c.label, request(t, s, c.method, c.path, c.body), c.status, c.message)
+	}
+	volumes.mu.Lock()
+	volumes.volumes[0].AttachedTo = ""
+	volumes.mu.Unlock()
+	wantFailure(t, "shrink", request(t, s, http.MethodPost, path, map[string]any{"sizeMiB": 512}), http.StatusBadRequest, "can only grow")
+	// A missing size is size 0, which the driver refuses; it is never a no-op.
+	wantFailure(t, "no body", request(t, s, http.MethodPost, path, nil), http.StatusBadRequest, "can only grow")
+}
+
+func TestVolumeGrowNeedsDriverSupport(t *testing.T) {
+	driver := &specDriver{fakeDriver: &fakeDriver{instances: map[string]vm.Instance{}}}
+	cfg := mixedConfig(e2bBase, 1)
+	cfg.Volumes = plainVolumes{&fakeVolumes{}}
+	s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, cfg)
+	created := createVolume(t, s, "data")
+	wantFailure(t, "unsupported", request(t, s, http.MethodPost, "/volumes/"+created.ID+"/resize", map[string]any{"sizeMiB": 1024}),
+		http.StatusNotImplemented, "grow unavailable")
 }
