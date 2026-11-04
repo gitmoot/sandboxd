@@ -17,12 +17,14 @@ import (
 )
 
 // volumeTransfers is protected by volumeMu. A zero SizeMiB is a backup of an
-// existing volume; a positive size reserves a new name and restore capacity.
+// existing volume; a positive size reserves a new name and restore capacity;
+// GrowTo > 0 is a grow of an existing volume from GrowFrom MiB to GrowTo MiB.
 // Reservations are process-local: the daemon's instance/ledger claim excludes
 // other writers, and restart removes incomplete .ext4.tmp imports.
 type fcVolumeTransfer struct {
-	Name    string
-	SizeMiB int
+	Name             string
+	SizeMiB          int
+	GrowFrom, GrowTo int
 }
 
 func (d *FirecrackerDriver) reserveVolumeTransfer(id string, transfer fcVolumeTransfer) error {
@@ -50,7 +52,13 @@ func (d *FirecrackerDriver) releaseVolumeTransfer(id string) {
 // partially allocated its staging file; a slow import must never overcommit it.
 func (d *FirecrackerDriver) reservedVolumeMiB(name string) (int, error) {
 	reserved := 0
-	for _, transfer := range d.volumeTransfers {
+	for id, transfer := range d.volumeTransfers {
+		if transfer.GrowTo > 0 {
+			// The volume's own footprint already counts what the disk file
+			// has been extended by; reserve only the rest of the growth.
+			reserved += max(transfer.GrowTo-max(transfer.GrowFrom, d.diskMiB(id)), 0)
+			continue
+		}
 		if transfer.SizeMiB == 0 {
 			continue
 		}

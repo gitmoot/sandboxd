@@ -97,9 +97,11 @@ func (d *FirecrackerDriver) ResizeVolume(ctx context.Context, id string, sizeMiB
 }
 
 // reserveGrowth checks the volume budget and the host disk floor for growth
-// MiB more, then reserves it like an in-flight restore, so a concurrent create
-// counts it. Callers hold volumeMu.
+// MiB more than the volume's footprint, then reserves the grow, so a
+// concurrent create counts it: the not yet extended remainder through the
+// reservation, the extended part through the disk file. Callers hold volumeMu.
 func (d *FirecrackerDriver) reserveGrowth(volume fcVolume, growth int) error {
+	target := d.volumeFootprintMiB(volume) + growth
 	volumes, err := d.readVolumes()
 	if err != nil {
 		return err
@@ -122,7 +124,7 @@ func (d *FirecrackerDriver) reserveGrowth(volume fcVolume, growth int) error {
 	if need := uint64(d.cfg.DiskFloorMiB+growth+reserved) << 20; free < need {
 		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB growth needed", ErrVolumeBudget, free>>20, d.cfg.DiskFloorMiB, growth)
 	}
-	return d.reserveVolumeTransfer(volume.ID, fcVolumeTransfer{Name: volume.Name, SizeMiB: growth})
+	return d.reserveVolumeTransfer(volume.ID, fcVolumeTransfer{Name: volume.Name, GrowFrom: volume.SizeMiB, GrowTo: target})
 }
 
 // growDisk extends the detached disk file and its filesystem. A disk larger
@@ -218,9 +220,14 @@ func (d *FirecrackerDriver) volumeLocked(id string) error {
 // volumeFootprintMiB is what a volume costs the budget: its recorded size, or
 // its disk file when that is larger (a grow whose record was not published).
 func (d *FirecrackerDriver) volumeFootprintMiB(volume fcVolume) int {
-	info, err := os.Lstat(d.volumeDisk(volume.ID))
+	return max(volume.SizeMiB, d.diskMiB(volume.ID))
+}
+
+// diskMiB is a volume's disk file size rounded up to MiB, 0 if unreadable.
+func (d *FirecrackerDriver) diskMiB(id string) int {
+	info, err := os.Lstat(d.volumeDisk(id))
 	if err != nil {
-		return volume.SizeMiB
+		return 0
 	}
-	return max(volume.SizeMiB, int((info.Size()+1<<20-1)>>20))
+	return int((info.Size() + 1<<20 - 1) >> 20)
 }

@@ -360,3 +360,45 @@ func TestLinuxHostResizeToolsKeepDiskLocked(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// While a grow runs, the budget charges the volume's growth once. The extended
+// disk file and the reserved growth must not both count: a create that fits
+// next to the grown volume is admitted, one that does not is refused.
+func TestFirecrackerVolumeGrowInFlightChargedOnce(t *testing.T) {
+	d, host, _ := newTestFirecracker(t, func(c *FirecrackerConfig) {
+		c.VolumeBudgetMiB, c.VolumeMiB, c.VolumeDir = 320, 128, filepath.Join(c.Root, "volumes")
+	})
+	ctx := context.Background()
+	volume, err := d.CreateVolume(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	host.resizeGate = gate
+	done := make(chan error, 1)
+	go func() { _, err := d.ResizeVolume(ctx, volume.ID, 192); done <- err }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		host.mu.Lock()
+		started := len(host.resized) == 1
+		host.mu.Unlock()
+		if started {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resize did not reach the host")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// 192 MiB growing + 128 MiB new = the 320 MiB budget exactly.
+	if _, err := d.CreateVolume(ctx, "next"); err != nil {
+		t.Fatalf("a volume that fits next to the growing one was refused: %v", err)
+	}
+	if _, err := d.CreateVolume(ctx, "over"); !errors.Is(err, ErrVolumeBudget) {
+		t.Fatalf("create past the budget during a grow: %v", err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
