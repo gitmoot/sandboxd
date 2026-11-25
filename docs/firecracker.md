@@ -479,10 +479,11 @@ Every VMM starts with an API socket for this.
   the free space, so a write that lands meanwhile can only make admission
   refuse near the floor, never admit past it; a write stays admitted until
   its VMM is known to have stopped writing (a VMM that cannot be stopped
-  keeps it until the daemon exits). A refused auto-pause leaves the
-  sandbox running and is retried each sweep until its pause retention
-  would have lapsed. The daemon flushes the guest's disks, pauses the
-  vCPUs and writes a full snapshot
+  keeps it until the daemon exits; a stopped build whose namespace or jail
+  removal fails releases it). A refused pause is an error like any other:
+  an auto-pause refused below the floor destroys the sandbox, as its end
+  time would have. The daemon flushes the guest's disks, pauses the vCPUs
+  and writes a full snapshot
   (VM state and a memory file as large as the guest's memory) into the
   VM's own jail (`<chroot>/paused/`), then stops the VMM and the VM's
   network stack and marks its record paused. A clone restored from a
@@ -495,10 +496,10 @@ Every VMM starts with an API socket for this.
   is resumed, killed or its `-pause-retention` (default 24 h) lapses. Its
   disk use is its home disk plus the memory file (the guest's memory size).
   Paused VMs survive daemon restarts, clean ones included: startup cleanup
-  and shutdown keep them. A clean shutdown still destroys every guest that
-  is not paused, those with `autoPause` included; only sandboxes whose end
-  time has come by the gateway's last sweep are auto-paused (and awaited)
-  first.
+  and shutdown keep them. A clean shutdown destroys every guest that is
+  not paused, those with `autoPause` included: once the gateway starts
+  closing it starts no pause or resume, auto-pauses due included, and only
+  waits for those already under way.
 - **Resume.** The daemon checks `-fc-memory-floor-mib`, clears what the
   last jailer run left in the jail (device nodes, the VMM binary and its
   PID file, the sockets), starts a VMM in the same jail and rebuilds the
