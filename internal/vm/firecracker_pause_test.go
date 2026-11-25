@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -306,7 +307,8 @@ func TestFirecrackerConcurrentPausesShareTheDiskHeadroom(t *testing.T) {
 	}
 	writing, release := make(chan string, 2), make(chan struct{})
 	host.mu.Lock()
-	host.free = uint64(cfg.DiskFloorMiB+513) << 20
+	// Room for one snapshot: 512 MiB of memory, 1 MiB of VM state, 1 MiB.
+	host.free = uint64(cfg.DiskFloorMiB+512+1+1) << 20
 	host.onSnapshot = func(chroot string) {
 		writing <- chroot
 		<-release
@@ -354,7 +356,9 @@ func TestFirecrackerPausesChargeOnlyWhatIsLeftToWrite(t *testing.T) {
 	}
 	writing, release := make(chan struct{}, 1), make(chan struct{})
 	host.mu.Lock()
-	host.free = uint64(cfg.DiskFloorMiB+1025) << 20
+	// Room for two snapshots (512 MiB of memory, 1 MiB of VM state each)
+	// above the floor, and 1 MiB.
+	host.free = uint64(cfg.DiskFloorMiB+2*(512+1)+1) << 20
 	host.snapshotMemoryMiB = 256
 	host.onSnapshot = func(chroot string) {
 		if strings.Contains(chroot, fcTestID) {
@@ -408,6 +412,120 @@ func TestFirecrackerBuildAndPauseShareTheDiskHeadroom(t *testing.T) {
 	}
 	if err := d.Pause(ctx, fcTestID); err != nil {
 		t.Fatalf("pause once the build is done: %v", err)
+	}
+}
+
+// Admission samples each writer's progress before the free space, so a
+// write landing between the samples is still charged as unwritten while its
+// blocks are already gone from the free space read: it can turn an
+// admission near the floor into a refusal, never take the disk below the
+// floor. Here the first pause writes its whole memory file right after the
+// second pause's first sample; both snapshots do not fit, and the second is
+// refused.
+func TestFirecrackerAdmissionRacingAWriteNeverOverspends(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	for i, id := range []string{fcTestID, fcTestID2} {
+		if _, err := d.Create(ctx, Spec{ID: id, Image: cfg.Images[0], Network: FirecrackerSlotNames(2)[i], CPUs: 1, MemoryMiB: 512}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writing, release := make(chan struct{}, 1), make(chan struct{})
+	host.mu.Lock()
+	host.free = uint64(cfg.DiskFloorMiB+900) << 20
+	host.onSnapshot = func(chroot string) {
+		if strings.Contains(chroot, fcTestID) {
+			writing <- struct{}{}
+			<-release
+		}
+	}
+	host.mu.Unlock()
+	first := make(chan error, 1)
+	go func() { first <- d.Pause(ctx, fcTestID) }()
+	<-writing
+	host.mu.Lock()
+	host.snapshotMemoryMiB = 512
+	host.onSample = func() {
+		host.mu.Lock()
+		defer host.mu.Unlock()
+		host.onSample = nil
+		for path := range host.written {
+			if strings.Contains(path, fcTestID) && filepath.Base(path) == fcSnapshotMemory {
+				host.written[path] = 512 << 20
+			}
+		}
+	}
+	host.mu.Unlock()
+	err := d.Pause(ctx, fcTestID2)
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first pause: %v", err)
+	}
+	if !errors.Is(err, ErrDiskFloor) {
+		t.Errorf("second pause admitted beside a write that left no room for it: %v", err)
+	}
+	if free, _ := host.FreeBytes(cfg.Root); free < uint64(cfg.DiskFloorMiB)<<20 {
+		t.Errorf("pauses left %d MiB free, below the %d MiB floor", free>>20, cfg.DiskFloorMiB)
+	}
+}
+
+// A template build that fails after its VMM started keeps its admission
+// until its VMM is stopped: a pause is refused while the build's cleanup has
+// not yet stopped it, and admitted once it has.
+func TestFirecrackerFailedBuildHoldsItsAdmissionUntilStopped(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	spec := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
+	build := fcBuildPrefix + snapshotName(t, d, spec)
+	original, err := os.ReadFile(cfg.Firecracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var launched atomic.Bool
+	stopping, release := make(chan struct{}, 1), make(chan struct{})
+	host.mu.Lock()
+	// Room for the build's home disk, memory and state, and 256 MiB more.
+	host.free = uint64(cfg.DiskFloorMiB+cfg.HomeDiskMiB+512+1+256) << 20
+	// The build runs another binary than its key names, so it fails once
+	// its VMM runs.
+	host.onExecCopy = func(id string, copied bool) {
+		if id != build {
+			return
+		}
+		content := "firecracker, another version"
+		if copied {
+			content = string(original)
+			launched.Store(true)
+		}
+		if err := replaceFile(cfg.Firecracker, content); err != nil {
+			t.Error(err)
+		}
+	}
+	host.onKill = func(name string) {
+		if name == build && launched.CompareAndSwap(true, false) {
+			stopping <- struct{}{}
+			<-release
+		}
+	}
+	host.mu.Unlock()
+	if _, err := d.Create(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	<-stopping
+	err = d.Pause(ctx, fcTestID)
+	close(release)
+	if !errors.Is(err, ErrDiskFloor) {
+		t.Errorf("pause beside a failed build whose VMM still runs: %v", err)
+	}
+	waitBuild(t, d)
+	if _, err := os.Stat(d.snapshotDir(snapshotName(t, d, spec))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the failed build stored a snapshot: %v", err)
+	}
+	if t.Failed() {
+		return
+	}
+	if err := d.Pause(ctx, fcTestID); err != nil {
+		t.Fatalf("pause once the failed build is stopped: %v", err)
 	}
 }
 

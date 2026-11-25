@@ -92,15 +92,26 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err != nil {
 		return fmt.Errorf("open the paused directory of %q: %w", id, err)
 	}
-	defer unix.Close(paused)
 	release, err := d.admitWrite(&fcWrite{
-		what: "guest memory", need: uint64(meta.MemoryMiB) << 20, owner: meta.VMMUID,
+		what: "guest memory and VM state", need: uint64(meta.MemoryMiB+fcSnapshotStateMiB) << 20, owner: meta.VMMUID,
 		files: []fcWrittenFile{{paused, fcSnapshotState}, {paused, fcSnapshotMemory}},
 	})
 	if err != nil {
+		_ = unix.Close(paused)
 		return err
 	}
-	defer release()
+	// The admission and the paused directory are held while the VMM may
+	// still write the snapshot. A VMM that can be neither resumed nor
+	// stopped keeps them until the daemon exits.
+	stuck := false
+	defer func() {
+		if stuck {
+			log.Printf("firecracker: the VMM of %s could not be stopped; its snapshot space stays held", id)
+			return
+		}
+		release()
+		_ = unix.Close(paused)
+	}()
 	conn, err := d.dialAgentAs(ctx, id, meta.VMMUID)
 	if err != nil {
 		return err
@@ -111,6 +122,7 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 		return fmt.Errorf("flush the guest's disks: %w", err)
 	}
 	if err := d.snapshotPaused(ctx, meta); err != nil {
+		stuck = errors.Is(err, errVMMNotStopped)
 		return err
 	}
 	// The VMM must be gone before the files are complete for a resume. If
@@ -159,10 +171,15 @@ func (d *FirecrackerDriver) checkPausable(ctx context.Context, meta fcMeta) erro
 	return nil
 }
 
+// errVMMNotStopped marks a failed snapshot whose VMM could be neither
+// resumed nor stopped: it may still be writing.
+var errVMMNotStopped = errors.New("the VMM could not be stopped")
+
 // snapshotPaused pauses VM meta's guest and writes its full snapshot to the
 // jail's paused directory. If the snapshot fails the guest is resumed, or,
 // if that fails too, its VMM is stopped; once the VMM can no longer write
-// there, what it wrote is discarded.
+// there, what it wrote is discarded. If it cannot be stopped either, the
+// error wraps errVMMNotStopped.
 func (d *FirecrackerDriver) snapshotPaused(ctx context.Context, meta fcMeta) error {
 	call := func(ctx context.Context, method, path string, body any) error {
 		ctx, cancel := context.WithTimeout(ctx, fcPauseAPITime)
@@ -187,7 +204,7 @@ func (d *FirecrackerDriver) snapshotPaused(ctx context.Context, meta fcMeta) err
 		stopErr := d.host.KillCgroup(undo, meta.ID)
 		err = errors.Join(err, resumeErr, stopErr)
 		if stopErr != nil {
-			return fmt.Errorf("snapshot Firecracker VM %q: %w", meta.ID, err)
+			return fmt.Errorf("snapshot Firecracker VM %q: %w", meta.ID, errors.Join(err, errVMMNotStopped))
 		}
 	}
 	if discardErr := os.RemoveAll(filepath.Join(d.chroot(meta.ID), fcPausedJail)); discardErr != nil {

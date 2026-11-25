@@ -198,10 +198,6 @@ var (
 	_ HostMemoryReporter = (*FirecrackerDriver)(nil)
 )
 
-// ErrDiskFloor reports that creating a VM would leave less free disk than the
-// configured floor.
-var ErrDiskFloor = errors.New("free disk is below the configured floor")
-
 // fcHost is every host operation the driver performs outside Root. The
 // production implementation is linuxFCHost; tests substitute a fake.
 type fcHost interface {

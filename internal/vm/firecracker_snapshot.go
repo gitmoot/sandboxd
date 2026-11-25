@@ -857,10 +857,24 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.destroyBuild(ctx, id); err != nil {
 		return err
 	}
+	// held is what the build holds while its VMM may still write: the
+	// directories its admission reads and the admission itself. They go
+	// once the build VM is destroyed; if that fails, the VMM may still be
+	// writing and the admission stays held until the daemon exits.
+	var held []func()
+	admitted := false
 	defer func() {
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err = errors.Join(err, d.destroyBuild(cleanup, id))
+		destroyErr := d.destroyBuild(cleanup, id)
+		err = errors.Join(err, destroyErr)
+		if destroyErr != nil && admitted {
+			log.Printf("firecracker: template build %s could not be removed; its snapshot space stays held", id)
+			return
+		}
+		for _, free := range slices.Backward(held) {
+			free()
+		}
 	}()
 	meta := fcMeta{ID: id, VMMUID: d.cfg.UIDBase + fcBuildSlot, NetUID: d.cfg.UIDBase + fcUIDStride + fcBuildSlot,
 		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Hardened: spec.Hardened}
@@ -886,22 +900,24 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err != nil {
 		return fmt.Errorf("open the build jail: %w", err)
 	}
-	defer unix.Close(chrootDir)
+	held = append(held, func() { _ = unix.Close(chrootDir) })
 	outDir, err := unix.Openat(chrootDir, filepath.Base(fcSnapshotJail), dirFlags, 0)
 	if err != nil {
 		return fmt.Errorf("open the build jail: %w", err)
 	}
-	defer unix.Close(outDir)
-	// The snapshot's memory file and the home disk the guest writes are
-	// admitted as one write, as a pause's snapshot is.
+	held = append(held, func() { _ = unix.Close(outDir) })
+	// The snapshot's memory and state files and the home disk the guest
+	// writes are admitted as one write, as a pause's snapshot is. Firecracker
+	// offers the guest no discard, so the home disk's blocks only grow.
 	release, err := d.admitWrite(&fcWrite{
-		what: "snapshot memory and home disk", need: uint64(d.cfg.HomeDiskMiB+spec.MemoryMiB) << 20, owner: meta.VMMUID,
+		what: "snapshot memory, VM state and home disk", need: uint64(d.cfg.HomeDiskMiB+spec.MemoryMiB+fcSnapshotStateMiB) << 20, owner: meta.VMMUID,
 		files: []fcWrittenFile{{chrootDir, "home.ext4"}, {outDir, fcSnapshotState}, {outDir, fcSnapshotMemory}},
 	})
 	if err != nil {
 		return err
 	}
-	defer release()
+	admitted = true
+	held = append(held, release)
 	startup := &fcStartup{}
 	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err

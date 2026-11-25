@@ -100,8 +100,11 @@ type fakeFCHost struct {
 	onRestore          func(id string)
 	// written is the disk space of each snapshot file a VMM wrote, by
 	// path: while the file exists it is taken from free and is what
-	// WrittenBytes reports.
-	written map[string]uint64
+	// WrittenBytes reports. onSample, when set, runs (outside h.mu) once a
+	// FreeBytes or WrittenBytes call has taken its sample: a write landing
+	// between two samples.
+	written  map[string]uint64
+	onSample func()
 	// facts is what SnapshotFacts reports; memory, what HostMemory does.
 	facts  fcHostFacts
 	memory HostMemory
@@ -177,27 +180,37 @@ func (h *fakeFCHost) TrustedFile(path string, _ bool) error {
 }
 func (h *fakeFCHost) FreeBytes(string) (uint64, error) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	free := h.free
 	for path, size := range h.written {
 		if _, err := os.Lstat(path); err == nil {
 			free -= min(free, size)
 		}
 	}
+	hook := h.onSample
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return free, nil
 }
 func (h *fakeFCHost) WrittenBytes(dir int, name string, _ int) uint64 {
+	var written uint64
 	parent, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir))
-	if err != nil {
-		return 0
-	}
-	path := filepath.Join(parent, name)
-	if _, err := os.Lstat(path); err != nil {
-		return 0
+	if err == nil {
+		path := filepath.Join(parent, name)
+		if _, err := os.Lstat(path); err == nil {
+			h.mu.Lock()
+			written = h.written[path]
+			h.mu.Unlock()
+		}
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.written[path]
+	hook := h.onSample
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return written
 }
 func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	h.mu.Lock()

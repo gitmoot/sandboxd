@@ -78,6 +78,10 @@ var ErrImageTooOld = errors.New("guest image does not support a requested featur
 // memory is below its configured floor; retrying later can succeed.
 var ErrMemoryPressure = errors.New("host memory is below the configured floor")
 
+// ErrDiskFloor refuses a new VM or snapshot that would leave less free disk
+// than the worker's configured floor; retrying later can succeed.
+var ErrDiskFloor = errors.New("free disk is below the configured floor")
+
 // HostMemory is one sample of a worker host's memory: what the kernel has
 // (MemTotal), what new work can still use without swapping (MemAvailable),
 // and the floor below which the driver refuses new VMs (0: none).
