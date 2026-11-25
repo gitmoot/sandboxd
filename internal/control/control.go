@@ -118,10 +118,12 @@ type Service struct {
 	// pauser is the local driver's pause and resume, nil when it has none:
 	// pause and resume are then refused (501).
 	pauser vm.Pauser
-	// autoPauses tracks the pauses reconciliation started at sandboxes' end
-	// times; Close waits for them. closing (guarded by mu) stops new ones.
-	autoPauses sync.WaitGroup
-	closing    bool
+	// lifecycle tracks every pause and resume in flight, explicit or
+	// started by reconciliation at a sandbox's end time; Close waits for
+	// them before it closes the ledger. closing (guarded by mu) refuses new
+	// ones.
+	lifecycle sync.WaitGroup
+	closing   bool
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -295,6 +297,8 @@ func (s *Service) clearBusy(id string) {
 	}
 }
 
+// Close stops the sweep, refuses new pauses and resumes, waits for those in
+// flight to settle their rows, then closes the ledger.
 func (s *Service) Close() error {
 	s.closeTunnels()
 	close(s.stop)
@@ -302,7 +306,7 @@ func (s *Service) Close() error {
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
-	s.autoPauses.Wait()
+	s.lifecycle.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ledger.Close()

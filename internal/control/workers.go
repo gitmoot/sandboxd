@@ -305,7 +305,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 					return s.offline(m, err)
 				}
 				s.markBusy(row.ID)
-				s.autoPauses.Add(1)
+				s.lifecycle.Add(1)
 				go s.autoPause(row)
 			case running && (fresh || row.Lease != lease):
 				expiries = append(expiries, row.ID)

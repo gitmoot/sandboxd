@@ -25,7 +25,9 @@ const defaultResumeTimeout = 15
 // it is resumed, deleted, or its retention (Config.PauseRetention, kept as
 // the row's end time) lapses; reconciliation then destroys it like any
 // expired sandbox. A failed pause or resume leaves the row in its prior
-// state, and reconciliation destroys a VM that is no longer in it.
+// state, and reconciliation destroys a VM that is no longer in it. Once
+// Close starts, pauses and resumes are refused (503), and Close waits for
+// those in flight to settle their rows before it closes the ledger.
 
 type pauseRequest struct {
 	Memory *bool `json:"memory"`
@@ -76,6 +78,11 @@ func (s *Service) pause(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "service closing")
+		return
+	}
 	row, err := s.ledger.Get(r.Context(), id)
 	switch {
 	case err != nil || released(row):
@@ -97,7 +104,9 @@ func (s *Service) pause(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	s.markBusy(id)
+	s.lifecycle.Add(1)
 	s.mu.Unlock()
+	defer s.lifecycle.Done()
 	if err := s.pauseRow(context.WithoutCancel(r.Context()), row, true); err != nil {
 		log.Printf("sandbox %s: pause failed: %v", id, err)
 		switch {
@@ -143,9 +152,9 @@ func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) erro
 }
 
 // autoPause pauses an e2b sandbox with autoPause at its end time;
-// reconciliation set its row pausing and busy, and counted it in autoPauses.
+// reconciliation set its row pausing and busy, and counted it in lifecycle.
 func (s *Service) autoPause(row store.Row) {
-	defer s.autoPauses.Done()
+	defer s.lifecycle.Done()
 	if err := s.pauseRow(context.Background(), row, false); err != nil {
 		log.Printf("sandbox %s: auto-pause failed, destroying it: %v", row.ID, err)
 	}
@@ -183,6 +192,11 @@ func (s *Service) resume(w http.ResponseWriter, r *http.Request, id string) {
 // that id is a present e2b sandbox on the local worker.
 func (s *Service) resumeSandbox(w http.ResponseWriter, r *http.Request, id string, ttl time.Duration, autoPause *bool) {
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		s.fail(w, ProfileE2B, http.StatusServiceUnavailable, "service closing")
+		return
+	}
 	row, err := s.ledger.Get(r.Context(), id)
 	switch {
 	case err != nil || released(row):
@@ -204,7 +218,9 @@ func (s *Service) resumeSandbox(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 	s.markBusy(id)
+	s.lifecycle.Add(1)
 	s.mu.Unlock()
+	defer s.lifecycle.Done()
 
 	ctx := context.WithoutCancel(r.Context())
 	resumeCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)

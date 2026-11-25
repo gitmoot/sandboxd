@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -323,6 +324,56 @@ func TestPausedSandboxSurvivesGatewayRestart(t *testing.T) {
 		t.Fatalf("after restart: %+v", described)
 	}
 	expectStatus(t, s, http.MethodPost, "/sandboxes/"+id+"/resume", nil, http.StatusCreated)
+}
+
+// TestCloseWaitsForAPauseInFlight: Close refuses new pauses and resumes and
+// waits for an explicit pause in flight to settle its row before it closes
+// the ledger, so the next gateway finds the sandbox paused.
+func TestCloseWaitsForAPauseInFlight(t *testing.T) {
+	driver := newPausingDriver()
+	driver.entered, driver.release = make(chan struct{}, 1), make(chan struct{})
+	release := sync.OnceFunc(func() { close(driver.release) })
+	t.Cleanup(release)
+	path := filepath.Join(t.TempDir(), "ledger.sqlite")
+	s, err := Open(context.Background(), path, driver, mixedConfig(e2bBase, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := createE2B(t, s, map[string]any{"templateID": "base"}).ID
+	other := createE2B(t, s, map[string]any{"templateID": "base"}).ID
+	paused := make(chan int, 1)
+	go func() { paused <- request(t, s, http.MethodPost, "/sandboxes/"+id+"/pause", nil).Code }()
+	receive(t, driver.entered)
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned with a pause in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		s.mu.Lock()
+		closing := s.closing
+		s.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Close never started refusing pauses")
+		}
+	}
+	expectStatus(t, s, http.MethodPost, "/sandboxes/"+other+"/pause", nil, http.StatusServiceUnavailable)
+	release()
+	if code := receive(t, paused); code != http.StatusNoContent {
+		t.Fatalf("pause in flight at Close: %d", code)
+	}
+	if err := receive(t, closed); err != nil {
+		t.Fatal(err)
+	}
+	next := openAt(t, path, driver, mixedConfig(e2bBase, 2))
+	if described := describedSandbox(t, next, id); described.State != "paused" {
+		t.Fatalf("after restart: %+v", described)
+	}
 }
 
 // TestPauseRefusedOnARemoteWorker: only the local driver pauses.
