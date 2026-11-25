@@ -28,23 +28,23 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 
 | Area | Operation | Python e2b | JS e2b | Python code-interpreter | JS code-interpreter | Gitmoot client |
 | --- | --- | --- | --- | --- | --- | --- |
-| Control plane | `Sandbox.create` | 🟡 6/16 | 🟡 2/3 | — | — | — |
-| Control plane | `Sandbox.connect` | 🟡 8/10 (+8 offline) | 🟡 4/5 (+1 offline) | — | — | — |
+| Control plane | `Sandbox.create` | 🟡 8/16 | 🟡 2/3 | — | — | — |
+| Control plane | `Sandbox.connect` | ✅ 10/10 (+8 offline) | ✅ 5/5 (+1 offline) | — | — | — |
 | Control plane | `Sandbox.kill` | ✅ 6/6 | ✅ 3/3 | — | — | — |
 | Control plane | `Sandbox.get_info` | ✅ 2/2 | ✅ 1/1 | — | — | — |
-| Control plane | `Sandbox.list` | 🟡 16/22 | 🟡 13/19 | — | — | — |
+| Control plane | `Sandbox.list` | ✅ 22/22 | ✅ 19/19 | — | — | — |
 | Control plane | `set_timeout` | ✅ 6/6 | ✅ 3/3 | — | — | — |
 | Control plane | `get_metrics` | ✅ 4/4 | ✅ 2/2 | — | — | — |
 | Control plane | secure envd access token | ✅ 4/4 | ✅ 2/2 (+3 offline) | — | — | — |
 | Control plane | `get_host` / guest ports | ❌ 0/2 | ❌ 0/2 | — | — | — |
 | Control plane | sandbox logs (`/v2/sandboxes/{id}/logs`, sandboxd tests) | ✅ 1/1 | ✅ 1/1 | — | — | — |
-| Control plane | pause, resume, snapshots | ❌ 0/28 | ❌ 0/23 (+8 offline) | — | — | — |
-| Control plane | lifecycle options (autoPause, onTimeout) | — | ❌ 0/12 (+13 offline) | — | — | — |
+| Control plane | pause, resume, snapshots | 🟡 6/28 | 🟡 7/23 (+8 offline) | — | — | — |
+| Control plane | lifecycle options (autoPause, onTimeout) | — | 🟡 1/12 (+13 offline) | — | — | — |
 | Control plane | `fork` | 🟡 2/8 | 🟡 1/4 | — | — | — |
 | Control plane | network, internet access, egress proxy | ❌ 0/28 (+2 offline) | ❌ 0/33 (+27 offline) | — | — | — |
 | Control plane | IAM | — | ❌ 0/6 (+11 offline) | — | — | — |
 | Control plane | client config and request plumbing | ❌ 0/2 (+6 offline) | ❌ 0/11 (+58 offline) | — | — | — |
-| Control plane | unsupported features refused with 501 (sandboxd tests) | ✅ 9/9 | ✅ 8/8 | — | — | — |
+| Control plane | unsupported features refused with 501 (sandboxd tests) | ✅ 10/10 | ✅ 9/9 | — | — | — |
 | Commands | `commands.run` | ✅ 13/13 | ✅ 6/6 (+13 offline) | — | — | — |
 | Commands | `commands.run` envs | ✅ 8/8 | ✅ 3/3 | — | — | — |
 | Commands | `commands.connect` | ✅ 4/4 | ✅ 2/2 | — | — | — |
@@ -89,8 +89,8 @@ the logs routes, which neither SDK's `Sandbox` calls, or sandboxd's refusals.
 | Gitmoot | pinned client conformance (v1 create, get, list, timeout, metrics, upload, start, cancel, delete) | — | — | — | — | ✅ 1/1 |
 | Gitmoot | client fixture tests (offline) | — | — | — | — | ⚪ (+124 offline) |
 
-Totals: 388 pass against sandboxd, 621 pass offline,
-527 expected failures, 3 skipped.
+Totals: 421 pass against sandboxd, 621 pass offline,
+496 expected failures, 3 skipped.
 
 ## Intentional refusals
 
@@ -98,15 +98,15 @@ These operations are refused on purpose: every route answers `501` with a docume
 error (see [compatibility.md](compatibility.md#not-supported)), asserted exactly by the
 "unsupported features refused" row. Their upstream tests stay red and are not planned work.
 
-- pause, resume, snapshots: pause, resume and snapshots are deferred with M5 (owner decision D7).
-- lifecycle options (autoPause, onTimeout): auto-pause and auto-resume are deferred with M5 (D7); the request-shape tests mock E2B's API host and cannot reach sandboxd.
+- pause, resume, snapshots: pause and resume keep memory (filesystem-only pause and `on_resume='reboot'` answer 501); snapshots are refused (D7).
+- lifecycle options (autoPause, onTimeout): auto-pause keeps memory; auto-resume and filesystem-only auto-pause are refused; the request-shape tests mock E2B's API host and cannot reach sandboxd.
 - `fork`: fork needs snapshots (D7).
 - network, internet access, egress proxy: the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted.
 - IAM: IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd.
 - template build API: templates are built and registered only with the operator CLI (D8); the alias lookup behind `Template.exists` is served.
 - volumes: volumes are served on the Linux Firecracker worker when the operator sets a volume budget, and only mounted in a sandbox; the volume content API answers 501, and the upstream tests mock E2B's API host and cannot reach sandboxd.
 - secrets: secrets are not supported; pass values in `envVars`.
-- `Sandbox.list` (paused sandboxes), `Sandbox.connect` (resuming a paused sandbox) and `Sandbox.create` (auto-pause, MCP gateway) have refused tests too: their paused, auto-pause and MCP cases.
+- `Sandbox.connect` (`on_resume='reboot'`) and `Sandbox.create` (filesystem-only auto-pause, auto-resume, MCP gateway) have refused tests too: their reboot, filesystem-only, auto-resume and MCP cases.
 
 ## Expected failures
 
@@ -114,44 +114,17 @@ Every test below fails today and is recorded as `fail` in `conformance/expected.
 A later milestone turns a cell green by making these pass and recording them, except for
 the intentional refusals above.
 
-<details><summary>Control plane: `Sandbox.create` (11)</summary>
+<details><summary>Control plane: `Sandbox.create` (9)</summary>
 
 - Python e2b: `async/sandbox_async/test_create.py::test_auto_pause_filesystem_only_reboots`
-- Python e2b: `async/sandbox_async/test_create.py::test_auto_pause_without_auto_resume_requires_connect`
 - Python e2b: `async/sandbox_async/test_create.py::test_auto_resume_wakes_on_http_request`
 - Python e2b: `async/sandbox_async/test_create.py::test_keep_memory_none_defaults_to_full_memory`
 - Python e2b: `async/sandbox_async/test_create.py::test_mcp_gateway_start_failure_kills_created_sandbox`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_auto_pause_filesystem_only_reboots`
-- Python e2b: `sync/sandbox_sync/test_create.py::test_auto_pause_without_auto_resume_requires_connect`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_auto_resume_wakes_on_http_request`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_keep_memory_none_defaults_to_full_memory`
 - Python e2b: `sync/sandbox_sync/test_create.py::test_mcp_gateway_start_failure_kills_created_sandbox`
 - JS e2b: `sandbox/create.test.ts > MCP gateway start failure kills the created sandbox`
-
-</details>
-
-<details><summary>Control plane: `Sandbox.connect` (3)</summary>
-
-- Python e2b: `async/sandbox_async/test_connect.py::test_connect_to_paused_sandbox_resumes`
-- Python e2b: `sync/sandbox_sync/test_connect.py::test_connect_to_paused_sandbox_resumes`
-- JS e2b: `sandbox/connect.test.ts > connect resumes paused sandbox`
-
-</details>
-
-<details><summary>Control plane: `Sandbox.list` (12)</summary>
-
-- Python e2b: `async/api_async/test_sbx_list.py::test_list_paused_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_paginate_paused_sandboxes`
-- Python e2b: `async/api_async/test_sbx_list.py::test_paginate_running_and_paused_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_list_paused_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_paused_sandboxes`
-- Python e2b: `sync/api_sync/test_sbx_list.py::test_paginate_running_and_paused_sandboxes`
-- JS e2b: `api/list.test.ts > list paused sandboxes`
-- JS e2b: `api/list.test.ts > list paused sandboxes #2`
-- JS e2b: `api/list.test.ts > paginate paused sandboxes`
-- JS e2b: `api/list.test.ts > paginate paused sandboxes #2`
-- JS e2b: `api/list.test.ts > paginate running and paused sandboxes`
-- JS e2b: `api/list.test.ts > paginate running and paused sandboxes #2`
 
 </details>
 
@@ -164,11 +137,8 @@ the intentional refusals above.
 
 </details>
 
-<details><summary>Control plane: pause, resume, snapshots (51)</summary>
+<details><summary>Control plane: pause, resume, snapshots (38)</summary>
 
-- Python e2b: `async/api_async/test_sbx_snapshot.py::test_pause_sandbox`
-- Python e2b: `async/api_async/test_sbx_snapshot.py::test_resume_sandbox`
-- Python e2b: `async/sandbox_async/test_snapshot.py::test_snapshot`
 - Python e2b: `async/sandbox_async/test_snapshot_api.py::test_create_multiple_sandboxes_from_snapshot`
 - Python e2b: `async/sandbox_async/test_snapshot_api.py::test_create_named_snapshot`
 - Python e2b: `async/sandbox_async/test_snapshot_api.py::test_create_sandbox_from_snapshot`
@@ -180,9 +150,6 @@ the intentional refusals above.
 - Python e2b: `async/sandbox_async/test_snapshot_api.py::test_list_snapshots_for_sandbox`
 - Python e2b: `async/sandbox_async/test_snapshot_api.py::test_snapshot_preserves_filesystem`
 - Python e2b: `async/sandbox_async/test_snapshot_filesystem_only.py::test_pause_filesystem_only`
-- Python e2b: `sync/api_sync/test_sbx_snapshot.py::test_pause_sandbox`
-- Python e2b: `sync/api_sync/test_sbx_snapshot.py::test_resume_sandbox`
-- Python e2b: `sync/sandbox_sync/test_snapshot.py::test_snapshot`
 - Python e2b: `sync/sandbox_sync/test_snapshot_api.py::test_create_multiple_sandboxes_from_snapshot`
 - Python e2b: `sync/sandbox_sync/test_snapshot_api.py::test_create_named_snapshot`
 - Python e2b: `sync/sandbox_sync/test_snapshot_api.py::test_create_sandbox_from_snapshot`
@@ -194,8 +161,6 @@ the intentional refusals above.
 - Python e2b: `sync/sandbox_sync/test_snapshot_api.py::test_list_snapshots_for_sandbox`
 - Python e2b: `sync/sandbox_sync/test_snapshot_api.py::test_snapshot_preserves_filesystem`
 - Python e2b: `sync/sandbox_sync/test_snapshot_filesystem_only.py::test_pause_filesystem_only`
-- JS e2b: `api/snapshot.test.ts > pause sandbox`
-- JS e2b: `api/snapshot.test.ts > resume sandbox`
 - JS e2b: `sandbox/onResumeRequest.test.ts > Sandbox.connect omits memory for onResume: 'restore'`
 - JS e2b: `sandbox/onResumeRequest.test.ts > Sandbox.connect omits memory when onResume is not given`
 - JS e2b: `sandbox/onResumeRequest.test.ts > Sandbox.connect sends memory: false for onResume: 'reboot'`
@@ -211,18 +176,12 @@ the intentional refusals above.
 - JS e2b: `sandbox/snapshot-api.test.ts > list snapshots for specific sandbox`
 - JS e2b: `sandbox/snapshot-api.test.ts > snapshot preserves file system state`
 - JS e2b: `sandbox/snapshot.test.ts > filesystem-only pause reboots on resume but keeps the filesystem`
-- JS e2b: `sandbox/snapshot.test.ts > pause and resume a sandbox`
-- JS e2b: `sandbox/snapshot.test.ts > pause and resume a sandbox with completed long running process`
-- JS e2b: `sandbox/snapshot.test.ts > pause and resume a sandbox with file`
 - JS e2b: `sandbox/snapshot.test.ts > pause and resume a sandbox with http server`
-- JS e2b: `sandbox/snapshot.test.ts > pause and resume a sandbox with ongoing long running process`
-- JS e2b: `sandbox/snapshot.test.ts > pause and resume with env vars > pause and resume a sandbox with env vars`
 
 </details>
 
-<details><summary>Control plane: lifecycle options (autoPause, onTimeout) (12)</summary>
+<details><summary>Control plane: lifecycle options (autoPause, onTimeout) (11)</summary>
 
-- JS e2b: `sandbox/lifecyclePayload.test.ts > auto-pause without auto-resume requires connect to wake`
 - JS e2b: `sandbox/lifecyclePayload.test.ts > auto-resume wakes paused sandbox on http request`
 - JS e2b: `sandbox/lifecyclePayload.test.ts > filesystem-only auto-pause reboots on connect`
 - JS e2b: `sandbox/lifecycleRequest.test.ts > Sandbox.create omits autoPause for a lifecycle without onTimeout`

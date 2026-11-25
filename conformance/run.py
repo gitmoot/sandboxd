@@ -181,8 +181,8 @@ REFUSED = {
     "secrets": "secrets are not supported; pass values in `envVars`",
 }
 REFUSED_ALSO = (
-    "`Sandbox.list` (paused sandboxes), `Sandbox.connect` (resuming a paused sandbox) and `Sandbox.create` "
-    "(auto-pause, MCP gateway) have refused tests too: their paused, auto-pause and MCP cases."
+    "`Sandbox.connect` (`on_resume='reboot'`) and `Sandbox.create` (filesystem-only auto-pause, auto-resume, "
+    "MCP gateway) have refused tests too: their reboot, filesystem-only, auto-resume and MCP cases."
 )
 OUTCOMES = ("pass", "fail", "skip")
 

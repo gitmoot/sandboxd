@@ -58,17 +58,17 @@ The Linux column comes from two sources:
 
   | Suite | Pass | Fail |
   | --- | ---: | ---: |
-  | Python `e2b` 2.52.0 | 249 | 113 |
-  | JS `e2b` 2.52.0 | 134 | 214 |
+  | Python `e2b` 2.52.0 | 268 | 97 |
+  | JS `e2b` 2.52.0 | 152 | 199 |
   | Python code-interpreter 2.10.1 | 0 | 131 |
   | JS code-interpreter 2.8.0 | 0 | 69 |
   | Gitmoot pinned client | 1 | 0 |
 
-  Of the `e2b` failures, 109 (Python) and 201 (JS) are features sandboxd
-  refuses on purpose: pause and resume (including auto-pause),
-  snapshots, fork, MCP gateways, network policy, IAM, volumes, secrets,
-  template builds. The other 4 and 13
-  are `get_host` (needs wildcard DNS) and client request-plumbing tests. The
+  Of the `e2b` failures, 91 (Python) and 185 (JS) are features sandboxd
+  refuses on purpose: filesystem-only pause, auto-resume, snapshots, fork,
+  MCP gateways, network policy, IAM, volumes, secrets, template builds.
+  The other 6 and 14 are `get_host` (needs wildcard DNS), `set_timeout(0)`
+  and client request-plumbing tests. The
   matrix lists every failing test. The code-interpreter suites fail in CI
   because the dev driver has no code-interpreter server.
 - **A real Firecracker worker.** With the `code-interpreter-v1` image, the
