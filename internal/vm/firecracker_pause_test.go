@@ -532,6 +532,23 @@ func TestFirecrackerFailedBuildHoldsItsAdmissionUntilStopped(t *testing.T) {
 // A failed template build whose VMM is confirmed stopped releases its
 // admission even when removing its network namespace then fails.
 func TestFirecrackerStoppedBuildReleasesItsAdmissionDespiteCleanupErrors(t *testing.T) {
+	failBuildCleanup(t, func(d *FirecrackerDriver, build string) (netns, kill map[string]bool) {
+		return map[string]bool{d.names.netnsPrefix + build: true}, nil
+	})
+}
+
+// A failed template build whose VMM is confirmed stopped releases its
+// admission even when killing its network stack then fails.
+func TestFirecrackerStoppedBuildReleasesItsAdmissionDespiteANetworkKillError(t *testing.T) {
+	failBuildCleanup(t, func(_ *FirecrackerDriver, build string) (netns, kill map[string]bool) {
+		return nil, map[string]bool{fcNetCgroup + build: true}
+	})
+}
+
+// failBuildCleanup fails a template build once its VMM runs, injects the
+// faults its cleanup then meets, and checks a pause is admitted after it.
+func failBuildCleanup(t *testing.T, faults func(d *FirecrackerDriver, build string) (netns, kill map[string]bool)) {
+	t.Helper()
 	d, host, cfg := newSnapshotFirecracker(t)
 	ctx := context.Background()
 	spec := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
@@ -544,7 +561,7 @@ func TestFirecrackerStoppedBuildReleasesItsAdmissionDespiteCleanupErrors(t *test
 	// Room for the build's home disk, memory and state, and 256 MiB more.
 	host.free = uint64(cfg.DiskFloorMiB+cfg.HomeDiskMiB+512+1+256) << 20
 	// The build runs another binary than its key names, so it fails once
-	// its VMM runs; its cleanup then fails to delete its namespace.
+	// its VMM runs; its cleanup then meets the faults.
 	host.onExecCopy = func(id string, copied bool) {
 		if id != build {
 			return
@@ -553,7 +570,7 @@ func TestFirecrackerStoppedBuildReleasesItsAdmissionDespiteCleanupErrors(t *test
 		if copied {
 			content = string(original)
 			host.mu.Lock()
-			host.netnsFaults = map[string]bool{d.names.netnsPrefix + build: true}
+			host.netnsFaults, host.killFaults = faults(d, build)
 			host.mu.Unlock()
 		}
 		if err := replaceFile(cfg.Firecracker, content); err != nil {
@@ -566,10 +583,10 @@ func TestFirecrackerStoppedBuildReleasesItsAdmissionDespiteCleanupErrors(t *test
 	}
 	waitBuild(t, d)
 	host.mu.Lock()
-	faulted := len(host.netnsFaults) == 0
+	met := len(host.netnsFaults) == 0 && len(host.killFaults) == 0
 	host.mu.Unlock()
-	if !faulted {
-		t.Fatal("the failed build's cleanup never deleted its namespace")
+	if !met {
+		t.Fatal("the failed build's cleanup never met its faults")
 	}
 	if err := d.Pause(ctx, fcTestID); err != nil {
 		t.Fatalf("pause beside a stopped build whose cleanup failed: %v", err)

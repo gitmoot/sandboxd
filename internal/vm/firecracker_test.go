@@ -114,8 +114,9 @@ type fakeFCHost struct {
 	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
 	// mid-teardown.
 	onKill func(name string)
-	// netnsFaults fails the next deletion of each listed namespace once.
-	netnsFaults map[string]bool
+	// netnsFaults and killFaults fail the next deletion of each listed
+	// namespace, and the next kill of each listed cgroup, once.
+	netnsFaults, killFaults map[string]bool
 	// onSnapshot runs, outside h.mu, once a VMM has written a snapshot, with
 	// its chroot: what a compromised VMM does there before it exits.
 	onSnapshot func(chroot string)
@@ -362,6 +363,10 @@ func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.killFaults[name] {
+		delete(h.killFaults, name)
+		return fmt.Errorf("kill cgroup %q: injected fault", name)
+	}
 	delete(h.cgroups, name)
 	for _, listeners := range []map[string]*net.UnixListener{h.listeners, h.apis} {
 		if l, ok := listeners[name]; ok {

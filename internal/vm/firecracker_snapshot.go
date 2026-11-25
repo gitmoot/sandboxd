@@ -827,22 +827,21 @@ func (d *FirecrackerDriver) destroyBuild(ctx context.Context, id string) error {
 	return d.removeBuild(ctx, id)
 }
 
-// stopBuild stops build VM id's VMM and network stack: once it returns nil,
-// nothing of the build can write.
+// stopBuild stops build VM id's VMM: once it returns nil the VMM cgroup is
+// empty, and nothing of the build can write its jail.
 func (d *FirecrackerDriver) stopBuild(ctx context.Context, id string) error {
 	if !fcBuildID.MatchString(id) {
 		return fmt.Errorf("invalid template build ID %q", id)
 	}
-	for _, cgroup := range []string{id, fcNetCgroup + id} {
-		if err := d.host.KillCgroup(ctx, cgroup); err != nil {
-			return err
-		}
-	}
-	return nil
+	return d.host.KillCgroup(ctx, id)
 }
 
-// removeBuild removes the network namespace and jail of stopped build VM id.
+// removeBuild removes the network stack, namespace and jail of build VM id,
+// whose VMM is stopped.
 func (d *FirecrackerDriver) removeBuild(ctx context.Context, id string) error {
+	if err := d.host.KillCgroup(ctx, fcNetCgroup+id); err != nil {
+		return err
+	}
 	if err := d.host.DeleteNetns(ctx, d.names.netnsPrefix+id); err != nil {
 		return err
 	}
@@ -873,9 +872,9 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}
 	// held is what the build holds while its VMM may still write: the
 	// directories its admission reads and the admission itself. They go
-	// once the build VM is stopped, whatever its removal then does; if it
-	// cannot be stopped, the VMM may still be writing and the admission
-	// stays held until the daemon exits.
+	// once the build's VMM is stopped, whatever removing its network stack,
+	// namespace and jail then does; if the VMM cannot be stopped, it may
+	// still be writing and the admission stays held until the daemon exits.
 	var held []func()
 	admitted := false
 	defer func() {
