@@ -500,8 +500,13 @@ Every VMM starts with an API socket for this.
   rebuilds it instead: the namespace, its slirp/NAT process and their host
   tables go with the VMM on pause (a clean shutdown removes the host
   tables, so nothing may outlive the VMM) and come back identical on
-  resume. Connections open across a pause are reset; the guest's
+  resume. Connections open across a pause end; the guest's
   addresses, slot and egress policy are unchanged.
+
+Measured on a Ryzen 5 3600 with Firecracker 1.17.0 and the review image
+(1 vCPU, 512 MiB, 20 cycles of `TestFirecrackerKVMPause`): pause p50 1.05 s,
+p95 1.51 s (writing the 512 MiB memory file dominates); resume p50 171 ms,
+p95 423 ms, until the guest agent answers again.
 
 ## Install
 
