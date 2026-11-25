@@ -376,6 +376,39 @@ func TestCloseWaitsForAPauseInFlight(t *testing.T) {
 	}
 }
 
+// TestCloseRefusesPausesWhileTheSweepDrains: Close refuses pauses from its
+// start, also while it waits for a sweep held by a worker's inventory.
+func TestCloseRefusesPausesWhileTheSweepDrains(t *testing.T) {
+	shortenWorkerTimeout(t, 3*time.Second)
+	remote := newFakeWorker(t, "worker-a", "arm64", map[string]string{"sandboxd-base": "linux-arm64-envd"}, 1)
+	cfg := mixedConfig(e2bBase, 1)
+	cfg.Workers = []Remote{{ID: remote.id, Member: remote.client}}
+	driver := newPausingDriver()
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := createE2B(t, s, map[string]any{"templateID": "base"}).ID
+	if _, local := driver.instance(id); !local {
+		t.Fatal("placement: sandbox not on the local worker")
+	}
+	inventory := "/vms"
+	remote.stall.Store(&inventory)
+	receive(t, remote.stalled)
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	select {
+	case <-s.stop:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not stop the sweep")
+	}
+	expectStatus(t, s, http.MethodPost, "/sandboxes/"+id+"/pause", nil, http.StatusServiceUnavailable)
+	remote.stall.Store(nil)
+	if err := receive(t, closed); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestPauseRefusedOnARemoteWorker: only the local driver pauses.
 func TestPauseRefusedOnARemoteWorker(t *testing.T) {
 	remote := newFakeWorker(t, "worker-a", "arm64", map[string]string{"sandboxd-base": "linux-arm64-envd"}, 1)

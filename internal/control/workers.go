@@ -290,7 +290,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		running := owned && row.State == "running" && instance.Running
 		// A paused sandbox is kept until its retention (its end time) lapses.
 		paused := owned && row.State == "paused" && instance.Paused && now.Before(row.Ends)
-		autoPause := running && !now.Before(row.Ends) && row.AutoPause && m.local && s.pauser != nil && !s.closing
+		autoPause := running && !now.Before(row.Ends) && row.AutoPause && m.local && s.pauser != nil
 		if running && now.Before(row.Ends) || paused || autoPause {
 			if row.Lease != lease {
 				if err := s.ledger.Adopt(ctx, row.ID, lease); err != nil {
@@ -299,6 +299,9 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 				}
 			}
 			switch {
+			case autoPause && s.closing:
+				// Close refuses new pauses: the row stays running for the
+				// next start to pause, never destroyed for a pause not run.
 			case autoPause:
 				if err := s.setState(ctx, row.ID, "pausing"); err != nil {
 					s.mu.Unlock()

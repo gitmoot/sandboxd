@@ -297,15 +297,15 @@ func (s *Service) clearBusy(id string) {
 	}
 }
 
-// Close stops the sweep, refuses new pauses and resumes, waits for those in
+// Close refuses new pauses and resumes, stops the sweep, waits for those in
 // flight to settle their rows, then closes the ledger.
 func (s *Service) Close() error {
-	s.closeTunnels()
-	close(s.stop)
-	<-s.done
 	s.mu.Lock()
 	s.closing = true
 	s.mu.Unlock()
+	s.closeTunnels()
+	close(s.stop)
+	<-s.done
 	s.lifecycle.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
