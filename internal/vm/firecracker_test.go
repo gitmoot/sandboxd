@@ -457,15 +457,17 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 			return nil
 		}
 	}
-	// Like the real jailer, the fake creates device nodes and a copy of the
-	// VMM binary in the chroot, and refuses one that already holds them.
-	for _, trace := range []string{"dev", "firecracker"} {
+	// Like the real jailer, the fake creates device nodes, a copy of the
+	// VMM binary and the VMM's PID file in the chroot, and refuses one that
+	// already holds them.
+	for _, trace := range []string{"dev", "firecracker", "firecracker.pid"} {
 		if _, err := os.Lstat(filepath.Join(chroot, trace)); err == nil {
 			return fmt.Errorf("fake jailer: %s exists in the chroot", trace)
 		}
 	}
 	if err := errors.Join(os.Mkdir(filepath.Join(chroot, "dev"), 0o755),
-		os.WriteFile(filepath.Join(chroot, "firecracker"), nil, 0o755)); err != nil {
+		os.WriteFile(filepath.Join(chroot, "firecracker"), nil, 0o755),
+		os.WriteFile(filepath.Join(chroot, "firecracker.pid"), nil, 0o644)); err != nil {
 		return err
 	}
 	h.cgroups[id] = !h.bootDies

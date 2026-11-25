@@ -29,7 +29,7 @@ func TestFirecrackerKVMPause(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = d.Destroy(t.Context(), id) })
 		code, out, stderr := kvmRun(ctx, t, d, id, "/bin/sh", "-c",
-			`echo kept-`+id+` > /root/pause-marker && sync; setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo $!`)
+			`set -e; echo kept-`+id+` > "$HOME/pause-marker"; sync; setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo $!`)
 		if code != 0 || strings.TrimSpace(out) == "" {
 			t.Fatalf("%s: start background process: %d %q %q", id, code, out, stderr)
 		}
@@ -37,7 +37,7 @@ func TestFirecrackerKVMPause(t *testing.T) {
 	}
 	survived := func(id string) {
 		t.Helper()
-		code, out, stderr := kvmRun(ctx, t, d, id, "/bin/sh", "-c", `kill -0 "$0" && cat /root/pause-marker`, pids[id])
+		code, out, stderr := kvmRun(ctx, t, d, id, "/bin/sh", "-c", `kill -0 "$0" && cat "$HOME/pause-marker"`, pids[id])
 		if code != 0 || strings.TrimSpace(out) != "kept-"+id {
 			t.Fatalf("%s after resume: process %s or file lost: %d %q %q", id, pids[id], code, out, stderr)
 		}

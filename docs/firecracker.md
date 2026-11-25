@@ -462,6 +462,47 @@ VM's memory is mostly shared snapshot pages, charged to the cgroup that
 first read them, so `memory.current` understates it and PSS is the fairer
 per-VM figure. A template build took 1.2 s.
 
+## Pause and resume
+
+The Firecracker driver pauses an `e2b` sandbox with its memory and resumes
+it where it stopped
+([API](compatibility.md#pause-and-resume), [#86](https://github.com/gitmoot/sandboxd/issues/86)).
+Every VMM starts with an API socket for this.
+
+- **Pause.** The daemon checks that the guest agent accepts `OpRestore`
+  (an older image answers `500`: rebuild it) and that the disk keeps
+  `-fc-disk-floor-mib` plus the guest's memory size free. It flushes the
+  guest's disks, pauses the vCPUs and writes a full snapshot (VM state and
+  a memory file as large as the guest's memory) into the VM's own jail
+  (`<chroot>/paused/`), then stops the VMM and the VM's network stack and
+  marks its record paused. A clone restored from a template snapshot
+  drops its links to the template, which may then be collected. If the
+  snapshot fails the guest is resumed and keeps running.
+- **Paused.** Nothing of the VM runs: no VMM, no slirp/NAT process, no
+  network namespace, no host RAM. It keeps its jail, disks, UIDs, record
+  and network slot, and the gateway counts it against `-max-vms` until it
+  is resumed, killed or its `-pause-retention` (default 24 h) lapses. Its
+  disk use is its home disk plus the memory file (the guest's memory size).
+  Paused VMs survive daemon restarts, clean ones included: startup cleanup
+  and shutdown keep them.
+- **Resume.** The daemon checks `-fc-memory-floor-mib`, clears what the
+  last jailer run left in the jail (device nodes, the VMM binary and its
+  PID file, the sockets), starts a VMM in the same jail and rebuilds the
+  network namespace with the same names, addresses and egress policy. It
+  loads the snapshot, resumes the guest and sends `OpRestore` as for a
+  template clone: fresh host entropy (a resumed guest never repeats the
+  random state of an earlier run of itself) and the host's clock. Processes,
+  their PIDs and open files continue; the agent is redialed on the new
+  vsock. The memory file stays mapped by the new VMM and is unlinked once
+  the guest runs, so its disk is returned when that VMM exits. A failed
+  resume stops the VMM again and leaves the VM paused.
+- **Network namespace.** E2B keeps a paused sandbox's network. sandboxd
+  rebuilds it instead: the namespace, its slirp/NAT process and their host
+  tables go with the VMM on pause (a clean shutdown removes the host
+  tables, so nothing may outlive the VMM) and come back identical on
+  resume. Connections open across a pause are reset; the guest's
+  addresses, slot and egress policy are unchanged.
+
 ## Install
 
 Host prerequisites: an x86_64 host with `/dev/kvm`, cgroup v2 with

@@ -275,14 +275,15 @@ func (d *FirecrackerDriver) loadPaused(ctx context.Context, meta fcMeta) error {
 }
 
 // clearJailerTraces removes what an earlier jailer run and its VMM left in
-// VM id's chroot (device nodes, the VMM binary copy, the sockets), so the
-// jailer can run in it again.
+// VM id's chroot (device nodes, the VMM binary copy and its PID file, the
+// sockets), so the jailer can run in it again.
 func (d *FirecrackerDriver) clearJailerTraces(id string) error {
 	root := d.chroot(id)
 	if err := os.RemoveAll(filepath.Join(root, "dev")); err != nil {
 		return err
 	}
-	for _, name := range []string{filepath.Base(d.cfg.Firecracker), fcVsockPath, fcAPIPath} {
+	binary := filepath.Base(d.cfg.Firecracker)
+	for _, name := range []string{binary, binary + ".pid", fcVsockPath, fcAPIPath} {
 		if err := fcRemoveMissing(filepath.Join(root, name)); err != nil {
 			return err
 		}
