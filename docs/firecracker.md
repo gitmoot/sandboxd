@@ -504,9 +504,11 @@ Every VMM starts with an API socket for this.
   addresses, slot and egress policy are unchanged.
 
 Measured on a Ryzen 5 3600 with Firecracker 1.17.0 and the review image
-(1 vCPU, 512 MiB, 20 cycles of `TestFirecrackerKVMPause`): pause p50 1.05 s,
-p95 1.51 s (writing the 512 MiB memory file dominates); resume p50 171 ms,
-p95 423 ms, until the guest agent answers again.
+(1 vCPU, 512 MiB, 20 cycles of `TestFirecrackerKVMPause`): pause p50 0.86 s,
+p95 0.93 s (writing the 512 MiB memory file dominates); resume p50 145 ms,
+p95 169 ms, until the guest agent answers again. An earlier run on the same
+host under concurrent load measured pause p50 1.05 s, p95 1.51 s and resume
+p50 171 ms, p95 423 ms.
 
 ## Install
 
