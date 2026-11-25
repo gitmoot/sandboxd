@@ -17,9 +17,9 @@ const notSupportedDoc = "see docs/compatibility.md#not-supported"
 // services with an e2b template answer them; a gitmoot-strict-only service
 // keeps its plain 404.
 const (
-	refusePause     = "pause and resume are not supported: sandboxd never pauses a sandbox (deferred, owner decision D7)"
-	refuseSnapshots = "snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)"
-	refuseFork      = "fork is not supported: it needs snapshots (deferred with pause, D7)"
+	refusePause     = "pause and resume are not supported: this gateway's local driver cannot pause"
+	refuseSnapshots = "snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (D7)"
+	refuseFork      = "fork is not supported: it needs snapshots (D7)"
 	refuseNetwork   = "network updates are not supported: a sandbox's network policy is fixed by the operator"
 	refuseVolumes   = "volumes are not supported: sandboxd keeps no storage beyond a sandbox's lifetime"
 	refuseSecrets   = "secrets are not supported: pass values to a sandbox in envVars instead"
@@ -30,6 +30,11 @@ const (
 	refuseTemplateDelete = "deleting templates or snapshots through the API is not supported: the operator registers templates with the sandboxd CLI (D8) and sandboxd has no snapshots (D7)"
 	// With volumes configured (volumes.go), only their file API is refused.
 	refuseVolumeContent = "the volume content API is not supported: mount the volume in a sandbox (volumeMounts) and use its files there"
+
+	// With a pausing local driver (pause.go), a pause always keeps memory
+	// and only the local worker pauses.
+	refusePauseFilesystem = "filesystem-only pause (memory=false) is not supported: a sandboxd pause always keeps the sandbox's memory"
+	refusePauseRemote     = "pause and resume are supported only for sandboxes on the gateway's local worker"
 )
 
 // refuse answers a request for a feature sandboxd does not support.
@@ -60,7 +65,7 @@ func (s *Service) refusable(w http.ResponseWriter, r *http.Request, id string) b
 		s.fail(w, ProfileE2B, http.StatusNotFound, fmt.Sprintf("sandbox %q not found", id))
 		return false
 	}
-	if _, _, err := s.live(r.Context(), id); err != nil {
+	if _, _, err := s.present(r.Context(), id); err != nil {
 		s.fail(w, ProfileE2B, statusFor(err), fmt.Sprintf("sandbox %q unavailable", id))
 		return false
 	}

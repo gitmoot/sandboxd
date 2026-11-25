@@ -460,7 +460,7 @@ func (d *FirecrackerDriver) restore(ctx context.Context, spec Spec, meta fcMeta,
 	if err := d.prepareRestoreJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, d.diskLimitMiB(meta), "--api-sock", fcAPIPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, "--api-sock", fcAPIPath); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, fcRestoreTime)
@@ -820,14 +820,27 @@ func (d *FirecrackerDriver) removeBuilds(ctx context.Context) error {
 
 // destroyBuild removes every trace of build VM id, from any partial state.
 func (d *FirecrackerDriver) destroyBuild(ctx context.Context, id string) error {
+	defer d.dropConsole(id)
+	if err := d.stopBuild(ctx, id); err != nil {
+		return err
+	}
+	return d.removeBuild(ctx, id)
+}
+
+// stopBuild stops build VM id's VMM: once it returns nil the VMM cgroup is
+// empty, and nothing of the build can write its jail.
+func (d *FirecrackerDriver) stopBuild(ctx context.Context, id string) error {
 	if !fcBuildID.MatchString(id) {
 		return fmt.Errorf("invalid template build ID %q", id)
 	}
-	defer d.dropConsole(id)
-	for _, cgroup := range []string{id, fcNetCgroup + id} {
-		if err := d.host.KillCgroup(ctx, cgroup); err != nil {
-			return err
-		}
+	return d.host.KillCgroup(ctx, id)
+}
+
+// removeBuild removes the network stack, namespace and jail of build VM id,
+// whose VMM is stopped.
+func (d *FirecrackerDriver) removeBuild(ctx context.Context, id string) error {
+	if err := d.host.KillCgroup(ctx, fcNetCgroup+id); err != nil {
+		return err
 	}
 	if err := d.host.DeleteNetns(ctx, d.names.netnsPrefix+id); err != nil {
 		return err
@@ -843,13 +856,6 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.Ready(ctx); err != nil {
 		return fmt.Errorf("firewall is not armed before the build: %w", err)
 	}
-	free, err := d.host.FreeBytes(d.cfg.Root)
-	if err != nil {
-		return err
-	}
-	if need := uint64(d.cfg.DiskFloorMiB+d.cfg.HomeDiskMiB+spec.MemoryMiB) << 20; free < need {
-		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus the snapshot's memory and home disk needed", ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB)
-	}
 	// The build VM runs beside the VM whose create started it: it must not
 	// take the host below the memory floor either.
 	if d.cfg.MemoryFloorMiB > 0 {
@@ -864,10 +870,29 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.destroyBuild(ctx, id); err != nil {
 		return err
 	}
+	// held is what the build holds while its VMM may still write: the
+	// directories its admission reads and the admission itself. They go
+	// once the build's VMM is stopped, whatever removing its network stack,
+	// namespace and jail then does; if the VMM cannot be stopped, it may
+	// still be writing and the admission stays held until the daemon exits.
+	var held []func()
+	admitted := false
 	defer func() {
+		defer d.dropConsole(id)
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		err = errors.Join(err, d.destroyBuild(cleanup, id))
+		if stopErr := d.stopBuild(cleanup, id); stopErr != nil {
+			err = errors.Join(err, stopErr)
+			if admitted {
+				log.Printf("firecracker: template build %s could not be stopped; its snapshot space stays held", id)
+				return
+			}
+		} else if removeErr := d.removeBuild(cleanup, id); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove the stopped template build: %w", removeErr))
+		}
+		for _, free := range slices.Backward(held) {
+			free()
+		}
 	}()
 	meta := fcMeta{ID: id, VMMUID: d.cfg.UIDBase + fcBuildSlot, NetUID: d.cfg.UIDBase + fcUIDStride + fcBuildSlot,
 		Image: spec.Image, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB, Envd: spec.Envd, Hardened: spec.Hardened}
@@ -893,16 +918,26 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err != nil {
 		return fmt.Errorf("open the build jail: %w", err)
 	}
-	defer unix.Close(chrootDir)
+	held = append(held, func() { _ = unix.Close(chrootDir) })
 	outDir, err := unix.Openat(chrootDir, filepath.Base(fcSnapshotJail), dirFlags, 0)
 	if err != nil {
 		return fmt.Errorf("open the build jail: %w", err)
 	}
-	defer unix.Close(outDir)
+	held = append(held, func() { _ = unix.Close(outDir) })
+	// The snapshot's memory and state files and the home disk the guest
+	// writes are admitted as one write, as a pause's snapshot is. Firecracker
+	// offers the guest no discard, so the home disk's blocks only grow.
+	release, err := d.admitWrite(&fcWrite{
+		what: "snapshot memory, VM state and home disk", need: uint64(d.cfg.HomeDiskMiB+spec.MemoryMiB+fcSnapshotStateMiB) << 20, owner: meta.VMMUID,
+		files: []fcWrittenFile{{chrootDir, "home.ext4"}, {outDir, fcSnapshotState}, {outDir, fcSnapshotMemory}},
+	})
+	if err != nil {
+		return err
+	}
+	admitted = true
+	held = append(held, release)
 	startup := &fcStartup{}
-	// Its file size limit covers the snapshot of its guest memory too.
-	fsizeMiB := max(d.diskLimitMiB(meta), meta.MemoryMiB)
-	if err := d.launch(ctx, spec, meta, startup, fsizeMiB, "--api-sock", fcAPIPath, "--config-file", fcConfigPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err
 	}
 	// The jailer copied the Firecracker binary into the jail and runs the
@@ -942,10 +977,12 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}); err != nil {
 		return err
 	}
-	// The VMM must be gone before its files are taken.
+	// The VMM must be gone before its files are taken. Then the write is
+	// done: the files are moved, not copied, so their space is counted.
 	if err := d.host.KillCgroup(ctx, id); err != nil {
 		return err
 	}
+	release()
 	return d.storeSnapshot(spec, key, name, chrootDir, outDir)
 }
 

@@ -75,6 +75,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	portHosts := flags.Bool("port-hosts", false, "also route exposed guest ports by wildcard host <port>-<id>.<domain> (needs wildcard DNS and TLS for *.<domain> in front of sandboxd); without it guest ports are reached only via -gateway-host and routing headers")
 	portStreams := flags.Int("port-max-streams", envd.DefaultMaxPortStreams, "maximum concurrent guest port requests (WebSocket and other upgraded streams included) per e2b sandbox; more are refused with 429")
 	readyTimeout := flags.Duration("template-ready-timeout", control.DefaultReadyTimeout, "how long create waits for an e2b template's start and ready commands before it destroys the sandbox and answers 503")
+	pauseRetention := flags.Duration("pause-retention", control.DefaultPauseRetention, "how long a paused e2b sandbox is kept before it is destroyed")
 	maxVMs := flags.Int("max-vms", 4, "maximum concurrent guests")
 	maxTTL := flags.Duration("max-ttl", time.Hour, "maximum per-sandbox lifetime")
 	cpus := flags.Int("cpus", 2, "CPU count reported for each guest")
@@ -100,8 +101,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if *maxVMs < 1 || *maxVMs > 64 {
 		return errors.New("max-vms must be between 1 and 64")
 	}
-	if *portStreams < 1 || *readyTimeout <= 0 {
-		return errors.New("port-max-streams must be at least 1 and template-ready-timeout positive")
+	if *portStreams < 1 || *readyTimeout <= 0 || *pauseRetention <= 0 {
+		return errors.New("port-max-streams must be at least 1, and template-ready-timeout and pause-retention positive")
 	}
 	if *volumeBudget < 0 || (*volumeBudget > 0 && *envdBinary == "") {
 		return errors.New("volume-budget-mib must not be negative, and volumes need -envd: they mount only in e2b guests")
@@ -141,7 +142,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	}
 	config := control.Config{
 		APIKey: apiKey, TemplateID: *template, Image: devImage, Domain: *domain, WorkerID: "sandboxd-devvm",
-		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Slots: slots,
+		CPUs: *cpus, MemoryMiB: *memory, MaxVMs: *maxVMs, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, PauseRetention: *pauseRetention, Slots: slots,
 		DriverName: "devvm", Templates: registered.Templates, TokenSecret: tokenSecret,
 	}
 	if *volumeBudget > 0 {

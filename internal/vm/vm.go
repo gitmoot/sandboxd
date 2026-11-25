@@ -78,6 +78,10 @@ var ErrImageTooOld = errors.New("guest image does not support a requested featur
 // memory is below its configured floor; retrying later can succeed.
 var ErrMemoryPressure = errors.New("host memory is below the configured floor")
 
+// ErrDiskFloor refuses a new VM or snapshot that would leave less free disk
+// than the worker's configured floor; retrying later can succeed.
+var ErrDiskFloor = errors.New("free disk is below the configured floor")
+
 // HostMemory is one sample of a worker host's memory: what the kernel has
 // (MemTotal), what new work can still use without swapping (MemAvailable),
 // and the floor below which the driver refuses new VMs (0: none).
@@ -104,11 +108,38 @@ type HardenedBooter interface {
 
 // Instance is a positive observation of a VM owned by this driver. Network is
 // its only attached network, or "" when it is not attached to exactly one.
+// Paused marks a VM a Pauser paused: not running, but kept whole for Resume.
+// A paused VM's Network is the slot it keeps (and resumes on).
 type Instance struct {
 	ID      string
 	Running bool
+	Paused  bool
 	Network string
 }
+
+// Pauser is implemented by drivers that can pause a running VM and resume it
+// later where it stopped: its memory, processes, disks and network slot are
+// kept, while a paused VM runs no guest code. Whether a paused VM still
+// holds host RAM or processes is each driver's own (and documented there).
+// Callers serialize Pause, Resume and Destroy of one VM.
+type Pauser interface {
+	// Pause stops running VM id, keeping everything Resume needs; List then
+	// reports it Paused until Resume or Destroy. On error the VM is either
+	// still running (Pause undid what it started) or neither running nor
+	// paused, left for Destroy.
+	Pause(ctx context.Context, id string) error
+	// Resume starts paused VM id again where it was paused; List then
+	// reports it Running. On error the VM is either still paused or neither
+	// running nor paused, left for Destroy.
+	Resume(ctx context.Context, id string) error
+}
+
+// ErrNotPaused refuses a Resume of a VM that is not paused, and
+// ErrNotRunning a Pause of one that is not running.
+var (
+	ErrNotPaused  = errors.New("VM is not paused")
+	ErrNotRunning = errors.New("VM is not running")
+)
 
 // Command is executed inside a running VM without a host shell.
 type Command struct {

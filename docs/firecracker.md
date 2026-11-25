@@ -14,7 +14,7 @@ Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
 | Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (the larger of the home disk and an attached volume; for a [template snapshot](#template-snapshots--fc-snapshots) build, at least the guest RAM it writes) and `nofile=256` |
 | Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk besides an attached [volume](#volumes). The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
 | Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
-| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
+| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk plus what snapshot writes in progress (pauses, template builds) have yet to write. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
 
 CPU and memory come from `-cpus` and `-memory-mib`, the same flags the Apple
 worker uses.
@@ -461,6 +461,73 @@ after the snapshot was built, the others were 176 and 211 ms. A restored
 VM's memory is mostly shared snapshot pages, charged to the cgroup that
 first read them, so `memory.current` understates it and PSS is the fairer
 per-VM figure. A template build took 1.2 s.
+
+## Pause and resume
+
+The Firecracker driver pauses an `e2b` sandbox with its memory and resumes
+it where it stopped
+([API](compatibility.md#pause-and-resume), [#86](https://github.com/gitmoot/sandboxd/issues/86)).
+Every VMM starts with an API socket for this.
+
+- **Pause.** The daemon checks that the guest agent accepts `OpRestore`
+  (an older image answers `500`: rebuild it) and removes what an earlier
+  pause left in the jail. The snapshot is admitted like a template build's:
+  the disk must keep `-fc-disk-floor-mib`, plus what every pause and build
+  in progress has yet to write (what they wrote already shows in the free
+  space), plus the guest's memory size and 1 MiB of VM state; creates
+  count the writes in progress too. Each writer's progress is read before
+  the free space, so a write that lands meanwhile can only make admission
+  refuse near the floor, never admit past it; a write stays admitted until
+  its VMM is known to have stopped writing (a VMM that cannot be stopped
+  keeps it until the daemon exits; a build whose VMM stopped releases it
+  even if removing its network stack, namespace or jail then fails). A
+  refused pause is an error like any other:
+  an auto-pause refused below the floor destroys the sandbox, as its end
+  time would have. The daemon flushes the guest's disks, pauses the vCPUs
+  and writes a full snapshot
+  (VM state and a memory file as large as the guest's memory) into the
+  VM's own jail (`<chroot>/paused/`), then stops the VMM and the VM's
+  network stack and marks its record paused. A clone restored from a
+  template snapshot drops its links to the template, which may then be
+  collected. If the snapshot fails the guest is resumed and keeps running,
+  and what the snapshot wrote is deleted.
+- **Paused.** Nothing of the VM runs: no VMM, no slirp/NAT process, no
+  network namespace, no host RAM. It keeps its jail, disks, UIDs, record
+  and network slot, and the gateway counts it against `-max-vms` until it
+  is resumed, killed or its `-pause-retention` (default 24 h) lapses. Its
+  disk use is its home disk plus the memory file (the guest's memory size).
+  Paused VMs survive daemon restarts, clean ones included: startup cleanup
+  and shutdown keep them. A clean shutdown destroys every guest that is
+  not paused, those with `autoPause` included: once the gateway starts
+  closing it starts no pause or resume, auto-pauses due included, and only
+  waits for those already under way.
+- **Resume.** The daemon checks `-fc-memory-floor-mib`, clears what the
+  last jailer run left in the jail (device nodes, the VMM binary and its
+  PID file, the sockets), starts a VMM in the same jail and rebuilds the
+  network namespace with the same names, addresses and egress policy. It
+  loads the snapshot, resumes the guest and sends `OpRestore` as for a
+  template clone: fresh host entropy (a resumed guest never repeats the
+  random state of an earlier run of itself) and the host's clock. Processes,
+  their PIDs and open files continue; the agent is redialed on the new
+  vsock. Only once the guest runs behind the armed host firewall is the
+  record marked running; the memory file stays mapped by the new VMM and
+  is unlinked then, so its disk is returned when that VMM exits. A resume
+  that fails at any step, the final firewall check included, stops the
+  VMM and network stack again and leaves the VM paused, its snapshot and
+  record intact.
+- **Network namespace.** E2B keeps a paused sandbox's network. sandboxd
+  rebuilds it instead: the namespace, its slirp/NAT process and their host
+  tables go with the VMM on pause (a clean shutdown removes the host
+  tables, so nothing may outlive the VMM) and come back identical on
+  resume. Connections open across a pause end; the guest's
+  addresses, slot and egress policy are unchanged.
+
+Measured on a Ryzen 5 3600 with Firecracker 1.17.0 and the review image
+(1 vCPU, 512 MiB, 20 cycles of `TestFirecrackerKVMPause`): pause p50 0.86 s,
+p95 0.93 s (writing the 512 MiB memory file dominates); resume p50 145 ms,
+p95 169 ms, until the guest agent answers again. An earlier run on the same
+host under concurrent load measured pause p50 1.05 s, p95 1.51 s and resume
+p50 171 ms, p95 423 ms.
 
 ## Install
 

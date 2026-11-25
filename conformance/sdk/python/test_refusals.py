@@ -10,9 +10,9 @@ from e2b import BuildException, Sandbox, SandboxException, Secret, Template
 from e2b.exceptions import SecretException
 
 DOC = "; see docs/compatibility.md#not-supported"
-PAUSE = "pause and resume are not supported: sandboxd never pauses a sandbox (deferred, owner decision D7)"
-SNAPSHOTS = "snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)"
-FORK = "fork is not supported: it needs snapshots (deferred with pause, D7)"
+PAUSE_FILESYSTEM = "filesystem-only pause (memory=false) is not supported: a sandboxd pause always keeps the sandbox's memory"
+SNAPSHOTS = "snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (D7)"
+FORK = "fork is not supported: it needs snapshots (D7)"
 NETWORK = "network updates are not supported: a sandbox's network policy is fixed by the operator"
 SECRETS = "secrets are not supported: pass values to a sandbox in envVars instead"
 TEMPLATES = ("template builds and template management through the API are not supported: "
@@ -37,13 +37,26 @@ def sandbox():
     sandbox.kill()
 
 
-def test_pause_is_refused(sandbox):
-    refused(SandboxException, PAUSE, sandbox.pause)
+def test_filesystem_only_pause_is_refused(sandbox):
+    refused(SandboxException, PAUSE_FILESYSTEM, lambda: sandbox.pause(keep_memory=False))
     assert sandbox.is_running()
+    refused(SandboxException, PAUSE_FILESYSTEM,
+            lambda: Sandbox.create(lifecycle={"on_timeout": {"action": "pause", "keep_memory": False}}))
 
 
-def test_auto_pause_is_refused():
-    refused(SandboxException, "autoPause (pause and resume) is not supported", lambda: Sandbox.create(lifecycle={"on_timeout": "pause"}))
+def test_auto_resume_is_refused():
+    refused(SandboxException, "autoResume is not supported",
+            lambda: Sandbox.create(lifecycle={"on_timeout": "pause", "auto_resume": True}))
+
+
+def test_reboot_resume_is_refused():
+    paused = Sandbox.create(timeout=120)
+    try:
+        assert paused.pause() is True
+        refused(SandboxException, PAUSE_FILESYSTEM, lambda: Sandbox.connect(paused.sandbox_id, on_resume="reboot"))
+        assert Sandbox.get_info(paused.sandbox_id).state == "paused"
+    finally:
+        paused.kill()
 
 
 def test_snapshots_are_refused(sandbox):

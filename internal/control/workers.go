@@ -225,10 +225,16 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	s.mu.Lock()
 	lease := m.lease
 	rows, err := s.ledger.Active(ctx)
-	settled := make(map[string]bool)
+	// settled records each row's state and end time when the inventory was
+	// requested: a row a pause or resume moved since is judged next pass.
+	type settledRow struct {
+		state string
+		ends  int64
+	}
+	settled := make(map[string]settledRow)
 	for _, row := range rows {
 		if row.WorkerID == m.id && s.busy[row.ID] == nil {
-			settled[row.ID] = true
+			settled[row.ID] = settledRow{row.State, row.Ends.UnixNano()}
 		}
 	}
 	s.mu.Unlock()
@@ -269,7 +275,7 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 	for _, row := range rows {
 		instance, observed := inventory[row.ID]
 		delete(inventory, row.ID)
-		if row.WorkerID != m.id || !settled[row.ID] || s.busy[row.ID] != nil {
+		if row.WorkerID != m.id || settled[row.ID] != (settledRow{row.State, row.Ends.UnixNano()}) || s.busy[row.ID] != nil {
 			continue
 		}
 		current, err := s.ledger.Current(ctx, row)
@@ -280,15 +286,32 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 		// A guest observed off its recorded slot may share a network with
 		// another guest; never keep it. Legacy rows have no recorded slot.
 		onSlot := row.Slot == "" || instance.Network == row.Slot
-		if observed && row.State == "running" && instance.Running && onSlot && current && now.Before(row.Ends) &&
-			m.serves[row.TemplateID] == row.Image {
+		owned := observed && onSlot && current && m.serves[row.TemplateID] == row.Image
+		running := owned && row.State == "running" && instance.Running
+		// A paused sandbox is kept until its retention (its end time) lapses.
+		paused := owned && row.State == "paused" && instance.Paused && now.Before(row.Ends)
+		autoPause := running && !now.Before(row.Ends) && row.AutoPause && m.local && s.pauser != nil
+		if running && now.Before(row.Ends) || paused || autoPause {
 			if row.Lease != lease {
 				if err := s.ledger.Adopt(ctx, row.ID, lease); err != nil {
 					s.mu.Unlock()
 					return s.offline(m, err)
 				}
 			}
-			if fresh || row.Lease != lease {
+			switch {
+			case autoPause && s.closing:
+				// Close admits no lifecycle work from any reconcile caller:
+				// the row stays running, and a clean shutdown removes the
+				// guest like any other one not paused.
+			case autoPause:
+				if err := s.setState(ctx, row.ID, "pausing"); err != nil {
+					s.mu.Unlock()
+					return s.offline(m, err)
+				}
+				s.markBusy(row.ID)
+				s.lifecycle.Add(1)
+				go s.autoPause(row)
+			case running && (fresh || row.Lease != lease):
 				expiries = append(expiries, row.ID)
 			}
 			continue
@@ -388,15 +411,19 @@ func (s *Service) pushExpiry(ctx context.Context, m *member, id string) error {
 }
 
 // placement carries what a sandbox needs from the gateway's own host: a
-// volume lives there, and only the local driver enforces an egress policy or
-// boots a hardened guest. A row with any goes to the local worker or nowhere.
+// volume lives there, and only the local driver enforces an egress policy,
+// boots a hardened guest or pauses a sandbox at its end time. A row with any
+// goes to the local worker or nowhere.
 type placement struct {
-	volume   *vm.VolumeMount
-	egress   *vm.EgressPolicy
-	hardened bool
+	volume    *vm.VolumeMount
+	egress    *vm.EgressPolicy
+	hardened  bool
+	autoPause bool
 }
 
-func (p placement) localOnly() bool { return p.volume != nil || p.egress != nil || p.hardened }
+func (p placement) localOnly() bool {
+	return p.volume != nil || p.egress != nil || p.hardened || p.autoPause
+}
 
 // localOnlyWhat names the reason in refusals.
 func (p placement) localOnlyWhat() string {
@@ -405,6 +432,8 @@ func (p placement) localOnlyWhat() string {
 		return "a hardened sandbox"
 	case p.volume != nil:
 		return "a sandbox with a volume"
+	case p.autoPause:
+		return "an auto-pausing sandbox"
 	}
 	return "a sandbox with an egress policy"
 }

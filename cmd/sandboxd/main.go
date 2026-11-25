@@ -57,6 +57,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	portHosts := flags.Bool("port-hosts", false, "also route exposed guest ports by wildcard host <port>-<id>.<domain> (needs wildcard DNS and TLS for *.<domain> in front of sandboxd); without it guest ports are reached only via -gateway-host and routing headers")
 	portStreams := flags.Int("port-max-streams", envd.DefaultMaxPortStreams, "maximum concurrent guest port requests (WebSocket and other upgraded streams included) per e2b sandbox; more are refused with 429")
 	readyTimeout := flags.Duration("template-ready-timeout", control.DefaultReadyTimeout, "how long create waits for an e2b template's start and ready commands before it destroys the sandbox and answers 503")
+	pauseRetention := flags.Duration("pause-retention", control.DefaultPauseRetention, "how long a paused e2b sandbox is kept before it is destroyed (pause needs a local driver that can pause: firecracker)")
 	var slots firewall.SlotFlags
 	flags.Var(&slots, "slot", "repeatable dedicated labeled host-only Apple network slot, one guest each: name=<network>,ipv4=<subnet>,gw=<gateway>,ipv6=<ula-prefix>")
 	workerID := flags.String("worker-id", "", "stable trusted worker identity recorded for every VM")
@@ -104,8 +105,8 @@ func run(ctx context.Context, args []string) (runErr error) {
 	if workerMode && (!local || len(enrolls) != 0 || len(templateArchs) != 0 || *tokenSecretFile != "") {
 		return fmt.Errorf("a -worker-key-file worker serves its own apple or firecracker driver and takes no -enroll, -template-arch or -token-secret-file")
 	}
-	if *portStreams < 1 || *readyTimeout <= 0 {
-		return fmt.Errorf("port-max-streams must be at least 1 and template-ready-timeout positive")
+	if *portStreams < 1 || *readyTimeout <= 0 || *pauseRetention <= 0 {
+		return fmt.Errorf("port-max-streams must be at least 1, and template-ready-timeout and pause-retention positive")
 	}
 	if !local && len(enrolls) == 0 {
 		return fmt.Errorf("the none driver runs no VMs; it needs at least one -enroll worker")
@@ -275,7 +276,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 		go server.ReapEvery(reapCtx, time.Second)
 		log.Printf("serving only the enrolled-worker API for worker %s (%s, %s); VMs end after at most %s", *workerID, *driverName, driverArch(*driverName), *maxTTL)
 	} else {
-		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, Templates: templates, TokenSecret: tokenSecret, Workers: remotes,
+		cfg := control.Config{APIKey: apiKey, Domain: *domain, MaxTTL: *maxTTL, ReadyTimeout: *readyTimeout, PauseRetention: *pauseRetention, Templates: templates, TokenSecret: tokenSecret, Workers: remotes,
 			Volumes: volumes, Egress: egressPolicies}
 		var local vm.Driver
 		if driver != nil {

@@ -82,15 +82,29 @@ type fakeFCHost struct {
 	oldAgent, noRestore bool
 	// features are each running guest's agent features; apis, the API
 	// sockets of VMMs started with one, and paused, the VMs paused through
-	// it. loadFault, when set, is the fault every snapshot load answers;
-	// restoreErr is what a restored guest's agent answers OpRestore with,
-	// and restores records each OpRestore it accepted.
-	features   map[string][]string
-	apis       map[string]*net.UnixListener
-	paused     map[string]bool
-	loadFault  string
-	restoreErr error
-	restores   []fakeRestore
+	// it. loadFault and snapshotFault, when set, are the fault every
+	// snapshot load and create answers; a failing create first writes
+	// snapshotPartialMiB of its memory file, a successful one
+	// snapshotMemoryMiB (or a few bytes). restoreErr is what a restored
+	// guest's agent answers OpRestore with, restores records each OpRestore
+	// it accepted, and onRestore, when set, runs (outside h.mu) after each.
+	features           map[string][]string
+	apis               map[string]*net.UnixListener
+	paused             map[string]bool
+	loadFault          string
+	snapshotFault      string
+	snapshotPartialMiB int
+	snapshotMemoryMiB  int
+	restoreErr         error
+	restores           []fakeRestore
+	onRestore          func(id string)
+	// written is the disk space of each snapshot file a VMM wrote, by
+	// path: while the file exists it is taken from free and is what
+	// WrittenBytes reports. onSample, when set, runs (outside h.mu) once a
+	// FreeBytes or WrittenBytes call has taken its sample: a write landing
+	// between two samples.
+	written  map[string]uint64
+	onSample func()
 	// facts is what SnapshotFacts reports; memory, what HostMemory does.
 	facts  fcHostFacts
 	memory HostMemory
@@ -100,6 +114,9 @@ type fakeFCHost struct {
 	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
 	// mid-teardown.
 	onKill func(name string)
+	// netnsFaults and killFaults fail the next deletion of each listed
+	// namespace, and the next kill of each listed cgroup, once.
+	netnsFaults, killFaults map[string]bool
 	// onSnapshot runs, outside h.mu, once a VMM has written a snapshot, with
 	// its chroot: what a compromised VMM does there before it exits.
 	onSnapshot func(chroot string)
@@ -164,7 +181,40 @@ func (h *fakeFCHost) TrustedFile(path string, _ bool) error {
 	}
 	return nil
 }
-func (h *fakeFCHost) FreeBytes(string) (uint64, error) { return h.free, nil }
+func (h *fakeFCHost) FreeBytes(string) (uint64, error) {
+	h.mu.Lock()
+	free := h.free
+	for path, size := range h.written {
+		if _, err := os.Lstat(path); err == nil {
+			free -= min(free, size)
+		}
+	}
+	hook := h.onSample
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return free, nil
+}
+func (h *fakeFCHost) WrittenBytes(dir int, name string, _ int) uint64 {
+	var written uint64
+	parent, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir))
+	if err == nil {
+		path := filepath.Join(parent, name)
+		if _, err := os.Lstat(path); err == nil {
+			h.mu.Lock()
+			written = h.written[path]
+			h.mu.Unlock()
+		}
+	}
+	h.mu.Lock()
+	hook := h.onSample
+	h.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return written
+}
 func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -313,6 +363,10 @@ func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.killFaults[name] {
+		delete(h.killFaults, name)
+		return fmt.Errorf("kill cgroup %q: injected fault", name)
+	}
 	delete(h.cgroups, name)
 	for _, listeners := range []map[string]*net.UnixListener{h.listeners, h.apis} {
 		if l, ok := listeners[name]; ok {
@@ -359,6 +413,10 @@ func (h *fakeFCHost) DeleteNetns(_ context.Context, name string) error {
 	h.record("netns delete " + name)
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.netnsFaults[name] {
+		delete(h.netnsFaults, name)
+		return fmt.Errorf("delete namespace %q: injected fault", name)
+	}
 	delete(h.netns, name)
 	return nil
 }
@@ -423,9 +481,16 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 		return failed
 	}
 	// The jailer copies the Firecracker binary into the chroot and runs the
-	// copy.
+	// copy. Like the real jailer, the fake creates device nodes, that copy
+	// and the VMM's PID file in the chroot, and refuses one that already
+	// holds them.
 	id, exec := argAfter(args, "--id"), argAfter(args, "--exec-file")
 	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), filepath.Base(exec), id, "root")
+	for _, trace := range []string{"dev", filepath.Base(exec), filepath.Base(exec) + ".pid"} {
+		if _, err := os.Lstat(filepath.Join(chroot, trace)); err == nil {
+			return fmt.Errorf("fake jailer: %s exists in the chroot", trace)
+		}
+	}
 	if onExecCopy != nil {
 		onExecCopy(id, false)
 	}
@@ -454,6 +519,10 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 			h.cgroups[id] = false
 			return nil
 		}
+	}
+	if err := errors.Join(os.Mkdir(filepath.Join(chroot, "dev"), 0o755),
+		os.WriteFile(filepath.Join(chroot, filepath.Base(exec)+".pid"), nil, 0o644)); err != nil {
+		return err
 	}
 	h.cgroups[id] = !h.bootDies
 	if h.bootDies {
@@ -493,13 +562,16 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 			features = append(features, guestagent.FeatureRestore)
 		}
 	}
-	return h.bootGuest(id, chroot, features)
+	return h.bootGuest(id, chroot, features, "")
 }
 
 // bootGuest runs VM id's guest: an agent with features on the VM's vsock
-// socket, serving a fresh guest directory. h.mu must be held.
-func (h *fakeFCHost) bootGuest(id, chroot string, features []string) error {
-	guest := h.t.TempDir()
+// socket, serving guest (the guest directory a snapshot kept) or, if "", a
+// fresh one. h.mu must be held.
+func (h *fakeFCHost) bootGuest(id, chroot string, features []string, guest string) error {
+	if guest == "" {
+		guest = h.t.TempDir()
+	}
 	h.guests[chroot] = guest
 	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
 	if err != nil {
@@ -509,12 +581,15 @@ func (h *fakeFCHost) bootGuest(id, chroot string, features []string) error {
 	h.features[id] = features
 	restore := func(entropy []byte, unixNano int64) error {
 		h.mu.Lock()
-		defer h.mu.Unlock()
-		if h.restoreErr != nil {
-			return h.restoreErr
+		err, hook := h.restoreErr, h.onRestore
+		if err == nil {
+			h.restores = append(h.restores, fakeRestore{ID: id, Entropy: slices.Clone(entropy), Time: time.Unix(0, unixNano)})
 		}
-		h.restores = append(h.restores, fakeRestore{ID: id, Entropy: slices.Clone(entropy), Time: time.Unix(0, unixNano)})
-		return nil
+		h.mu.Unlock()
+		if err == nil && hook != nil {
+			hook(id)
+		}
+		return err
 	}
 	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent, features, restore)
 	return nil

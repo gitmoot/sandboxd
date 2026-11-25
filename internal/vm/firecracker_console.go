@@ -94,15 +94,16 @@ func (d *FirecrackerDriver) consoleLogPath(id string) string {
 }
 
 // consoleSink returns the VMM's stdout and stderr for spec and, for an envd
-// guest, the Console that keeps its output for the logs API. With ConsoleLog
-// the VMM writes to <jail>/console.log for debugging, as before, and nothing
-// is kept for the logs API. Otherwise the VMM writes to a pipe whose reader
-// keeps the startup head in startup and the rest in the envd guest's Console
-// (discarded for a strict guest) until the VMM exits. A daemon restart loses
-// the reader: the VMM's later console writes then fail (EPIPE) and are
-// dropped by its serial device, and Console reports ErrNoConsole for the
-// adopted VM. The caller closes console once the jailer has started the VMM,
-// which holds its own copy.
+// guest, the Console that keeps its output for the logs API: the one kept
+// for it already (a resumed VM's output continues its earlier run's) or a
+// new one. With ConsoleLog the VMM writes to <jail>/console.log for
+// debugging, as before, and nothing is kept for the logs API. Otherwise the
+// VMM writes to a pipe whose reader keeps the startup head in startup and the
+// rest in the envd guest's Console (discarded for a strict guest) until the
+// VMM exits. A daemon restart loses the reader: the VMM's later console
+// writes then fail (EPIPE) and are dropped by its serial device, and Console
+// reports ErrNoConsole for the adopted VM. The caller closes console once the
+// jailer has started the VMM, which holds its own copy.
 func (d *FirecrackerDriver) consoleSink(spec Spec, startup *fcStartup) (console *os.File, guest *Console, err error) {
 	if d.cfg.ConsoleLog {
 		console, err = os.OpenFile(d.consoleLogPath(spec.ID), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
@@ -114,7 +115,12 @@ func (d *FirecrackerDriver) consoleSink(spec Spec, startup *fcStartup) (console 
 	}
 	rest := io.Discard
 	if spec.Envd {
-		guest = NewConsole()
+		d.consoleMu.Lock()
+		guest = d.consoles[spec.ID]
+		d.consoleMu.Unlock()
+		if guest == nil {
+			guest = NewConsole()
+		}
 		rest = guest
 	}
 	startup.eof = make(chan struct{})

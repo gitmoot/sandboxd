@@ -32,9 +32,13 @@ type fakeRestore struct {
 }
 
 // fakeVMState is what the fake VMM writes as a snapshot's VM state: the
-// guest's agent features, which every clone of it keeps.
+// guest's agent features, which every clone of it keeps, and its jail and
+// guest directory: a snapshot loaded in the jail it was taken in (a pause)
+// runs that same guest on.
 type fakeVMState struct {
 	Features []string `json:"features"`
+	Chroot   string   `json:"chroot"`
+	Guest    string   `json:"guest"`
 }
 
 // The fake guest has written fakeHomeMark at fakeHomeOffset of its home
@@ -59,13 +63,18 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 		var body struct {
 			State string `json:"state"`
 		}
-		if json.NewDecoder(r.Body).Decode(&body) != nil || body.State != "Paused" {
+		if json.NewDecoder(r.Body).Decode(&body) != nil || (body.State != "Paused" && body.State != "Resumed") {
 			fault(w, "unsupported VM state change")
 			return
 		}
-		h.record("pause " + id)
+		paused := body.State == "Paused"
+		if paused {
+			h.record("pause " + id)
+		} else {
+			h.record("resume " + id)
+		}
 		h.mu.Lock()
-		h.paused[id] = true
+		h.paused[id] = paused
 		h.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -80,13 +89,39 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		h.mu.Lock()
-		paused, features := h.paused[id], h.features[id]
+		paused, features, guest, failure := h.paused[id], h.features[id], h.guests[chroot], h.snapshotFault
+		partial, memory := uint64(h.snapshotPartialMiB)<<20, uint64(h.snapshotMemoryMiB)<<20
+		_, writable := h.owners[filepath.Dir(jailed(body.State))]
 		h.mu.Unlock()
+		// wrote records what the VMM wrote at path, once per path.
+		wrote := func(path string, size uint64) {
+			if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+				path = filepath.Join(dir, filepath.Base(path))
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.written == nil {
+				h.written = map[string]uint64{}
+			}
+			h.written[path] = size
+		}
 		if !paused {
 			fault(w, "the VM must be paused")
 			return
 		}
-		state, err := json.Marshal(fakeVMState{Features: features})
+		// The VMM writes as its own UID: only where the driver chowned to it.
+		if !writable {
+			fault(w, "cannot create %s: permission denied", body.State)
+			return
+		}
+		if failure != "" {
+			if partial > 0 && os.WriteFile(jailed(body.Memory), nil, 0o600) == nil {
+				wrote(jailed(body.Memory), partial)
+			}
+			fault(w, "%s", failure)
+			return
+		}
+		state, err := json.Marshal(fakeVMState{Features: features, Chroot: chroot, Guest: guest})
 		if err != nil {
 			fault(w, "%v", err)
 			return
@@ -102,6 +137,8 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			fault(w, "%v", err)
 			return
 		}
+		wrote(jailed(body.State), uint64(len(state)))
+		wrote(jailed(body.Memory), max(memory, uint64(len("memory of "+id))))
 		h.record("snapshot " + id)
 		h.mu.Lock()
 		tamper := h.onSnapshot
@@ -131,9 +168,11 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			fault(w, "%s", loadFault)
 			return
 		}
-		// The VMM's own UID reads the root-owned snapshot files as others.
+		// The VMM's own UID reads the root-owned snapshot files as others,
+		// and those it wrote itself (in a directory chowned to it) as owner.
 		for _, path := range []string{jailed(body.State), jailed(body.Backend.Path)} {
-			if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o004 == 0 {
+			_, own := h.owner(filepath.Dir(path))
+			if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() || (info.Mode().Perm()&0o004 == 0 && !own) {
 				fault(w, "cannot open %s: %v", path, err)
 				return
 			}
@@ -145,8 +184,12 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		h.record("load " + id)
+		guest := ""
+		if state.Chroot == chroot {
+			guest = state.Guest
+		}
 		h.mu.Lock()
-		err = h.bootGuest(id, chroot, state.Features)
+		err = h.bootGuest(id, chroot, state.Features, guest)
 		h.mu.Unlock()
 		if err != nil {
 			fault(w, "%v", err)
@@ -223,16 +266,16 @@ func lastStart(host *fakeFCHost, id string) []string {
 	return starts[len(starts)-1]
 }
 
-// coldBooted reports whether args started a VM from its configuration
-// without an API: a cold boot.
+// coldBooted reports whether args started a VM from its configuration, with
+// the API socket a pause snapshots it through: a cold boot.
 func coldBooted(args []string) bool {
-	return slices.Contains(args, "--no-api") && argAfter(args, "--config-file") == "/vm.json"
+	return argAfter(args, "--api-sock") == "/run/api.sock" && argAfter(args, "--config-file") == "/vm.json"
 }
 
 // restored reports whether args started VM id waiting for a snapshot load.
 func restored(args []string, id string) bool {
 	return argAfter(args, "--id") == id && argAfter(args, "--api-sock") == "/run/api.sock" &&
-		!slices.Contains(args, "--config-file") && !slices.Contains(args, "--no-api")
+		!slices.Contains(args, "--config-file")
 }
 
 func TestFirecrackerSnapshotRestore(t *testing.T) {
@@ -287,8 +330,8 @@ func TestFirecrackerSnapshotRestore(t *testing.T) {
 	if args := lastStart(host, fcTestID2); !restored(args, fcTestID2) || argAfter(args, "--uid") != strconv.Itoa(cfg.UIDBase+1) {
 		t.Fatalf("clone VMM args = %v", args)
 	}
-	// A clone writes only its disks.
-	if got := argAfter(lastStart(host, fcTestID2), "--resource-limit"); got != fmt.Sprint("fsize=", 256<<20) {
+	// A clone can be paused: its limit covers a snapshot of its memory.
+	if got := argAfter(lastStart(host, fcTestID2), "--resource-limit"); got != fmt.Sprint("fsize=", 512<<20) {
 		t.Fatalf("clone VMM %s", got)
 	}
 	if meta, err := d.readMeta(fcTestID2); err != nil || meta.Snapshot != name {

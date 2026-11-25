@@ -181,6 +181,12 @@ type FirecrackerDriver struct {
 
 	// snap is the template snapshot state (firecracker_snapshot.go).
 	snap fcSnapshots
+
+	// writes are the snapshot writes (pauses and template builds) admitted
+	// under Root and not yet done (firecracker_disk.go); writesMu guards
+	// them.
+	writesMu sync.Mutex
+	writes   map[*fcWrite]struct{}
 }
 
 var (
@@ -192,15 +198,15 @@ var (
 	_ HostMemoryReporter = (*FirecrackerDriver)(nil)
 )
 
-// ErrDiskFloor reports that creating a VM would leave less free disk than the
-// configured floor.
-var ErrDiskFloor = errors.New("free disk is below the configured floor")
-
 // fcHost is every host operation the driver performs outside Root. The
 // production implementation is linuxFCHost; tests substitute a fake.
 type fcHost interface {
 	TrustedFile(path string, executable bool) error
 	FreeBytes(path string) (uint64, error)
+	// WrittenBytes is the disk space file name in the open directory dir
+	// takes, if it is a regular file of owner with one link; 0 for
+	// anything else, a missing file included. Nothing is followed.
+	WrittenBytes(dir int, name string, owner int) uint64
 	Chown(path string, uid, gid int) error
 	// ChownAt changes the owner of name in the open directory dir, without
 	// following a symlink or resolving anything above dir.
@@ -301,9 +307,13 @@ type fcMeta struct {
 	// nil for a VM created without one, whose table is fcNetnsRuleset.
 	Egress *EgressPolicy `json:"egress,omitempty"`
 	// Snapshot names the template snapshot the VM was restored from ("" for
-	// a cold boot). The records are the snapshots' reference counts: one is
-	// collected only once no record names it.
+	// a cold boot, and once the VM was paused). The records are the
+	// snapshots' reference counts: one is collected only once no record
+	// names it.
 	Snapshot string `json:"snapshot,omitempty"`
+	// Paused marks a VM Pause stopped: its snapshot is in its jail and it
+	// keeps nothing else on the host (see firecracker_pause.go).
+	Paused bool `json:"paused,omitempty"`
 }
 
 func cleanAbs(path string) bool {
@@ -654,9 +664,10 @@ func (d *FirecrackerDriver) firewallReady(ctx context.Context) error {
 // HostTable is the name of this instance's host nftables table (inet).
 func (d *FirecrackerDriver) HostTable() string { return d.names.table }
 
-// Disarm removes the host table and cgroup parent once no VM remains, then
-// the instance's claim. Snapshot builds and collections are stopped first
-// (stopBuilds), and one still running awaited.
+// Disarm removes the host table and cgroup parent once no VM but paused ones
+// remains, then the instance's claim. Snapshot builds and collections are
+// stopped first (stopBuilds), and one still running awaited. Paused VMs hold
+// no host state outside Root and resume under the next start's table.
 func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	if err := d.stopBuilds(ctx); err != nil {
 		return err
@@ -665,8 +676,8 @@ func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if len(vms) != 0 {
-		return fmt.Errorf("%d Firecracker VMs remain; destroy them before disarming", len(vms))
+	if remain := slices.DeleteFunc(vms, fcVM.paused); len(remain) != 0 {
+		return fmt.Errorf("%d Firecracker VMs remain; destroy them before disarming", len(remain))
 	}
 	d.mu.Lock()
 	d.armed = ""
@@ -677,9 +688,9 @@ func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	return d.releaseClaim()
 }
 
-// CleanupGuests destroys every VM this driver owns, after stopping snapshot
-// builds and collections (stopBuilds): a build still running removes its
-// VM.
+// CleanupGuests destroys every VM this driver owns except paused ones (kept
+// for Resume after the next start), after stopping snapshot builds and
+// collections (stopBuilds): a build still running removes its VM.
 func (d *FirecrackerDriver) CleanupGuests(ctx context.Context) error {
 	if err := d.stopBuilds(ctx); err != nil {
 		return err
@@ -690,7 +701,9 @@ func (d *FirecrackerDriver) CleanupGuests(ctx context.Context) error {
 	}
 	var errs []error
 	for _, vm := range vms {
-		errs = append(errs, d.Destroy(ctx, vm.id))
+		if !vm.paused() {
+			errs = append(errs, d.Destroy(ctx, vm.id))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -707,7 +720,16 @@ type fcVM struct {
 	netUp   bool
 }
 
-func (vm fcVM) running() bool { return vm.meta != nil && vm.netns && vm.vmmUp && vm.netUp }
+func (vm fcVM) running() bool {
+	return vm.up() && !vm.meta.Paused
+}
+
+// up reports VM vm's VMM and network stack running in its namespace,
+// whatever its record says: a resume confirms this before it records the VM
+// as running.
+func (vm fcVM) up() bool {
+	return vm.meta != nil && vm.netns && vm.vmmUp && vm.netUp
+}
 
 func (d *FirecrackerDriver) readMeta(id string) (*fcMeta, error) {
 	data, err := os.ReadFile(d.metaPath(id))
@@ -861,8 +883,9 @@ func (d *FirecrackerDriver) lookup(id string) (fcVM, bool, error) {
 }
 
 // List reports every VM with any host trace. Only a VM whose record,
-// namespace, VMM and network stack are all present is running; anything else
-// is stopped and must be destroyed by the caller.
+// namespace, VMM and network stack are all present is running, and only one
+// whose record says paused and whose jail alone remains is paused; anything
+// else is stopped and must be destroyed by the caller.
 func (d *FirecrackerDriver) List(ctx context.Context) ([]Instance, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -873,8 +896,8 @@ func (d *FirecrackerDriver) List(ctx context.Context) ([]Instance, error) {
 	}
 	instances := make([]Instance, 0, len(vms))
 	for _, vm := range vms {
-		instance := Instance{ID: vm.id, Running: vm.running()}
-		if vm.meta != nil && vm.netns {
+		instance := Instance{ID: vm.id, Running: vm.running(), Paused: vm.paused()}
+		if vm.meta != nil && (vm.netns || instance.Paused) {
 			instance.Network = vm.meta.Slot
 		}
 		instances = append(instances, instance)
@@ -946,20 +969,16 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 	return json.MarshalIndent(config, "", "  ")
 }
 
-// fcBootArgs are a cold-booted VMM's own arguments: no API, the VM booted
-// from its configuration file.
-var fcBootArgs = []string{"--no-api", "--config-file", fcConfigPath}
+// fcBootArgs are a cold-booted VMM's own arguments: the VM booted from its
+// configuration file, and the API socket Pause snapshots it through.
+var fcBootArgs = []string{"--api-sock", fcAPIPath, "--config-file", fcConfigPath}
 
-// diskLimitMiB is the file size limit of a VMM that writes only its disks:
-// the home disk and any attached volume.
-func (d *FirecrackerDriver) diskLimitMiB(meta fcMeta) int {
-	return max(d.cfg.HomeDiskMiB, meta.VolumeMiB)
-}
-
-// jailerArgs runs the VMM with vmm as its own arguments and fsizeMiB as its
-// file size limit, which must cover every file it writes: diskLimitMiB, and
-// for a template build the snapshot of its guest memory as well.
-func (d *FirecrackerDriver) jailerArgs(meta fcMeta, fsizeMiB int, vmm ...string) []string {
+// jailerArgs runs the VMM with vmm as its own arguments. Its file size limit
+// covers every file a VMM writes: the home disk, an attached volume, and
+// the memory file of a snapshot, since every VMM has an API socket (a
+// template build, and every sandbox, which can be paused).
+func (d *FirecrackerDriver) jailerArgs(meta fcMeta, vmm ...string) []string {
+	fsizeMiB := max(d.cfg.HomeDiskMiB, meta.VolumeMiB, meta.MemoryMiB)
 	args := []string{
 		"--id", meta.ID,
 		"--exec-file", d.cfg.Firecracker,
@@ -1120,7 +1139,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 			return Instance{}, fmt.Errorf("Firecracker slot %q is in use by %q", spec.Network, vm.id)
 		}
 	}
-	free, err := d.host.FreeBytes(d.cfg.Root)
+	free, err := d.rootFree()
 	if err != nil {
 		return Instance{}, err
 	}
@@ -1166,7 +1185,7 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, d.diskLimitMiB(meta), fcBootArgs...); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err
 	}
 	if _, err := d.waitAgent(ctx, spec, meta.VMMUID); err != nil {
@@ -1176,9 +1195,9 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 }
 
 // launch creates the VM's network and runs its VMM, with vmm as the VMM's
-// own arguments and fsizeMiB as its file size limit (jailerArgs), in the
-// prepared jail. An envd guest's console is kept.
-func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, fsizeMiB int, vmm ...string) error {
+// own arguments (jailerArgs), in the prepared jail. An envd guest's console
+// is kept.
+func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, vmm ...string) error {
 	ruleset, marker := d.netnsRuleset(meta.Egress)
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: d.names.netnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
@@ -1191,7 +1210,7 @@ func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, 
 	if err != nil {
 		return err
 	}
-	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, fsizeMiB, vmm...), console)
+	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, vmm...), console)
 	_ = console.Close() // the VMM holds its own descriptor
 	if err != nil {
 		return err
@@ -1202,14 +1221,14 @@ func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, 
 	return nil
 }
 
-// confirmStarted requires a started VM to be running behind the armed
-// firewall before it is handed out.
+// confirmStarted requires a started VM's VMM and network stack to be
+// running behind the armed firewall before it is handed out.
 func (d *FirecrackerDriver) confirmStarted(ctx context.Context, id string) error {
 	vm, found, err := d.lookup(id)
 	if err != nil {
 		return err
 	}
-	if !found || !vm.running() {
+	if !found || !vm.up() {
 		return fmt.Errorf("Firecracker VM %q did not stay running", id)
 	}
 	if err := d.Ready(ctx); err != nil {

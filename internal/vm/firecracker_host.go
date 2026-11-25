@@ -136,6 +136,19 @@ func (h *linuxFCHost) FreeBytes(path string) (uint64, error) {
 	return stat.Bavail * uint64(stat.Bsize), nil
 }
 
+// WrittenBytes counts the allocated blocks of a file a VMM wrote: a file
+// with another link (one the VMM linked in, its home disk say) or of
+// another owner counts nothing, so a VMM can never make a write in progress
+// look further along than it is.
+func (h *linuxFCHost) WrittenBytes(dir int, name string, owner int) uint64 {
+	var stat unix.Stat_t
+	if unix.Fstatat(dir, name, &stat, unix.AT_SYMLINK_NOFOLLOW) != nil ||
+		stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 || stat.Uid != uint32(owner) {
+		return 0
+	}
+	return uint64(stat.Blocks) * 512
+}
+
 func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(path, uid, gid) }
 func (h *linuxFCHost) ChownAt(dir int, name string, uid, gid int) error {
 	return unix.Fchownat(dir, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
