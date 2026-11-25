@@ -120,8 +120,8 @@ type Service struct {
 	pauser vm.Pauser
 	// lifecycle tracks every pause and resume in flight, explicit or
 	// started by reconciliation at a sandbox's end time; Close waits for
-	// them before it closes the ledger. closing (guarded by mu) refuses new
-	// ones.
+	// them before it closes the ledger. closing (guarded by mu, set before
+	// that wait) refuses new ones from every caller, so no Add follows it.
 	lifecycle sync.WaitGroup
 	closing   bool
 }

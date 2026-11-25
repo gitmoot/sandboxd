@@ -300,8 +300,9 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 			}
 			switch {
 			case autoPause && s.closing:
-				// Close refuses new pauses: the row stays running for the
-				// next start to pause, never destroyed for a pause not run.
+				// Close admits no lifecycle work from any reconcile caller:
+				// the row stays running, and a clean shutdown removes the
+				// guest like any other one not paused.
 			case autoPause:
 				if err := s.setState(ctx, row.ID, "pausing"); err != nil {
 					s.mu.Unlock()
