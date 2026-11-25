@@ -479,8 +479,9 @@ Every VMM starts with an API socket for this.
   the free space, so a write that lands meanwhile can only make admission
   refuse near the floor, never admit past it; a write stays admitted until
   its VMM is known to have stopped writing (a VMM that cannot be stopped
-  keeps it until the daemon exits; a stopped build whose namespace or jail
-  removal fails releases it). A refused pause is an error like any other:
+  keeps it until the daemon exits; a build whose VMM stopped releases it
+  even if removing its network stack, namespace or jail then fails). A
+  refused pause is an error like any other:
   an auto-pause refused below the floor destroys the sandbox, as its end
   time would have. The daemon flushes the guest's disks, pauses the vCPUs
   and writes a full snapshot
