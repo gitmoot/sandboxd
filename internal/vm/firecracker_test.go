@@ -84,7 +84,8 @@ type fakeFCHost struct {
 	// sockets of VMMs started with one, and paused, the VMs paused through
 	// it. loadFault and snapshotFault, when set, are the fault every
 	// snapshot load and create answers; a failing create first writes
-	// snapshotPartialMiB of its memory file. restoreErr is what a restored
+	// snapshotPartialMiB of its memory file, a successful one
+	// snapshotMemoryMiB (or a few bytes). restoreErr is what a restored
 	// guest's agent answers OpRestore with, restores records each OpRestore
 	// it accepted, and onRestore, when set, runs (outside h.mu) after each.
 	features           map[string][]string
@@ -93,12 +94,14 @@ type fakeFCHost struct {
 	loadFault          string
 	snapshotFault      string
 	snapshotPartialMiB int
+	snapshotMemoryMiB  int
 	restoreErr         error
 	restores           []fakeRestore
 	onRestore          func(id string)
-	// written is every snapshot file a VMM wrote: while it exists, its size
-	// is taken from free.
-	written []string
+	// written is the disk space of each snapshot file a VMM wrote, by
+	// path: while the file exists it is taken from free and is what
+	// WrittenBytes reports.
+	written map[string]uint64
 	// facts is what SnapshotFacts reports; memory, what HostMemory does.
 	facts  fcHostFacts
 	memory HostMemory
@@ -176,12 +179,25 @@ func (h *fakeFCHost) FreeBytes(string) (uint64, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	free := h.free
-	for _, path := range h.written {
-		if info, err := os.Stat(path); err == nil {
-			free -= min(free, uint64(info.Size()))
+	for path, size := range h.written {
+		if _, err := os.Lstat(path); err == nil {
+			free -= min(free, size)
 		}
 	}
 	return free, nil
+}
+func (h *fakeFCHost) WrittenBytes(dir int, name string, _ int) uint64 {
+	parent, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir))
+	if err != nil {
+		return 0
+	}
+	path := filepath.Join(parent, name)
+	if _, err := os.Lstat(path); err != nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.written[path]
 }
 func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	h.mu.Lock()

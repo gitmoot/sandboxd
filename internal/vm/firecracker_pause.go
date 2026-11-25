@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sync"
 	"time"
 
 	"github.com/gitmoot/sandboxd/internal/guestagent"
@@ -52,9 +51,8 @@ func (vm fcVM) paused() bool {
 // (every VM started since pause support) whose guest agent can be restored
 // can be paused. On error before the snapshot is complete the guest is
 // resumed and what the snapshot wrote is discarded; after that it is left
-// for Destroy. The guest's memory is reserved under Root above the disk
-// floor from admission until the snapshot is written or discarded, so
-// concurrent pauses never promise the same space.
+// for Destroy. The snapshot is admitted as a write of the guest's memory
+// under Root (admitWrite), as a template build's is.
 func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err := validAppleID(id); err != nil {
 		return err
@@ -83,11 +81,6 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err := os.RemoveAll(filepath.Join(d.chroot(id), fcPausedJail)); err != nil {
 		return err
 	}
-	release, err := d.reservePause(meta.MemoryMiB)
-	if err != nil {
-		return err
-	}
-	defer release()
 	name := filepath.Base(fcPausedJail)
 	if err := unix.Mkdirat(chroot, name, 0o700); err != nil {
 		return fmt.Errorf("create the paused directory of %q: %w", id, err)
@@ -95,6 +88,19 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err := d.host.ChownAt(chroot, name, meta.VMMUID, meta.VMMUID); err != nil {
 		return err
 	}
+	paused, err := unix.Openat(chroot, name, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the paused directory of %q: %w", id, err)
+	}
+	defer unix.Close(paused)
+	release, err := d.admitWrite(&fcWrite{
+		what: "guest memory", need: uint64(meta.MemoryMiB) << 20, owner: meta.VMMUID,
+		files: []fcWrittenFile{{paused, fcSnapshotState}, {paused, fcSnapshotMemory}},
+	})
+	if err != nil {
+		return err
+	}
+	defer release()
 	conn, err := d.dialAgentAs(ctx, id, meta.VMMUID)
 	if err != nil {
 		return err
@@ -151,42 +157,6 @@ func (d *FirecrackerDriver) checkPausable(ctx context.Context, meta fcMeta) erro
 		return fmt.Errorf("%w: the guest agent of %s cannot be restored from a snapshot", ErrImageTooOld, meta.Image)
 	}
 	return nil
-}
-
-// reservePause reserves memoryMiB, the memory file of a pause snapshot,
-// under Root above the disk floor and the space earlier pauses reserved.
-// release returns it once the snapshot is written (and so counted in the
-// free space) or discarded.
-func (d *FirecrackerDriver) reservePause(memoryMiB int) (release func(), err error) {
-	d.pausingMu.Lock()
-	defer d.pausingMu.Unlock()
-	free, err := d.host.FreeBytes(d.cfg.Root)
-	if err != nil {
-		return nil, err
-	}
-	need := uint64(memoryMiB) << 20
-	if floor := uint64(d.cfg.DiskFloorMiB)<<20 + d.pausing; free < floor+need {
-		return nil, fmt.Errorf("%w: %d MiB free, %d MiB floor and %d MiB of pauses in progress plus %d MiB guest memory needed",
-			ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB, d.pausing>>20, memoryMiB)
-	}
-	d.pausing += need
-	return sync.OnceFunc(func() {
-		d.pausingMu.Lock()
-		d.pausing -= need
-		d.pausingMu.Unlock()
-	}), nil
-}
-
-// rootFree is the free space under Root less what pauses in progress have
-// reserved (reservePause) but not yet written.
-func (d *FirecrackerDriver) rootFree() (uint64, error) {
-	d.pausingMu.Lock()
-	defer d.pausingMu.Unlock()
-	free, err := d.host.FreeBytes(d.cfg.Root)
-	if err != nil {
-		return 0, err
-	}
-	return free - min(free, d.pausing), nil
 }
 
 // snapshotPaused pauses VM meta's guest and writes its full snapshot to the

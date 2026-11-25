@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -336,6 +337,77 @@ func TestFirecrackerConcurrentPausesShareTheDiskHeadroom(t *testing.T) {
 	}
 	if err := d.Pause(ctx, fcTestID2); err != nil {
 		t.Fatalf("pause once the first one wrote its snapshot: %v", err)
+	}
+}
+
+// A pause in progress is charged only what it has yet to write: what it
+// wrote is already gone from the free space. With room for two 512 MiB
+// snapshots above the floor, a second pause is admitted while the first has
+// written 256 MiB.
+func TestFirecrackerPausesChargeOnlyWhatIsLeftToWrite(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	for i, id := range []string{fcTestID, fcTestID2} {
+		if _, err := d.Create(ctx, Spec{ID: id, Image: cfg.Images[0], Network: FirecrackerSlotNames(2)[i], CPUs: 1, MemoryMiB: 512}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writing, release := make(chan struct{}, 1), make(chan struct{})
+	host.mu.Lock()
+	host.free = uint64(cfg.DiskFloorMiB+1025) << 20
+	host.snapshotMemoryMiB = 256
+	host.onSnapshot = func(chroot string) {
+		if strings.Contains(chroot, fcTestID) {
+			writing <- struct{}{}
+			<-release
+		}
+	}
+	host.mu.Unlock()
+	paused := make(chan error, 1)
+	go func() { paused <- d.Pause(ctx, fcTestID) }()
+	<-writing
+	err := d.Pause(ctx, fcTestID2)
+	close(release)
+	if err != nil {
+		t.Errorf("second pause beside one that wrote half its snapshot: %v", err)
+	}
+	if err := <-paused; err != nil {
+		t.Fatalf("first pause: %v", err)
+	}
+}
+
+// A template build and a pause are snapshot writes admitted alike: a pause
+// is refused while a build holds the space it has yet to write, and
+// admitted once the build is done.
+func TestFirecrackerBuildAndPauseShareTheDiskHeadroom(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	building, release := make(chan struct{}, 1), make(chan struct{})
+	host.mu.Lock()
+	// Room for the build's home disk and memory, and 256 MiB more.
+	host.free = uint64(cfg.DiskFloorMiB+cfg.HomeDiskMiB+512+256) << 20
+	host.onSnapshot = func(chroot string) {
+		if strings.Contains(chroot, fcBuildPrefix) {
+			building <- struct{}{}
+			<-release
+		}
+	}
+	host.mu.Unlock()
+	if _, err := d.Create(ctx, Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}); err != nil {
+		t.Fatal(err)
+	}
+	<-building
+	err := d.Pause(ctx, fcTestID)
+	close(release)
+	if !errors.Is(err, ErrDiskFloor) {
+		t.Errorf("pause beside a template build in progress: %v", err)
+	}
+	waitBuild(t, d)
+	if list, err := d.List(ctx); err != nil || !slices.Equal(list, []Instance{{ID: fcTestID, Running: true, Network: "sbx0"}}) {
+		t.Fatalf("list after a refused pause = %+v, %v", list, err)
+	}
+	if err := d.Pause(ctx, fcTestID); err != nil {
+		t.Fatalf("pause once the build is done: %v", err)
 	}
 }
 

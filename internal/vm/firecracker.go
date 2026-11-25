@@ -182,11 +182,11 @@ type FirecrackerDriver struct {
 	// snap is the template snapshot state (firecracker_snapshot.go).
 	snap fcSnapshots
 
-	// pausing is the guest memory, in bytes, of every pause admitted but
-	// whose snapshot is not yet complete or discarded: disk under Root that
-	// is promised but not yet taken (rootFree). pausingMu guards it.
-	pausingMu sync.Mutex
-	pausing   uint64
+	// writes are the snapshot writes (pauses and template builds) admitted
+	// under Root and not yet done (firecracker_disk.go); writesMu guards
+	// them.
+	writesMu sync.Mutex
+	writes   map[*fcWrite]struct{}
 }
 
 var (
@@ -207,6 +207,10 @@ var ErrDiskFloor = errors.New("free disk is below the configured floor")
 type fcHost interface {
 	TrustedFile(path string, executable bool) error
 	FreeBytes(path string) (uint64, error)
+	// WrittenBytes is the disk space file name in the open directory dir
+	// takes, if it is a regular file of owner with one link; 0 for
+	// anything else, a missing file included. Nothing is followed.
+	WrittenBytes(dir int, name string, owner int) uint64
 	Chown(path string, uid, gid int) error
 	// ChownAt changes the owner of name in the open directory dir, without
 	// following a symlink or resolving anything above dir.

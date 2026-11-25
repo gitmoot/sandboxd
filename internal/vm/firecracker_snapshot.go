@@ -843,13 +843,6 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.Ready(ctx); err != nil {
 		return fmt.Errorf("firewall is not armed before the build: %w", err)
 	}
-	free, err := d.rootFree()
-	if err != nil {
-		return err
-	}
-	if need := uint64(d.cfg.DiskFloorMiB+d.cfg.HomeDiskMiB+spec.MemoryMiB) << 20; free < need {
-		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus the snapshot's memory and home disk needed", ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB)
-	}
 	// The build VM runs beside the VM whose create started it: it must not
 	// take the host below the memory floor either.
 	if d.cfg.MemoryFloorMiB > 0 {
@@ -899,6 +892,16 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 		return fmt.Errorf("open the build jail: %w", err)
 	}
 	defer unix.Close(outDir)
+	// The snapshot's memory file and the home disk the guest writes are
+	// admitted as one write, as a pause's snapshot is.
+	release, err := d.admitWrite(&fcWrite{
+		what: "snapshot memory and home disk", need: uint64(d.cfg.HomeDiskMiB+spec.MemoryMiB) << 20, owner: meta.VMMUID,
+		files: []fcWrittenFile{{chrootDir, "home.ext4"}, {outDir, fcSnapshotState}, {outDir, fcSnapshotMemory}},
+	})
+	if err != nil {
+		return err
+	}
+	defer release()
 	startup := &fcStartup{}
 	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err
@@ -940,10 +943,12 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}); err != nil {
 		return err
 	}
-	// The VMM must be gone before its files are taken.
+	// The VMM must be gone before its files are taken. Then the write is
+	// done: the files are moved, not copied, so their space is counted.
 	if err := d.host.KillCgroup(ctx, id); err != nil {
 		return err
 	}
+	release()
 	return d.storeSnapshot(spec, key, name, chrootDir, outDir)
 }
 

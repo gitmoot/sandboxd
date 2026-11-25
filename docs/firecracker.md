@@ -14,7 +14,7 @@ Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
 | Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (the larger of the home disk and an attached volume; for a [template snapshot](#template-snapshots--fc-snapshots) build, at least the guest RAM it writes) and `nofile=256` |
 | Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk besides an attached [volume](#volumes). The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
 | Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
-| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
+| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk plus what snapshot writes in progress (pauses, template builds) have yet to write. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
 
 CPU and memory come from `-cpus` and `-memory-mib`, the same flags the Apple
 worker uses.
@@ -470,11 +470,13 @@ it where it stopped
 Every VMM starts with an API socket for this.
 
 - **Pause.** The daemon checks that the guest agent accepts `OpRestore`
-  (an older image answers `500`: rebuild it), removes what an earlier pause
-  left in the jail, and reserves the guest's memory size on the disk above
-  `-fc-disk-floor-mib` and the space of every pause still writing its
-  snapshot (creates and template builds count those reservations too). It
-  flushes the guest's disks, pauses the vCPUs and writes a full snapshot
+  (an older image answers `500`: rebuild it) and removes what an earlier
+  pause left in the jail. The snapshot is admitted like a template build's:
+  the disk must keep `-fc-disk-floor-mib`, plus what every pause and build
+  in progress has yet to write (what they wrote already shows in the free
+  space), plus the guest's memory size; creates count the writes in
+  progress too. It flushes the guest's disks, pauses the vCPUs and writes
+  a full snapshot
   (VM state and a memory file as large as the guest's memory) into the
   VM's own jail (`<chroot>/paused/`), then stops the VMM and the VM's
   network stack and marks its record paused. A clone restored from a

@@ -89,10 +89,22 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		h.mu.Lock()
-		paused, features, guest, failure, partial := h.paused[id], h.features[id], h.guests[chroot], h.snapshotFault, h.snapshotPartialMiB
+		paused, features, guest, failure := h.paused[id], h.features[id], h.guests[chroot], h.snapshotFault
+		partial, memory := uint64(h.snapshotPartialMiB)<<20, uint64(h.snapshotMemoryMiB)<<20
 		_, writable := h.owners[filepath.Dir(jailed(body.State))]
-		h.written = append(h.written, jailed(body.State), jailed(body.Memory))
 		h.mu.Unlock()
+		// wrote records what the VMM wrote at path, once per path.
+		wrote := func(path string, size uint64) {
+			if dir, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+				path = filepath.Join(dir, filepath.Base(path))
+			}
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.written == nil {
+				h.written = map[string]uint64{}
+			}
+			h.written[path] = size
+		}
 		if !paused {
 			fault(w, "the VM must be paused")
 			return
@@ -103,10 +115,8 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		if failure != "" {
-			if partial > 0 {
-				if err := os.WriteFile(jailed(body.Memory), nil, 0o600); err == nil {
-					_ = os.Truncate(jailed(body.Memory), int64(partial)<<20)
-				}
+			if partial > 0 && os.WriteFile(jailed(body.Memory), nil, 0o600) == nil {
+				wrote(jailed(body.Memory), partial)
 			}
 			fault(w, "%s", failure)
 			return
@@ -127,6 +137,8 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			fault(w, "%v", err)
 			return
 		}
+		wrote(jailed(body.State), uint64(len(state)))
+		wrote(jailed(body.Memory), max(memory, uint64(len("memory of "+id))))
 		h.record("snapshot " + id)
 		h.mu.Lock()
 		tamper := h.onSnapshot
