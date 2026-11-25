@@ -7,9 +7,9 @@ import { afterAll, beforeAll, expect, test } from 'vitest'
 import { Sandbox, SandboxError, Secret, SecretError, Template } from '../../src'
 
 const DOC = '; see docs/compatibility.md#not-supported'
-const PAUSE = 'pause and resume are not supported: sandboxd never pauses a sandbox (deferred, owner decision D7)'
-const SNAPSHOTS = 'snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (deferred with pause, D7)'
-const FORK = 'fork is not supported: it needs snapshots (deferred with pause, D7)'
+const PAUSE_FILESYSTEM = "filesystem-only pause (memory=false) is not supported: a sandboxd pause always keeps the sandbox's memory"
+const SNAPSHOTS = 'snapshots are not supported: sandboxd keeps no sandbox state after a sandbox ends (D7)'
+const FORK = 'fork is not supported: it needs snapshots (D7)'
 const NETWORK = "network updates are not supported: a sandbox's network policy is fixed by the operator"
 const SECRETS = 'secrets are not supported: pass values to a sandbox in envVars instead'
 
@@ -35,16 +35,30 @@ async function refused(errorClass: new (...args: never[]) => Error, reason: stri
   }
 }
 
-test('pause is refused', async () => {
-  await refused(SandboxError, PAUSE, () => sandbox.pause())
+test('filesystem-only pause is refused', async () => {
+  await refused(SandboxError, PAUSE_FILESYSTEM, () => sandbox.pause({ keepMemory: false }))
   expect(await sandbox.isRunning()).toBe(true)
-})
-
-test('auto-pause is refused', async () => {
-  await refused(SandboxError, 'autoPause (pause and resume) is not supported', () =>
-    Sandbox.create({ lifecycle: { onTimeout: 'pause' } })
+  await refused(SandboxError, PAUSE_FILESYSTEM, () =>
+    Sandbox.create({ lifecycle: { onTimeout: { action: 'pause', keepMemory: false } } })
   )
 })
+
+test('auto-resume is refused', async () => {
+  await refused(SandboxError, 'autoResume is not supported', () =>
+    Sandbox.create({ lifecycle: { onTimeout: 'pause', autoResume: true } })
+  )
+})
+
+test('reboot resume is refused', async () => {
+  const paused = await Sandbox.create({ timeoutMs: 120_000 })
+  try {
+    expect(await paused.pause()).toBe(true)
+    await refused(SandboxError, PAUSE_FILESYSTEM, () => Sandbox.connect(paused.sandboxId, { onResume: 'reboot' }))
+    expect((await Sandbox.getInfo(paused.sandboxId)).state).toBe('paused')
+  } finally {
+    await paused.kill()
+  }
+}, 60_000)
 
 test('snapshots are refused', async () => {
   await refused(SandboxError, SNAPSHOTS, () => sandbox.createSnapshot())

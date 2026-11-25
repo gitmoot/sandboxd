@@ -22,8 +22,10 @@ change is needed for the supported operations.
 >   ([#38](https://github.com/gitmoot/sandboxd/issues/38)).
 > - There is **one API key per server** and no tenants or quotas. A server
 >   is meant for one operator or team, not for strangers sharing it.
-> - Pause, resume, snapshots, fork, secrets and template builds through the
->   API are refused (see [Not supported yet](#not-supported-yet)). Volumes
+> - Snapshots, fork, secrets and template builds through the API are
+>   refused (see [Not supported yet](#not-supported-yet)). Pause and resume
+>   work on the Linux Firecracker worker only
+>   ([pause and resume](docs/compatibility.md#pause-and-resume)). Volumes
 >   are opt-in on the Linux worker only
 >   ([volumes](docs/compatibility.md#volumes)).
 
@@ -87,10 +89,12 @@ route by route.
 - **`get_host` and per-sandbox hostnames.** `<port>-<id>.<domain>` needs
   wildcard DNS and TLS, so it is off by default (`-port-hosts` turns it on).
   Guest ports work through the gateway host with the SDKs' routing headers.
-- **Pause, resume, snapshots and fork through the API** (M5). Refused with
-  a `501` and a clear message. The Firecracker worker restores new VMs from
-  a template snapshot internally (`-fc-snapshots`), which the API does not
-  expose.
+- **Snapshots and fork through the API** (M5). Refused with a `501` and a
+  clear message. The Firecracker worker pauses and resumes a sandbox with
+  its memory ([pause and resume](docs/compatibility.md#pause-and-resume))
+  and restores new VMs from a template snapshot internally
+  (`-fc-snapshots`), but the API exposes no snapshots. Filesystem-only
+  pause and auto-resume are refused; the Mac worker cannot pause.
 - **Template builds through the API.** Templates are built with the scripts
   in [`images/`](images) and registered by the operator with
   `-register-template`.

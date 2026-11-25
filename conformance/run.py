@@ -171,8 +171,8 @@ KEY_TO_OPERATION = {key: operation for _, operation, keys in OPERATIONS for key 
 # their routes answer 501 with a documented E2B error, so their upstream tests
 # stay red. Rendered as the matrix's notes.
 REFUSED = {
-    "pause, resume, snapshots": "pause, resume and snapshots are deferred with M5 (owner decision D7)",
-    "lifecycle options (autoPause, onTimeout)": "auto-pause and auto-resume are deferred with M5 (D7); the request-shape tests mock E2B's API host and cannot reach sandboxd",
+    "pause, resume, snapshots": "pause and resume keep memory (filesystem-only pause and `on_resume='reboot'` answer 501); snapshots are refused (D7)",
+    "lifecycle options (autoPause, onTimeout)": "auto-pause keeps memory; auto-resume and filesystem-only auto-pause are refused; the request-shape tests mock E2B's API host and cannot reach sandboxd",
     "`fork`": "fork needs snapshots (D7)",
     "network, internet access, egress proxy": "the guest network policy is fixed by the operator; only `allowPublicTraffic: false` is accepted",
     "IAM": "IAM is not supported; the request-shape tests mock E2B's API host and cannot reach sandboxd",
