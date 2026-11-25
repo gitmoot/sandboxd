@@ -25,9 +25,10 @@ type firecrackerFlags struct {
 	instance                           *string
 	root, firecracker, jailer, kernel  *string
 	uidBase, homeDiskMiB, diskFloorMiB *int
+	memoryFloorMiB                     *int
 	hostPort                           *int
 	bootTimeout                        *time.Duration
-	consoleLog, balloon                *bool
+	consoleLog, balloon, snapshots     *bool
 	deny                               *egress.PrefixFlags
 	volumeBudgetMiB, volumeMiB         *int
 	volumeDir                          *string
@@ -49,6 +50,10 @@ func addFirecrackerFlags(flags *flag.FlagSet) firecrackerFlags {
 		uidBase:      flags.Int("fc-uid-base", vm.FirecrackerDefaultUIDBase, "firecracker: first host UID; slot i runs its VMM as base+i and its NAT as base+1000+i"),
 		homeDiskMiB:  flags.Int("fc-home-disk-mib", 10240, "firecracker: size of each VM's private writable /home/user disk"),
 		diskFloorMiB: flags.Int("fc-disk-floor-mib", 8192, "firecracker: refuse to create a VM unless this much disk stays free beyond its home disk"),
+		memoryFloorMiB: flags.Int("fc-memory-floor-mib", 0, "firecracker: refuse to create a VM while the host has less memory available (MemAvailable) than this; "+
+			"0 (the default) checks only each VM's own cgroup limit"),
+		snapshots: flags.Bool("fc-snapshots", false, "firecracker: start VMs by restoring a booted template snapshot of their image and shape "+
+			"(built in the background after the first cold boot) instead of booting the kernel"),
 		hostPort: flags.Int("fc-host-port", 0, "firecracker: the one host TCP port guests may reach, as 10.0.2.2:<port> = the host's 127.0.0.1:<port> "+
 			"(e.g. a credential gateway); 0 allows none"),
 		bootTimeout: flags.Duration("fc-boot-timeout", time.Minute, "firecracker: maximum time for the guest agent to answer after boot"),

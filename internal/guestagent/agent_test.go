@@ -274,6 +274,48 @@ func TestSyncRemountsVolume(t *testing.T) {
 	}
 }
 
+// OpRestore hands the host's entropy and clock to the Restore hook once both
+// are well formed; anything the agent refuses is ErrRefused.
+func TestRestoreHandsEntropyAndClockToTheHook(t *testing.T) {
+	ctx := context.Background()
+	entropy := bytes.Repeat([]byte{7}, RestoreEntropyBytes)
+	now := time.Unix(1_800_000_000, 123)
+	if err := Restore(ctx, connect(t, testServer(t)), entropy, now); !errors.Is(err, ErrRefused) {
+		t.Fatalf("restore of an agent without the hook = %v", err)
+	}
+	var got []byte
+	var at int64
+	s := testServer(t)
+	s.Restore = func(entropy []byte, unixNano int64) error {
+		got, at = bytes.Clone(entropy), unixNano
+		return nil
+	}
+	if err := Restore(ctx, connect(t, s), entropy, now); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, entropy) || at != now.UnixNano() {
+		t.Fatalf("hook got %x at %d", got, at)
+	}
+	for name, request := range map[string]Request{
+		"short entropy": {Op: OpRestore, Entropy: entropy[:8], Time: now.UnixNano()},
+		"no clock":      {Op: OpRestore, Entropy: entropy},
+	} {
+		got = nil
+		conn := connect(t, s)
+		if err := WriteRequest(conn, request); err != nil {
+			t.Fatal(err)
+		}
+		if result, err := readResult(conn); err != nil || result.Error == "" || got != nil {
+			t.Errorf("%s: result %+v, %v, hook got %x", name, result, err, got)
+		}
+	}
+	failing := testServer(t)
+	failing.Restore = func([]byte, int64) error { return errors.New("no random device") }
+	if err := Restore(ctx, connect(t, failing), entropy, now); !errors.Is(err, ErrRefused) || !strings.Contains(err.Error(), "no random device") {
+		t.Fatalf("restore with a failing hook = %v", err)
+	}
+}
+
 func TestVolumePathFromCmdline(t *testing.T) {
 	for cmdline, want := range map[string]string{
 		"console=ttyS0 sandboxd.envd=1":                   "",

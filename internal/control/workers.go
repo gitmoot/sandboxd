@@ -519,6 +519,20 @@ type workerCapacity struct {
 	MemoryMiB int        `json:"memoryMiB"`
 	LastSeen  *time.Time `json:"lastSeen"`
 	Error     string     `json:"error"`
+	// HostMemory is the local worker's host memory as its driver measures
+	// it (Firecracker), absent for any other worker.
+	HostMemory *hostMemory `json:"hostMemory,omitempty"`
+}
+
+// hostMemory reports vm.HostMemory: available memory counts pages VMs
+// share (a template snapshot's) once; floorMiB is the driver's admission
+// floor (0: none) and pressureSome10 the host's PSI "some" average over
+// 10 s, in percent.
+type hostMemory struct {
+	TotalMiB       uint64  `json:"totalMiB"`
+	AvailableMiB   uint64  `json:"availableMiB"`
+	FloorMiB       uint64  `json:"floorMiB"`
+	PressureSome10 float64 `json:"pressureSome10"`
 }
 
 type capacityReport struct {
@@ -533,6 +547,16 @@ type capacityReport struct {
 // only online workers; an offline worker stays listed with its last error.
 // Reserved and unresolved rows hold their slot until proven gone.
 func (s *Service) capacity(w http.ResponseWriter, r *http.Request) {
+	var local *hostMemory
+	if s.localMemory != nil {
+		// Sampled before s.mu is taken; a failed sample is left out.
+		if sample, err := s.localMemory.HostMemory(r.Context()); err == nil {
+			local = &hostMemory{TotalMiB: sample.TotalBytes >> 20, AvailableMiB: sample.AvailableBytes >> 20,
+				FloorMiB: sample.FloorBytes >> 20, PressureSome10: sample.PressureSome10}
+		} else {
+			log.Printf("capacity: local host memory: %v", err)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.ledger.Active(r.Context())
@@ -559,6 +583,9 @@ func (s *Service) capacity(w http.ResponseWriter, r *http.Request) {
 		entry := workerCapacity{WorkerID: m.id, Arch: m.decl.Arch, Driver: m.decl.Driver, Templates: []string{},
 			RefusedTemplates: map[string]string{}, Enrolled: true, Online: m.online, Lease: m.lease, MaxVMs: m.decl.MaxVMs,
 			UsedSlots: used[m.id], CPUs: m.decl.CPUs, MemoryMiB: m.decl.MemoryMiB, Error: m.err}
+		if m.local {
+			entry.HostMemory = local
+		}
 		for template := range m.serves {
 			entry.Templates = append(entry.Templates, template)
 		}

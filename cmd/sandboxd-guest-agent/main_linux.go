@@ -371,6 +371,10 @@ func serve(envd bool) error {
 		WriteHelper: []string{self, "write"},
 		WaitDelay:   2 * time.Second,
 		DiskPath:    homeDir,
+		// A restored guest is reseeded and its clock set before the host
+		// hands it out (guestagent.OpRestore).
+		Restore:  guestagent.ApplyRestore,
+		Features: []string{guestagent.FeatureRestore},
 	}
 	if envd {
 		server.DialHost = "127.0.0.1"

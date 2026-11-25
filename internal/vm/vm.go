@@ -74,6 +74,27 @@ var ErrHardenedUnsupported = errors.New("hardened guests are not supported by th
 // for and is not kept.
 var ErrImageTooOld = errors.New("guest image does not support a requested feature; rebuild it with this sandboxd version")
 
+// ErrMemoryPressure refuses a new VM while the worker host's available
+// memory is below its configured floor; retrying later can succeed.
+var ErrMemoryPressure = errors.New("host memory is below the configured floor")
+
+// HostMemory is one sample of a worker host's memory: what the kernel has
+// (MemTotal), what new work can still use without swapping (MemAvailable),
+// and the floor below which the driver refuses new VMs (0: none).
+// PressureSome10 is the share of the last 10 seconds in which some task
+// stalled on memory (/proc/pressure/memory "some avg10"), in percent, or -1
+// when the kernel does not report it.
+type HostMemory struct {
+	TotalBytes, AvailableBytes, FloorBytes uint64
+	PressureSome10                         float64
+}
+
+// HostMemoryReporter is implemented by drivers whose capacity follows the
+// host's real memory use rather than a fixed reservation per VM.
+type HostMemoryReporter interface {
+	HostMemory(context.Context) (HostMemory, error)
+}
+
 // HardenedBooter is implemented by drivers whose guest init boots hardened
 // guests (Spec.Hardened). A gateway serves a hardened template only through
 // such a driver: support is declared, never assumed from a driver's name.

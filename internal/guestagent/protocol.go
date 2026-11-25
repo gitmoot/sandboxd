@@ -48,7 +48,17 @@ const (
 	// and remounts an attached volume read-only so nothing more is written
 	// to it. Error reports only a failed remount; the flush always runs.
 	OpSync = "sync"
+	// OpRestore runs once in a guest restored from a snapshot, before the
+	// host hands it out: the agent mixes Request.Entropy into the guest
+	// kernel's entropy pool, makes the kernel reseed its random number
+	// generator from it, and sets the wall clock to Request.Time. Clones of
+	// one snapshot then never share kernel randomness or a stale clock.
+	// Only an agent reporting FeatureRestore serves it.
+	OpRestore = "restore"
 )
+
+// RestoreEntropyBytes is the length of OpRestore's Request.Entropy.
+const RestoreEntropyBytes = 64
 
 // VolumeArg is the kernel argument prefix naming the guest path of an
 // attached volume (the VM's third disk, /dev/vdc): "sandboxd.volume=/data".
@@ -124,6 +134,10 @@ type Request struct {
 	Size int64             `json:"size,omitempty"`
 	// Port is OpDial's guest TCP port, 1-65535.
 	Port int `json:"port,omitempty"`
+	// Entropy is OpRestore's fresh host randomness, RestoreEntropyBytes
+	// long, and Time the host's wall clock in Unix nanoseconds.
+	Entropy []byte `json:"entropy,omitempty"`
+	Time    int64  `json:"time,omitempty"`
 }
 
 // Started acknowledges an accepted command. ID is a positive per-agent
@@ -141,8 +155,9 @@ type Result struct {
 	DiskTotal uint64 `json:"diskTotal,omitempty"`
 	DiskUsed  uint64 `json:"diskUsed,omitempty"`
 	// Features answers OpPing: what this guest's init applied, from
-	// FeatureHardened and FeatureVolume. An agent older than them reports
-	// none, so the host can tell a guest that ignored a request.
+	// FeatureHardened and FeatureVolume, and FeatureRestore when the agent
+	// serves OpRestore. An agent older than them reports none, so the host
+	// can tell a guest that ignored a request.
 	Features []string `json:"features,omitempty"`
 }
 
@@ -150,6 +165,9 @@ type Result struct {
 const (
 	FeatureHardened = "hardened"
 	FeatureVolume   = "volume"
+	// FeatureRestore: the agent serves OpRestore, so its guest may be
+	// snapshotted and restored.
+	FeatureRestore = "restore"
 )
 
 // WriteRequest sends the request line.

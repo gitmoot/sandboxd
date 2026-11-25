@@ -51,6 +51,9 @@ type Server struct {
 	VolumePath string
 	// Features is what init applied, reported by OpPing.
 	Features []string
+	// Restore serves OpRestore with the request's entropy and wall clock
+	// (Unix nanoseconds); nil refuses it. A real guest uses ApplyRestore.
+	Restore func(entropy []byte, unixNano int64) error
 
 	next atomic.Int64
 }
@@ -98,6 +101,8 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		result = s.disk()
 	case OpSync:
 		result = s.sync()
+	case OpRestore:
+		result = s.restore(request)
 	default:
 		result = Result{Error: fmt.Sprintf("unknown guest agent operation %q", request.Op)}
 	}
@@ -180,6 +185,22 @@ func (s *Server) sync() Result {
 	syscall.Sync()
 	if err != nil {
 		return Result{Error: fmt.Sprintf("remount volume read-only: %v", err)}
+	}
+	return Result{}
+}
+
+// restore applies OpRestore. The host sends it once, right after a restore;
+// a request without exactly RestoreEntropyBytes of entropy and a clock is
+// refused, so a malformed one never leaves the guest half reseeded.
+func (s *Server) restore(request Request) Result {
+	if s.Restore == nil {
+		return Result{Error: "this guest cannot be restored from a snapshot"}
+	}
+	if len(request.Entropy) != RestoreEntropyBytes || request.Time <= 0 {
+		return Result{Error: "restore needs fresh entropy and the host clock"}
+	}
+	if err := s.Restore(request.Entropy, request.Time); err != nil {
+		return Result{Error: fmt.Sprintf("restore: %v", err)}
 	}
 	return Result{}
 }

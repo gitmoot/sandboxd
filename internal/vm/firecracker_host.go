@@ -478,7 +478,7 @@ func (h *linuxFCHost) CreateNetwork(ctx context.Context, network fcNetwork) erro
 		{h.tools.ip, "-n", network.Netns, "link", "set", "lo", "up"},
 		{h.tools.ip, "-n", network.Netns, "tuntap", "add", "dev", fcGuestTap, "mode", "tap", "user", vmm, "group", vmm},
 		{h.tools.ip, "-n", network.Netns, "addr", "add", fcGatewayCIDR, "dev", fcGuestTap},
-		{h.tools.ip, "-n", network.Netns, "link", "set", fcGuestTap, "up"},
+		{h.tools.ip, "-n", network.Netns, "link", "set", fcGuestTap, "address", fcGatewayMAC, "up"},
 		{h.tools.nsenter, ns, "--", "/bin/sh", "-c",
 			"echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6 && echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6 && echo 1 > /proc/sys/net/ipv4/ip_forward"},
 	}
@@ -560,27 +560,31 @@ func (h *linuxFCHost) StartVMM(ctx context.Context, jailer string, args []string
 }
 
 func (h *linuxFCHost) Dial(ctx context.Context, chroot string, owner int) (net.Conn, error) {
-	return dialJailSocket(ctx, chroot, owner)
+	return dialJailSocket(ctx, chroot, owner, fcVsockName)
 }
 
-// dialJailSocket connects to the VMM's vsock socket <chroot>/run/v.sock
-// without following anything the VMM can replace. The VMM owns <chroot> and
-// <chroot>/run, so each component is opened beneath the root-owned jail
-// directory with O_NOFOLLOW; the run directory and the socket must belong to
-// owner; and the connection goes to the opened socket inode through
-// /proc/self/fd/N, never through a path that is resolved again. This also
-// keeps sun_path short whatever the install directory.
-func dialJailSocket(ctx context.Context, chroot string, owner int) (net.Conn, error) {
+func (h *linuxFCHost) DialAPI(ctx context.Context, chroot string, owner int) (net.Conn, error) {
+	return dialJailSocket(ctx, chroot, owner, fcAPIName)
+}
+
+// dialJailSocket connects to the VMM's socket <chroot>/run/<name> (its vsock
+// or API socket) without following anything the VMM can replace. The VMM
+// owns <chroot> and <chroot>/run, so each component is opened beneath the
+// root-owned jail directory with O_NOFOLLOW; the run directory and the
+// socket must belong to owner; and the connection goes to the opened socket
+// inode through /proc/self/fd/N, never through a path that is resolved
+// again. This also keeps sun_path short whatever the install directory.
+func dialJailSocket(ctx context.Context, chroot string, owner int, name string) (net.Conn, error) {
 	const flags = unix.O_PATH | unix.O_NOFOLLOW | unix.O_CLOEXEC
 	dir, err := unix.Open(filepath.Dir(chroot), flags|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open jail: %w", err)
 	}
 	defer unix.Close(dir)
-	for _, name := range []string{filepath.Base(chroot), fcVsockDir} {
-		next, err := unix.Openat(dir, name, flags|unix.O_DIRECTORY, 0)
+	for _, part := range []string{filepath.Base(chroot), fcVsockDir} {
+		next, err := unix.Openat(dir, part, flags|unix.O_DIRECTORY, 0)
 		if err != nil {
-			return nil, fmt.Errorf("open jail directory %q: %w", name, err)
+			return nil, fmt.Errorf("open jail directory %q: %w", part, err)
 		}
 		defer unix.Close(next)
 		dir = next
@@ -588,7 +592,7 @@ func dialJailSocket(ctx context.Context, chroot string, owner int) (net.Conn, er
 	if err := checkOwned(dir, unix.S_IFDIR, owner); err != nil {
 		return nil, fmt.Errorf("jail socket directory: %w", err)
 	}
-	sock, err := unix.Openat(dir, fcVsockName, flags, 0)
+	sock, err := unix.Openat(dir, name, flags, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open jail socket: %w", err)
 	}
@@ -613,4 +617,110 @@ func checkOwned(fd int, kind uint32, owner int) error {
 		return fmt.Errorf("owned by uid %d, want %d", stat.Uid, owner)
 	}
 	return nil
+}
+
+// SnapshotFacts runs `firecracker --version` (the trusted binary, outside
+// any jail) and reads the host kernel release and the first CPU's identity
+// from /proc/cpuinfo, microcode revision included.
+func (h *linuxFCHost) SnapshotFacts(ctx context.Context, firecracker string) (fcHostFacts, error) {
+	out, err := h.run(ctx, nil, firecracker, "--version")
+	if err != nil {
+		return fcHostFacts{}, err
+	}
+	version, _, _ := strings.Cut(string(out), "\n")
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err != nil {
+		return fcHostFacts{}, err
+	}
+	cpuinfo, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return fcHostFacts{}, err
+	}
+	return fcHostFacts{
+		Firecracker: strings.TrimSpace(version),
+		HostKernel:  unix.ByteSliceToString(uts.Release[:]),
+		CPU:         fcCPUIdentity(string(cpuinfo)),
+	}, nil
+}
+
+// fcCPUIdentity is the first processor's vendor, family, model, stepping,
+// microcode and name from /proc/cpuinfo: what a snapshot's saved CPU state
+// depends on.
+func fcCPUIdentity(cpuinfo string) string {
+	first, _, _ := strings.Cut(cpuinfo, "\n\n")
+	fields := map[string]string{}
+	for line := range strings.Lines(first) {
+		key, value, ok := strings.Cut(line, ":")
+		if ok {
+			fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+	}
+	var parts []string
+	for _, key := range []string{"vendor_id", "cpu family", "model", "stepping", "microcode", "model name", "CPU implementer", "CPU part", "CPU variant", "CPU revision"} {
+		if value, ok := fields[key]; ok {
+			parts = append(parts, key+"="+value)
+		}
+	}
+	return strings.Join(parts, ";")
+}
+
+// HostMemory reads MemTotal and MemAvailable from /proc/meminfo, and the
+// memory pressure "some avg10" from /proc/pressure/memory when it exists.
+func (h *linuxFCHost) HostMemory() (HostMemory, error) {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return HostMemory{}, err
+	}
+	memory, err := fcParseMeminfo(string(data))
+	if err != nil {
+		return HostMemory{}, err
+	}
+	memory.PressureSome10 = -1
+	if data, err := os.ReadFile("/proc/pressure/memory"); err == nil {
+		memory.PressureSome10 = fcPressureSome10(string(data))
+	}
+	return memory, nil
+}
+
+func fcParseMeminfo(meminfo string) (HostMemory, error) {
+	var memory HostMemory
+	found := 0
+	for line := range strings.Lines(meminfo) {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || (key != "MemTotal" && key != "MemAvailable") {
+			continue
+		}
+		kib, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimSpace(value), " kB"), 10, 64)
+		if err != nil {
+			return HostMemory{}, fmt.Errorf("/proc/meminfo %s: %w", key, err)
+		}
+		if key == "MemTotal" {
+			memory.TotalBytes = kib << 10
+		} else {
+			memory.AvailableBytes = kib << 10
+		}
+		found++
+	}
+	if found != 2 {
+		return HostMemory{}, errors.New("/proc/meminfo has no MemTotal or MemAvailable")
+	}
+	return memory, nil
+}
+
+// fcPressureSome10 is the "some avg10" of a PSI file, or -1.
+func fcPressureSome10(psi string) float64 {
+	for line := range strings.Lines(psi) {
+		rest, ok := strings.CutPrefix(line, "some ")
+		if !ok {
+			continue
+		}
+		for field := range strings.FieldsSeq(rest) {
+			if value, ok := strings.CutPrefix(field, "avg10="); ok {
+				if pct, err := strconv.ParseFloat(value, 64); err == nil {
+					return pct
+				}
+			}
+		}
+	}
+	return -1
 }

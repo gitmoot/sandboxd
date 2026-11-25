@@ -39,9 +39,10 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 	driver, err := vm.NewFirecrackerDriver(vm.FirecrackerConfig{
 		Instance: *f.instance, ClaimDir: fcClaimDir,
 		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: images, Slots: slots,
-		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
+		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB, MemoryFloorMiB: *f.memoryFloorMiB,
 		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny, HostPort: *f.hostPort,
 		VolumeBudgetMiB: *f.volumeBudgetMiB, VolumeMiB: *f.volumeMiB, VolumeDir: volumeDir, Balloon: *f.balloon,
+		Snapshots: *f.snapshots,
 	})
 	if err != nil {
 		return nil, nil, err
