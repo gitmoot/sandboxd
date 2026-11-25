@@ -125,8 +125,11 @@ func (s *Service) pause(w http.ResponseWriter, r *http.Request, id string) {
 // pauseRow pauses row's VM, whose row the caller set pausing and busy, and
 // settles the row: paused until its retention lapses on success. On failure
 // an explicit pause (revert) returns the row to running, and reconciliation
-// destroys the VM if the driver left it stopped; a failed auto-pause marks
-// the row unknown, so reconciliation destroys it as at any end time.
+// destroys the VM if the driver left it stopped. A failed auto-pause marks
+// the row unknown, so reconciliation destroys it as at any end time, unless
+// the driver refused it below its disk floor (the guest untouched and
+// running): then the row returns to running and the next sweep retries,
+// until the pause retention would have lapsed.
 func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) error {
 	pauseCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
 	pauseErr := s.pauser.Pause(pauseCtx, row.ID)
@@ -141,7 +144,8 @@ func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) erro
 		}
 		return err
 	}
-	if !revert {
+	retry := errors.Is(pauseErr, vm.ErrDiskFloor) && time.Now().Before(row.Ends.Add(s.cfg.PauseRetention))
+	if !revert && !retry {
 		return errors.Join(pauseErr, s.setState(ctx, row.ID, "unknown"))
 	}
 	running, err := s.ledger.Transition(ctx, row.ID, "pausing", "running", row.Ends, row.AutoPause)
@@ -155,7 +159,11 @@ func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) erro
 // reconciliation set its row pausing and busy, and counted it in lifecycle.
 func (s *Service) autoPause(row store.Row) {
 	defer s.lifecycle.Done()
-	if err := s.pauseRow(context.Background(), row, false); err != nil {
+	err := s.pauseRow(context.Background(), row, false)
+	switch {
+	case errors.Is(err, vm.ErrDiskFloor) && time.Now().Before(row.Ends.Add(s.cfg.PauseRetention)):
+		log.Printf("sandbox %s: auto-pause refused, retrying while it runs on: %v", row.ID, err)
+	case err != nil:
 		log.Printf("sandbox %s: auto-pause failed, destroying it: %v", row.ID, err)
 	}
 }

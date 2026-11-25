@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"path/filepath"
 	"sync"
@@ -17,6 +18,8 @@ import (
 type pausingDriver struct {
 	*fakeDriver
 	pauseError, resumeError error
+	// pauses counts Pause calls.
+	pauses int
 	// release, when set, holds every Pause until it is closed; entered
 	// then receives once per held Pause.
 	entered, release chan struct{}
@@ -33,6 +36,7 @@ func (d *pausingDriver) Pause(_ context.Context, id string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.pauses++
 	if d.pauseError != nil {
 		return d.pauseError
 	}
@@ -303,6 +307,34 @@ func TestAutoPauseAtEndTimeAndRetention(t *testing.T) {
 		_, ok := driver.instance(failed)
 		return !ok
 	})
+}
+
+// TestAutoPauseBelowTheDiskFloorKeepsTheSandbox: an auto-pause the driver
+// refuses below its disk floor leaves the sandbox running and is retried,
+// until it succeeds.
+func TestAutoPauseBelowTheDiskFloorKeepsTheSandbox(t *testing.T) {
+	driver := newPausingDriver()
+	driver.pauseError = fmt.Errorf("%w: 100 MiB free", vm.ErrDiskFloor)
+	s := openAt(t, filepath.Join(t.TempDir(), "ledger.sqlite"), driver, mixedConfig(e2bBase, 1))
+	id := createE2B(t, s, map[string]any{"templateID": "base", "autoPause": true, "timeout": 1}).ID
+	waitFor(t, s, "a retried auto-pause", func() bool {
+		driver.mu.Lock()
+		defer driver.mu.Unlock()
+		return driver.pauses >= 2
+	})
+	if instance, ok := driver.instance(id); !ok || !instance.Running {
+		t.Fatalf("sandbox after refused auto-pauses: %+v, %t", instance, ok)
+	}
+	driver.mu.Lock()
+	driver.pauseError = nil
+	driver.mu.Unlock()
+	waitFor(t, s, "the auto-pause", func() bool {
+		instance, _ := driver.instance(id)
+		return instance.Paused
+	})
+	if described := describedSandbox(t, s, id); described.State != "paused" {
+		t.Fatalf("auto-paused sandbox: %+v", described)
+	}
 }
 
 // TestPausedSandboxSurvivesGatewayRestart: a new gateway instance adopts a
