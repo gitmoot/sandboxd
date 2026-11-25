@@ -460,7 +460,7 @@ func (d *FirecrackerDriver) restore(ctx context.Context, spec Spec, meta fcMeta,
 	if err := d.prepareRestoreJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, d.diskLimitMiB(meta), "--api-sock", fcAPIPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, d.snapshotLimitMiB(meta), "--api-sock", fcAPIPath); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, fcRestoreTime)
@@ -900,9 +900,7 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}
 	defer unix.Close(outDir)
 	startup := &fcStartup{}
-	// Its file size limit covers the snapshot of its guest memory too.
-	fsizeMiB := max(d.diskLimitMiB(meta), meta.MemoryMiB)
-	if err := d.launch(ctx, spec, meta, startup, fsizeMiB, "--api-sock", fcAPIPath, "--config-file", fcConfigPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, d.snapshotLimitMiB(meta), fcBootArgs...); err != nil {
 		return err
 	}
 	// The jailer copied the Firecracker binary into the jail and runs the

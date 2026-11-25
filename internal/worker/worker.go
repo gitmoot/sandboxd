@@ -229,6 +229,7 @@ type enrollRequest struct {
 type instanceJSON struct {
 	ID      string `json:"id"`
 	Running bool   `json:"running"`
+	Paused  bool   `json:"paused,omitempty"`
 	Network string `json:"network"`
 }
 

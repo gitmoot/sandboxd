@@ -64,7 +64,7 @@ const (
 
 // envdGuestLayout lists what the helper creates in the guest directory, all
 // removed by the helper itself (root owns them) before it exits.
-var envdGuestLayout = []string{"home", "tmp", "root", "passwd", "group", "sudoers", "hosts", "shadow", envdSocket, envdSocket + ".pending"}
+var envdGuestLayout = []string{"home", "tmp", "root", "passwd", "group", "sudoers", "hosts", "shadow", envdSocket, envdSocket + ".pending", envdPausedMark}
 
 func (e Envd) validate() error {
 	if e.Binary == "" {
@@ -299,10 +299,30 @@ func envdInit(args []string) error {
 		killAll()
 		return err
 	}
+	// The lifeline is the helper's stdin: envdPause and envdResume stop and
+	// continue the guest (pause.go), and its end (the driver closed it or
+	// exited) ends the guest.
 	lifeline := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(io.Discard, os.Stdin)
-		close(lifeline)
+		defer close(lifeline)
+		var command [1]byte
+		for {
+			if _, err := os.Stdin.Read(command[:]); err != nil {
+				return
+			}
+			var err error
+			switch command[0] {
+			case envdPause:
+				err = pauseNamespace(dirFD)
+			case envdResume:
+				err = resumeNamespace(dirFD)
+			default:
+				err = fmt.Errorf("unknown lifeline command %q", command[0])
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "envd guest init: %v\n", err)
+			}
+		}
 	}()
 	for {
 		select {

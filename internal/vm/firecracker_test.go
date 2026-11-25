@@ -82,15 +82,17 @@ type fakeFCHost struct {
 	oldAgent, noRestore bool
 	// features are each running guest's agent features; apis, the API
 	// sockets of VMMs started with one, and paused, the VMs paused through
-	// it. loadFault, when set, is the fault every snapshot load answers;
-	// restoreErr is what a restored guest's agent answers OpRestore with,
-	// and restores records each OpRestore it accepted.
-	features   map[string][]string
-	apis       map[string]*net.UnixListener
-	paused     map[string]bool
-	loadFault  string
-	restoreErr error
-	restores   []fakeRestore
+	// it. loadFault and snapshotFault, when set, are the fault every
+	// snapshot load and create answers; restoreErr is what a restored
+	// guest's agent answers OpRestore with, and restores records each
+	// OpRestore it accepted.
+	features      map[string][]string
+	apis          map[string]*net.UnixListener
+	paused        map[string]bool
+	loadFault     string
+	snapshotFault string
+	restoreErr    error
+	restores      []fakeRestore
 	// facts is what SnapshotFacts reports; memory, what HostMemory does.
 	facts  fcHostFacts
 	memory HostMemory
@@ -455,6 +457,17 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 			return nil
 		}
 	}
+	// Like the real jailer, the fake creates device nodes and a copy of the
+	// VMM binary in the chroot, and refuses one that already holds them.
+	for _, trace := range []string{"dev", "firecracker"} {
+		if _, err := os.Lstat(filepath.Join(chroot, trace)); err == nil {
+			return fmt.Errorf("fake jailer: %s exists in the chroot", trace)
+		}
+	}
+	if err := errors.Join(os.Mkdir(filepath.Join(chroot, "dev"), 0o755),
+		os.WriteFile(filepath.Join(chroot, "firecracker"), nil, 0o755)); err != nil {
+		return err
+	}
 	h.cgroups[id] = !h.bootDies
 	if h.bootDies {
 		return nil
@@ -493,13 +506,16 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 			features = append(features, guestagent.FeatureRestore)
 		}
 	}
-	return h.bootGuest(id, chroot, features)
+	return h.bootGuest(id, chroot, features, "")
 }
 
 // bootGuest runs VM id's guest: an agent with features on the VM's vsock
-// socket, serving a fresh guest directory. h.mu must be held.
-func (h *fakeFCHost) bootGuest(id, chroot string, features []string) error {
-	guest := h.t.TempDir()
+// socket, serving guest (the guest directory a snapshot kept) or, if "", a
+// fresh one. h.mu must be held.
+func (h *fakeFCHost) bootGuest(id, chroot string, features []string, guest string) error {
+	if guest == "" {
+		guest = h.t.TempDir()
+	}
 	h.guests[chroot] = guest
 	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
 	if err != nil {

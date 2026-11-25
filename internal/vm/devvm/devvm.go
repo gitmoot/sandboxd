@@ -79,19 +79,23 @@ type guest struct {
 	holder    *exec.Cmd
 	exited    chan struct{}
 	// envd marks an envd guest: holder is its root helper, and closing
-	// lifeline ends it (see envd.go).
+	// lifeline ends it (see envd.go); writing to it pauses and resumes it.
 	envd     bool
-	lifeline io.Closer
+	lifeline io.WriteCloser
 	// console keeps an envd guest's console output.
 	console *vm.Console
 	// volume is the ID of the volume mounted in an envd guest, "" for none.
 	volume string
+	// paused, guarded by Driver.mu, marks a guest Pause stopped (or is
+	// stopping); Resume clears it once the guest runs again.
+	paused bool
 }
 
 var (
 	_ vm.Driver        = (*Driver)(nil)
 	_ vm.ResourceMeter = (*Driver)(nil)
 	_ vm.PortDialer    = (*Driver)(nil)
+	_ vm.Pauser        = (*Driver)(nil)
 )
 
 // New uses root, which must be absent or empty, as the parent of all guest
@@ -211,12 +215,14 @@ func (g *guest) running() bool {
 func (g *guest) pgid() int { return g.holder.Process.Pid }
 
 // List is complete by construction: the driver owns every guest it reports.
+// A paused guest keeps its network (and its processes, stopped).
 func (d *Driver) List(context.Context) ([]vm.Instance, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	instances := make([]vm.Instance, 0, len(d.vms))
 	for id, g := range d.vms {
-		instances = append(instances, vm.Instance{ID: id, Running: g.running(), Network: g.network})
+		alive := g.running()
+		instances = append(instances, vm.Instance{ID: id, Running: alive && !g.paused, Paused: alive && g.paused, Network: g.network})
 	}
 	sort.Slice(instances, func(i, j int) bool { return instances[i].ID < instances[j].ID })
 	return instances, nil
@@ -236,7 +242,7 @@ func (d *Driver) running(id string) (*guest, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	g, ok := d.vms[id]
-	if !ok || !g.running() {
+	if !ok || !g.running() || g.paused {
 		return nil, fmt.Errorf("guest %q is not running", id)
 	}
 	return g, nil
@@ -520,6 +526,7 @@ func sampleGroup(pgid int) (groupSample, error) {
 }
 
 type procStat struct {
+	state                  byte
 	ppid, pgrp             int
 	utime, stime, rssPages uint64
 }
@@ -545,7 +552,7 @@ func statFields(raw string) (procStat, bool) {
 	if err := errors.Join(err0, err1, err2, err3, err4); err != nil || rss < 0 {
 		return procStat{}, false
 	}
-	return procStat{ppid: ppid, pgrp: pgrp, utime: utime, stime: stime, rssPages: uint64(rss)}, true
+	return procStat{state: fields[0][0], ppid: ppid, pgrp: pgrp, utime: utime, stime: stime, rssPages: uint64(rss)}, true
 }
 
 // Destroy kills the guest's process group, waits until no member remains, and
