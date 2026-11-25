@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -100,6 +101,12 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		h.record("snapshot " + id)
+		h.mu.Lock()
+		tamper := h.onSnapshot
+		h.mu.Unlock()
+		if tamper != nil {
+			tamper(chroot)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("PUT /snapshot/load", func(w http.ResponseWriter, r *http.Request) {
@@ -227,7 +234,9 @@ func restored(args []string, id string) bool {
 }
 
 func TestFirecrackerSnapshotRestore(t *testing.T) {
-	d, host, cfg := newSnapshotFirecracker(t)
+	// A home disk smaller than the guest's memory tells the VMMs' file size
+	// limits apart.
+	d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) { c.HomeDiskMiB = 256 })
 	ctx := context.Background()
 	first := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
 	// The first VM of a shape cold boots and starts its template's build.
@@ -250,6 +259,10 @@ func TestFirecrackerSnapshotRestore(t *testing.T) {
 		argAfter(buildArgs, "--api-sock") != "/run/api.sock" || argAfter(buildArgs, "--config-file") != "/vm.json" {
 		t.Fatalf("build VMM args = %v", buildArgs)
 	}
+	// It writes the guest's memory, so its file size limit covers that.
+	if got := argAfter(buildArgs, "--resource-limit"); got != fmt.Sprint("fsize=", 512<<20) {
+		t.Fatalf("build VMM %s", got)
+	}
 	if pause, snap := slices.Index(calls, "pause "+build), slices.Index(calls, "snapshot "+build); pause < 0 || snap < pause {
 		t.Fatalf("calls = %v", calls)
 	}
@@ -271,6 +284,10 @@ func TestFirecrackerSnapshotRestore(t *testing.T) {
 	}
 	if args := lastStart(host, fcTestID2); !restored(args, fcTestID2) || argAfter(args, "--uid") != strconv.Itoa(cfg.UIDBase+1) {
 		t.Fatalf("clone VMM args = %v", args)
+	}
+	// A clone writes only its disks.
+	if got := argAfter(lastStart(host, fcTestID2), "--resource-limit"); got != fmt.Sprint("fsize=", 256<<20) {
+		t.Fatalf("clone VMM %s", got)
 	}
 	if meta, err := d.readMeta(fcTestID2); err != nil || meta.Snapshot != name {
 		t.Fatalf("clone record = %+v, %v", meta, err)
@@ -633,5 +650,200 @@ func TestFirecrackerMemoryFloor(t *testing.T) {
 	host.memory.AvailableBytes++
 	if _, err := d.Create(ctx, spec); err != nil {
 		t.Fatal(err)
+	}
+	// The floor is the host's, not a guest's: it can exceed the most RAM a
+	// VM can have, as long as it counts in bytes.
+	for floor, valid := range map[int]bool{512 << 10: true, math.MaxInt64 >> 20: true, math.MaxInt64>>20 + 1: false} {
+		c := cfg
+		c.MemoryFloorMiB = floor
+		if _, err := newFirecrackerDriver(c, newFakeFCHost(t)); (err == nil) != valid {
+			t.Errorf("memory floor of %d MiB: %v", floor, err)
+		}
+	}
+}
+
+// replaceFile replaces path with a new file, as installing another version
+// of an image does: at once, so a VM starting meanwhile links one or the
+// other.
+func replaceFile(path, content string) error {
+	next := path + ".next"
+	if err := errors.Join(os.WriteFile(next, []byte(content), 0o444), os.Chmod(next, 0o444)); err != nil {
+		return err
+	}
+	return os.Rename(next, path)
+}
+
+// A snapshot's key names the image by the identity of the file its path
+// resolved to; a build and a restore resolve the path again to link the
+// image into their jail. An image replaced in between is neither
+// snapshotted under the key of the one it replaced nor resumed from a
+// snapshot of another image.
+func TestFirecrackerSnapshotKeyedByLinkedImage(t *testing.T) {
+	ctx := context.Background()
+	spec := func(cfg FirecrackerConfig, id, slot string) Spec {
+		return Spec{ID: id, Image: cfg.Images[0], Network: slot, CPUs: 1, MemoryMiB: 512}
+	}
+	t.Run("build", func(t *testing.T) {
+		d, host, cfg := newSnapshotFirecracker(t)
+		image := cfg.Images[0]
+		original := filepath.Join(filepath.Dir(image), "original.ext4")
+		if err := os.Link(image, original); err != nil {
+			t.Fatal(err)
+		}
+		name := snapshotName(t, d, spec(cfg, fcTestID, "sbx0"))
+		build := fcBuildPrefix + name
+		// The image is replaced once the first create has computed the key
+		// (the build clears its VM's leftovers before it links the image),
+		// and rolled back by the time the build VM is stopped.
+		kills := 0
+		host.onKill = func(cgroup string) {
+			if cgroup != build {
+				return
+			}
+			kills++
+			var err error
+			switch kills {
+			case 1:
+				err = replaceFile(image, "another image")
+			case 2:
+				err = os.Rename(original, image)
+			}
+			if err != nil {
+				t.Error(err)
+			}
+		}
+		if _, err := d.Create(ctx, spec(cfg, fcTestID, "sbx0")); err != nil {
+			t.Fatal(err)
+		}
+		waitBuild(t, d)
+		host.onKill = nil
+		if kills < 2 {
+			t.Fatalf("the build VM was stopped %d times", kills)
+		}
+		if starts := vmmStarts(host, build); len(starts) != 0 {
+			t.Errorf("the build VM booted the replacement image: %v", starts)
+		}
+		if _, err := os.Stat(d.snapshotDir(name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a snapshot of the replacement is stored under the original image's key: %v", err)
+		}
+		// The original image has no snapshot: it cold boots.
+		if _, err := d.Create(ctx, spec(cfg, fcTestID2, "sbx1")); err != nil {
+			t.Fatal(err)
+		}
+		if args := lastStart(host, fcTestID2); !coldBooted(args) {
+			t.Fatalf("resumed a snapshot of another image: %v", args)
+		}
+	})
+	t.Run("restore", func(t *testing.T) {
+		d, _, cfg := newSnapshotFirecracker(t)
+		first := spec(cfg, fcTestID, "sbx0")
+		if _, err := d.Create(ctx, first); err != nil {
+			t.Fatal(err)
+		}
+		waitBuild(t, d)
+		name := snapshotName(t, d, first)
+		// The image is replaced after a create found the snapshot current
+		// and before it links the image into its clone's jail.
+		if err := replaceFile(cfg.Images[0], "another image"); err != nil {
+			t.Fatal(err)
+		}
+		clone := spec(cfg, fcTestID2, "sbx1")
+		meta := fcMeta{ID: clone.ID, Slot: clone.Network, VMMUID: cfg.UIDBase + 1, NetUID: cfg.UIDBase + fcUIDStride + 1,
+			Image: clone.Image, CPUs: clone.CPUs, MemoryMiB: clone.MemoryMiB, Snapshot: name}
+		if err := d.prepareRestoreJail(clone, meta); err == nil {
+			t.Fatal("a clone's jail holds an image its snapshot was not built from")
+		}
+	})
+}
+
+// A host serves one VM shape. A snapshot of another shape, such as one built
+// before the host's shape changed, is collected once no VM has used it for
+// fcSnapshotIdle: it does not stay on disk for good. This driver serves no
+// shape in particular, so its snapshots are all of another shape.
+func TestFirecrackerSnapshotOfAnotherShapeCollected(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	spec := func(id, slot string) Spec {
+		return Spec{ID: id, Image: cfg.Images[0], Network: slot, CPUs: 1, MemoryMiB: 512}
+	}
+	if _, err := d.Create(ctx, spec(fcTestID, "sbx0")); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(t, d)
+	name := snapshotName(t, d, spec(fcTestID, "sbx0"))
+	if _, err := d.Create(ctx, spec(fcTestID2, "sbx1")); err != nil {
+		t.Fatal(err)
+	}
+	if args := lastStart(host, fcTestID2); !restored(args, fcTestID2) {
+		t.Fatalf("not restored: %v", args)
+	}
+	for _, id := range []string{fcTestID, fcTestID2} {
+		if err := d.Destroy(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := d.snapshotDir(name)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("snapshot restored from moments ago: %v", err)
+	}
+	// A day on, unused since: the next collection, here at a restart,
+	// removes it.
+	unused := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(dir, unused, unused); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot of a shape this host does not serve kept: %v", err)
+	}
+}
+
+// A build VMM owns its chroot, so before it exits it can leave a symlink to
+// a host directory where its output directory was. Its output is taken only
+// through the directories the driver opened before it started: no host file
+// is taken, and what is stored is what the VMM wrote.
+func TestFirecrackerSnapshotBuildOutputStaysInJail(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	first := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
+	// On the jails' filesystem, where a move from it would succeed.
+	outside := filepath.Join(cfg.Root, "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{fcSnapshotState, fcSnapshotMemory} {
+		if err := os.WriteFile(filepath.Join(outside, file), []byte("host file"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tampered := make(chan error, 1)
+	host.mu.Lock()
+	host.onSnapshot = func(chroot string) {
+		out := filepath.Join(chroot, fcSnapshotJail)
+		tampered <- errors.Join(os.Rename(out, out+".moved"), os.Symlink(outside, out))
+	}
+	host.mu.Unlock()
+	if _, err := d.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(t, d)
+	select {
+	case err := <-tampered:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("the build VM wrote no snapshot")
+	}
+	for _, file := range []string{fcSnapshotState, fcSnapshotMemory} {
+		if data, err := os.ReadFile(filepath.Join(outside, file)); err != nil || string(data) != "host file" {
+			t.Fatalf("host file %s taken: %q %v", file, data, err)
+		}
+	}
+	name := snapshotName(t, d, first)
+	if data, err := os.ReadFile(filepath.Join(d.snapshotDir(name), fcSnapshotMemory)); err != nil || string(data) != "memory of "+fcBuildPrefix+name {
+		t.Fatalf("stored memory = %q, %v", data, err)
 	}
 }

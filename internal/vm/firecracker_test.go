@@ -100,6 +100,9 @@ type fakeFCHost struct {
 	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
 	// mid-teardown.
 	onKill func(name string)
+	// onSnapshot runs, outside h.mu, once a VMM has written a snapshot, with
+	// its chroot: what a compromised VMM does there before it exits.
+	onSnapshot func(chroot string)
 	// dropAccept installs the host table without its accept rules, as an
 	// nft that silently loses one would.
 	dropAccept bool
@@ -161,6 +164,15 @@ func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	defer h.mu.Unlock()
 	h.owners[path] = uid
 	return nil
+}
+
+// ChownAt records the change under the path of dir's open directory.
+func (h *fakeFCHost) ChownAt(dir int, name string, uid, gid int) error {
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir))
+	if err != nil {
+		return err
+	}
+	return h.Chown(filepath.Join(path, name), uid, gid)
 }
 func (h *fakeFCHost) owner(path string) (int, bool) {
 	h.mu.Lock()

@@ -11,7 +11,7 @@ Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
 | --- | --- |
 | VM | One Firecracker microVM per sandbox, started by the jailer with `--new-pid-ns` |
 | Host identity | Slot *i* runs its VMM as UID/GID `fc-uid-base + i` and its NAT as `fc-uid-base + 1000 + i`. Each VM gets its own chroot under `<fc-root>/jail/firecracker/<id>/root` |
-| Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (home disk size) and `nofile=256` |
+| Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (the larger of the home disk and an attached volume; for a [template snapshot](#template-snapshots--fc-snapshots) build, at least the guest RAM it writes) and `nofile=256` |
 | Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk besides an attached [volume](#volumes). The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
 | Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
 | Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
@@ -393,6 +393,13 @@ the same image and shape (`#46`):
   agent (and envd) answer, flushes its disks, is paused and written as a
   full Firecracker snapshot. The files go to `<fc-root>/snapshots/<key>/`
   (`vmstate`, `mem`, `home.ext4`, `meta.json`), root-owned and read-only.
+  The image and kernel linked into the build jail must be the files the key
+  was computed from (a file replaced in between fails the build), and so
+  must the Firecracker binary the jailer copied. The build VMM owns its
+  chroot, so its files are taken only through the chroot and output
+  directories the daemon opened before it started, never through a path
+  resolved again or a symlink; each must be a regular single-link file
+  owned by the build UID.
   One build runs at a time, beside the create that started it; it is
   skipped while it would take the host below `-fc-memory-floor-mib`. A
   failed build is retried after 15 minutes at the earliest.
@@ -400,8 +407,9 @@ the same image and shape (`#46`):
   namespace and UIDs exactly as a cold boot does. The jail holds hard links
   of `vmstate` and `mem` (so clones share one page cache for the snapshot's
   memory, mapped private: a clone's writes stay its own) and a sparse copy
-  of the template's home disk. Firecracker loads the snapshot through its
-  API socket and resumes the guest.
+  of the template's home disk. The image linked into the jail must be the
+  one the snapshot was built from. Firecracker loads the snapshot through
+  its API socket and resumes the guest.
 - **Home disk.** A clone's home disk is a copy of the template's, not a
   blank disk: the guest agent formats and mounts it during boot, so the
   snapshot's memory depends on it. It holds nothing per sandbox: envd
@@ -428,7 +436,9 @@ the same image and shape (`#46`):
   VM uses and that this daemon would no longer restore (changed
   Firecracker, kernel, image or configuration, or `-fc-snapshots` off) is
   deleted when a VM ends, after a build and at startup, together with
-  anything an interrupted build left.
+  anything an interrupted build left. A snapshot of another shape than
+  `-cpus`/`-memory-mib` (say, from before they changed) is deleted too once
+  no VM uses it and none was restored from it for an hour.
 
 An image needs the guest agent of this release (`OpRestore`); rebuild it
 with the scripts below. Older images keep cold booting.

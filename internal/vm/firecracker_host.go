@@ -137,6 +137,9 @@ func (h *linuxFCHost) FreeBytes(path string) (uint64, error) {
 }
 
 func (h *linuxFCHost) Chown(path string, uid, gid int) error { return os.Lchown(path, uid, gid) }
+func (h *linuxFCHost) ChownAt(dir int, name string, uid, gid int) error {
+	return unix.Fchownat(dir, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
+}
 
 // FormatVolume makes an ext4 filesystem in the volume image file. mkfs works
 // on the file itself; nothing is mounted on the host. The root directory

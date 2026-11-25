@@ -57,7 +57,16 @@ import (
 // Lifetime. A clone's record names its snapshot. A snapshot that no longer
 // matches this host (after an upgrade) or was retired is deleted once no
 // record names it, and each clone holds hard links of the files it maps, so
-// even a deleted snapshot stays readable until its last clone is gone.
+// even a deleted snapshot stays readable until its last clone is gone. A
+// current snapshot of a shape this host does not serve (FirecrackerConfig
+// CPUs and MemoryMiB) is deleted too, once no record names it and none was
+// built or restored from for fcSnapshotIdle.
+//
+// Trust. Each key names files by path, which are resolved again to link
+// them into a jail: the links are checked to be the files the key was
+// computed from (checkLinked). A build VMM owns its chroot and may replace
+// anything in it, so its output is taken only through directories opened
+// before it started (takeVMMFile).
 
 const (
 	fcSnapshotFormat = 1
@@ -85,6 +94,9 @@ const (
 	fcRestoreTime = 10 * time.Second
 	// fcRestoreFaults consecutive rejected loads retire a snapshot.
 	fcRestoreFaults = 3
+	// fcSnapshotIdle is how long a snapshot of a shape this host does not
+	// serve is kept, unused, after it was built or last restored.
+	fcSnapshotIdle = time.Hour
 )
 
 var (
@@ -163,8 +175,10 @@ type fcSnapshots struct {
 	// faults counts its consecutive rejected loads.
 	failed map[string]time.Time
 	faults map[string]int
-	// gc serializes collections.
-	gc sync.Mutex
+	// gc serializes collections; sweep is the next one, due when a
+	// snapshot kept for fcSnapshotIdle expires.
+	gc    sync.Mutex
+	sweep *time.Timer
 }
 
 func (d *FirecrackerDriver) snapshotsDir() string { return filepath.Join(d.cfg.Root, "snapshots") }
@@ -190,7 +204,14 @@ func fileIdentity(path string) (string, error) {
 
 // fileDigest is path's SHA-256, hashed again only when its identity changed.
 func (d *FirecrackerDriver) fileDigest(path string) (string, error) {
-	identity, err := fileIdentity(path)
+	return d.linkDigest(path, path)
+}
+
+// linkDigest is the SHA-256 of link, a hard link of path (or path itself),
+// cached as path's: one digest per path, of the inode it was computed for,
+// so a link of the file the cache holds is not read again.
+func (d *FirecrackerDriver) linkDigest(path, link string) (string, error) {
+	identity, err := fileIdentity(link)
 	if err != nil {
 		return "", err
 	}
@@ -201,7 +222,7 @@ func (d *FirecrackerDriver) fileDigest(path string) (string, error) {
 	if cached[0] == identity {
 		return cached[1], nil
 	}
-	file, err := os.Open(path)
+	file, err := os.Open(link)
 	if err != nil {
 		return "", err
 	}
@@ -210,8 +231,8 @@ func (d *FirecrackerDriver) fileDigest(path string) (string, error) {
 	if _, err := io.Copy(hash, file); err != nil {
 		return "", err
 	}
-	if again, err := fileIdentity(path); err != nil || again != identity {
-		return "", errors.Join(fmt.Errorf("%s changed while it was hashed", path), err)
+	if again, err := fileIdentity(link); err != nil || again != identity {
+		return "", errors.Join(fmt.Errorf("%s changed while it was hashed", link), err)
 	}
 	sum := hex.EncodeToString(hash.Sum(nil))
 	s.mu.Lock()
@@ -320,6 +341,33 @@ func (d *FirecrackerDriver) checkSnapshot(name string, key fcSnapshotKey) error 
 	return nil
 }
 
+// checkLinked requires the image linked into chroot, and with kernel the
+// kernel, to be the files key was computed from. Linking resolved their
+// paths again, so a file replaced in between would otherwise boot under the
+// key of the one it replaced, or a snapshot would resume on another root
+// disk. The links are the inodes the VMM opens: the image's identity is
+// checked, and the kernel's digest (one hash per kernel, see linkDigest).
+func (d *FirecrackerDriver) checkLinked(chroot string, key fcSnapshotKey, kernel bool) error {
+	image, err := fileIdentity(filepath.Join(chroot, "rootfs.ext4"))
+	if err != nil {
+		return err
+	}
+	if image != key.ImageID {
+		return fmt.Errorf("image %s is not the one its template snapshot key was computed from: it was replaced", key.Image)
+	}
+	if !kernel {
+		return nil
+	}
+	sum, err := d.linkDigest(d.cfg.Kernel, filepath.Join(chroot, "vmlinux"))
+	if err != nil {
+		return err
+	}
+	if sum != key.KernelSHA256 {
+		return fmt.Errorf("guest kernel %s is not the one its template snapshot key was computed from: it was replaced", d.cfg.Kernel)
+	}
+	return nil
+}
+
 // createFromSnapshot starts spec by restoring its template snapshot. It
 // reports false when the VM must cold boot instead, after logging why and
 // removing every trace of the attempt; true with the outcome otherwise. A
@@ -343,6 +391,11 @@ func (d *FirecrackerDriver) createFromSnapshot(ctx context.Context, spec Spec, m
 		}
 		d.buildSnapshot(spec, key, name)
 		return coldBoot("%v", err)
+	}
+	// A restore is a use: its time is the directory's (unusedSnapshot).
+	now := time.Now()
+	if err := os.Chtimes(d.snapshotDir(name), now, now); err != nil {
+		log.Printf("firecracker: template snapshot %s: %v", name, err)
 	}
 	meta.Snapshot = name
 	if err := d.writeRecord(spec, &meta); err != nil {
@@ -396,7 +449,7 @@ func (d *FirecrackerDriver) restore(ctx context.Context, spec Spec, meta fcMeta,
 	if err := d.prepareRestoreJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, "--api-sock", fcAPIPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, d.diskLimitMiB(meta), "--api-sock", fcAPIPath); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, fcRestoreTime)
@@ -422,9 +475,10 @@ func (d *FirecrackerDriver) restore(ctx context.Context, spec Spec, meta fcMeta,
 }
 
 // prepareRestoreJail lays out a clone's chroot: a hard link of the image
-// (the root drive the snapshot names), a sparse copy of the template's home
-// disk owned by the VMM UID, the socket directory, and hard links of the VM
-// state and memory file, root-owned and read-only. The kernel and the VM
+// (the root drive the snapshot names), which must be the very image the
+// snapshot was built from, a sparse copy of the template's home disk owned
+// by the VMM UID, the socket directory, and hard links of the VM state and
+// memory file, root-owned and read-only. The kernel and the VM
 // configuration are not needed: the guest is already booted.
 func (d *FirecrackerDriver) prepareRestoreJail(spec Spec, meta fcMeta) error {
 	root, err := d.makeJail(spec.ID)
@@ -435,6 +489,13 @@ func (d *FirecrackerDriver) prepareRestoreJail(spec Spec, meta fcMeta) error {
 		return fmt.Errorf("link image into jail (same filesystem required): %w", err)
 	}
 	store := d.snapshotDir(meta.Snapshot)
+	built, err := readSnapshotMeta(store)
+	if err != nil {
+		return fmt.Errorf("template snapshot %s: %w", meta.Snapshot, err)
+	}
+	if err := d.checkLinked(root, built.Key, false); err != nil {
+		return err
+	}
 	home := filepath.Join(root, "home.ext4")
 	if err := copySparse(filepath.Join(store, fcSnapshotHome), home, 0o600); err != nil {
 		return fmt.Errorf("copy the template home disk: %w", err)
@@ -661,7 +722,8 @@ func (d *FirecrackerDriver) buildSnapshot(spec Spec, key fcSnapshotKey, name str
 }
 
 // stopBuilds stops a running build, waits until it has removed its VM, and
-// removes what an interrupted build left.
+// removes what an interrupted build left. The next collection is no longer
+// due: whatever starts the driver again collects (Arm).
 func (d *FirecrackerDriver) stopBuilds(ctx context.Context) error {
 	s := &d.snap
 	s.mu.Lock()
@@ -677,6 +739,13 @@ func (d *FirecrackerDriver) stopBuilds(ctx context.Context) error {
 			return fmt.Errorf("template snapshot build did not stop: %w", ctx.Err())
 		}
 	}
+	// After the build: it collects as it ends.
+	s.mu.Lock()
+	if s.sweep != nil {
+		s.sweep.Stop()
+		s.sweep = nil
+	}
+	s.mu.Unlock()
 	return d.removeBuilds(ctx)
 }
 
@@ -791,16 +860,41 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
-	out := filepath.Join(d.chroot(id), fcSnapshotJail)
+	root := d.chroot(id)
+	if err := d.checkLinked(root, key, true); err != nil {
+		return err
+	}
+	out := filepath.Join(root, fcSnapshotJail)
 	if err := mkdirExact(out, 0o700); err != nil {
 		return err
 	}
 	if err := d.host.Chown(out, meta.VMMUID, meta.VMMUID); err != nil {
 		return err
 	}
+	// The VMM owns its chroot and can replace anything in it: its output is
+	// taken only through the chroot and output directories opened now,
+	// while the jail is still the daemon's alone.
+	const dirFlags = unix.O_PATH | unix.O_DIRECTORY | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	chrootDir, err := unix.Open(root, dirFlags, 0)
+	if err != nil {
+		return fmt.Errorf("open the build jail: %w", err)
+	}
+	defer unix.Close(chrootDir)
+	outDir, err := unix.Openat(chrootDir, filepath.Base(fcSnapshotJail), dirFlags, 0)
+	if err != nil {
+		return fmt.Errorf("open the build jail: %w", err)
+	}
+	defer unix.Close(outDir)
 	startup := &fcStartup{}
-	if err := d.launch(ctx, spec, meta, startup, "--api-sock", fcAPIPath, "--config-file", fcConfigPath); err != nil {
+	// Its file size limit covers the snapshot of its guest memory too.
+	fsizeMiB := max(d.diskLimitMiB(meta), meta.MemoryMiB)
+	if err := d.launch(ctx, spec, meta, startup, fsizeMiB, "--api-sock", fcAPIPath, "--config-file", fcConfigPath); err != nil {
 		return err
+	}
+	// The jailer copied the Firecracker binary as it started the VMM: the
+	// one key was computed from, unless that file has changed since.
+	if sum, err := d.fileDigest(d.cfg.Firecracker); err != nil || sum != key.FirecrackerSHA256 {
+		return errors.Join(fmt.Errorf("Firecracker binary %s was replaced as the template build started", d.cfg.Firecracker), err)
 	}
 	features, err := d.waitAgent(ctx, spec, meta.VMMUID)
 	if err != nil {
@@ -837,7 +931,7 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.host.KillCgroup(ctx, id); err != nil {
 		return err
 	}
-	return d.storeSnapshot(spec, key, name)
+	return d.storeSnapshot(spec, key, name, chrootDir, outDir)
 }
 
 // waitEnvd waits until envd accepts connections in build VM id: a snapshot
@@ -860,10 +954,10 @@ func (d *FirecrackerDriver) waitEnvd(ctx context.Context, id string, uid int) er
 
 // storeSnapshot moves the stopped build VM's snapshot and home disk into
 // Root/snapshots/<name>, root-owned and read-only, beside its meta.json.
-// The VMM wrote the files as the build UID inside its jail: each must be a
-// regular file with one link, so nothing else on the host is ever taken.
-func (d *FirecrackerDriver) storeSnapshot(spec Spec, key fcSnapshotKey, name string) error {
-	root := d.chroot(spec.ID)
+// chroot and out are the build jail's chroot and output directories, opened
+// before the VMM started. The VMM wrote the files there as the build UID,
+// which owns out; they are taken through those directories (takeVMMFile).
+func (d *FirecrackerDriver) storeSnapshot(spec Spec, key fcSnapshotKey, name string, chroot, out int) error {
 	base := d.snapshotsDir()
 	if err := mkdirExact(base, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
 		return err
@@ -875,28 +969,26 @@ func (d *FirecrackerDriver) storeSnapshot(spec Spec, key fcSnapshotKey, name str
 	if err := mkdirExact(tmp, 0o700); err != nil {
 		return err
 	}
+	to, err := unix.Open(tmp, unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(to)
+	var build unix.Stat_t
+	if err := unix.Fstat(out, &build); err != nil {
+		return err
+	}
 	for _, file := range []struct {
+		dir      int
 		from, to string
-		mode     os.FileMode
+		mode     uint32
 	}{
-		{filepath.Join(root, fcSnapshotJail, fcSnapshotState), fcSnapshotState, 0o444},
-		{filepath.Join(root, fcSnapshotJail, fcSnapshotMemory), fcSnapshotMemory, 0o444},
-		{filepath.Join(root, "home.ext4"), fcSnapshotHome, 0o400},
+		{out, fcSnapshotState, fcSnapshotState, 0o444},
+		{out, fcSnapshotMemory, fcSnapshotMemory, 0o444},
+		{chroot, "home.ext4", fcSnapshotHome, 0o400},
 	} {
-		info, err := os.Lstat(file.from)
-		if err != nil {
-			return err
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !info.Mode().IsRegular() || !ok || stat.Nlink != 1 {
-			return fmt.Errorf("template snapshot file %s is not a regular file of the build VM", file.to)
-		}
-		to := filepath.Join(tmp, file.to)
-		if err := os.Rename(file.from, to); err != nil {
-			return err
-		}
-		if err := errors.Join(d.host.Chown(to, 0, 0), os.Chmod(to, file.mode)); err != nil {
-			return err
+		if err := d.takeVMMFile(file.dir, file.from, build.Uid, to, file.to, file.mode); err != nil {
+			return fmt.Errorf("template snapshot file %s: %w", file.to, err)
 		}
 	}
 	meta, err := json.Marshal(fcSnapshotMeta{Key: key, CPUs: spec.CPUs, MemoryMiB: spec.MemoryMiB,
@@ -914,6 +1006,39 @@ func (d *FirecrackerDriver) storeSnapshot(spec Spec, key fcSnapshotKey, name str
 		return err
 	}
 	return fcSyncPath(base)
+}
+
+// takeVMMFile moves the file name of directory dir, written by a VMM that
+// ran as owner and has stopped, into directory to as as, root's with mode.
+// No path is resolved: dir is an open directory, name is opened without
+// following a symlink, and the move and the change of owner and mode are
+// relative to the open directories. The file must be a regular file of
+// owner with one link, so no other file on the host is ever taken, and the
+// entry moved must be that file.
+func (d *FirecrackerDriver) takeVMMFile(dir int, name string, owner uint32, to int, as string, mode uint32) error {
+	fd, err := unix.Openat(dir, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	var file unix.Stat_t
+	if err := unix.Fstat(fd, &file); err != nil {
+		return err
+	}
+	if file.Mode&unix.S_IFMT != unix.S_IFREG || file.Nlink != 1 || file.Uid != owner {
+		return fmt.Errorf("not a regular single-link file of the build VM (mode %#o, %d links, owner %d)", file.Mode, file.Nlink, file.Uid)
+	}
+	if err := unix.Renameat(dir, name, to, as); err != nil {
+		return err
+	}
+	var moved unix.Stat_t
+	if err := unix.Fstatat(to, as, &moved, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if moved.Dev != file.Dev || moved.Ino != file.Ino {
+		return errors.New("replaced while it was moved")
+	}
+	return errors.Join(d.host.ChownAt(to, as, 0, 0), unix.Fchmodat(to, as, mode, 0))
 }
 
 // retireSnapshot sets snapshot name aside for collection and builds it
@@ -940,7 +1065,9 @@ func (d *FirecrackerDriver) retireSnapshot(name string) {
 // that this host will not restore again: one whose key differs from what it
 // would be built with now (Firecracker, kernel, image, host or VM
 // configuration changed, or snapshots are off), a retired one, and what an
-// interrupted build left. Anything else in the directory is left alone.
+// interrupted build left. A current snapshot of a shape this host does not
+// serve goes too once unused for fcSnapshotIdle, when the next collection
+// is due. Anything else in the directory is left alone.
 func (d *FirecrackerDriver) collectSnapshots() {
 	s := &d.snap
 	s.gc.Lock()
@@ -966,50 +1093,92 @@ func (d *FirecrackerDriver) collectSnapshots() {
 	s.mu.Lock()
 	building := s.building
 	s.mu.Unlock()
+	now := time.Now()
+	var next time.Duration // until the first kept snapshot expires
 	for _, entry := range names {
 		base, suffix, _ := strings.Cut(entry, ".")
 		if !fcSnapshotName.MatchString(base) {
 			continue
 		}
-		var remove bool
+		var why string
 		switch {
 		case suffix == "tmp":
-			remove = base != building
+			if base != building {
+				why = "an interrupted build left it"
+			}
 		case strings.HasPrefix(suffix, "retired-"):
-			remove = refs[base] == 0
-		case suffix == "":
-			remove = refs[base] == 0 && d.snapshotStale(base)
+			if refs[base] == 0 {
+				why = "it was retired and no VM uses it"
+			}
+		case suffix == "" && refs[base] == 0:
+			var keep time.Duration
+			why, keep = d.unusedSnapshot(base, now)
+			if keep > 0 && (next == 0 || keep < next) {
+				next = keep
+			}
 		}
-		if !remove {
+		if why == "" {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(d.snapshotsDir(), entry)); err != nil {
 			log.Printf("firecracker: remove template snapshot %s: %v", entry, err)
 		} else {
-			log.Printf("firecracker: template snapshot %s removed: no VM uses it and none will", entry)
+			log.Printf("firecracker: template snapshot %s removed: %s", entry, why)
 		}
 	}
+	s.mu.Lock()
+	if s.sweep != nil {
+		s.sweep.Stop()
+		s.sweep = nil
+	}
+	if next > 0 {
+		s.sweep = time.AfterFunc(next, d.collectSnapshots)
+	}
+	s.mu.Unlock()
 }
 
-// snapshotStale reports whether stored snapshot name would not be restored
-// by this driver now. A key that cannot be computed for a passing reason
-// (the version check failed) keeps the snapshot until the next collection.
-func (d *FirecrackerDriver) snapshotStale(name string) bool {
+// unusedSnapshot decides about stored snapshot name, which no VM uses: it is
+// removed (why says why) when this driver would not restore it now, or when
+// its shape is not the one this host serves and it was neither built nor
+// restored from for fcSnapshotIdle; it is otherwise kept, such a snapshot
+// for keep more. A key that cannot be computed for a passing reason (the
+// version check failed) keeps the snapshot until the next collection.
+func (d *FirecrackerDriver) unusedSnapshot(name string, now time.Time) (why string, keep time.Duration) {
+	const stale = "no VM uses it and none will"
 	if !d.cfg.Snapshots {
-		return true
+		return stale, 0
 	}
-	meta, err := readSnapshotMeta(d.snapshotDir(name))
+	dir := d.snapshotDir(name)
+	meta, err := readSnapshotMeta(dir)
 	if err != nil {
-		return true
+		return stale, 0
 	}
 	if _, ok := d.images[meta.Key.Image]; !ok {
-		return true
+		return stale, 0
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	key, err := d.snapshotKey(ctx, meta.spec())
 	if err != nil {
-		return errors.Is(err, fs.ErrNotExist)
+		if errors.Is(err, fs.ErrNotExist) {
+			return stale, 0
+		}
+		return "", 0
 	}
-	return key != meta.Key || key.name() != name
+	if key != meta.Key || key.name() != name {
+		return stale, 0
+	}
+	if meta.CPUs == d.cfg.CPUs && meta.MemoryMiB == d.cfg.MemoryMiB {
+		return "", 0
+	}
+	// The directory's time is its last use: the build, or a restore.
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", 0
+	}
+	idle := max(now.Sub(info.ModTime()), 0)
+	if idle >= fcSnapshotIdle {
+		return fmt.Sprintf("this host serves another VM shape, and no VM used it for %v", fcSnapshotIdle), 0
+	}
+	return "", fcSnapshotIdle - idle
 }

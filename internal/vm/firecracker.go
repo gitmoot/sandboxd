@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -121,6 +122,13 @@ type FirecrackerConfig struct {
 	// whose snapshot is missing, outdated or rejected cold boots, and the
 	// reason is logged. Off by default: every VM then boots as before.
 	Snapshots bool
+	// CPUs and MemoryMiB are the VM shape this host serves (sandboxd's
+	// -cpus and -memory-mib). Template snapshots of that shape are kept
+	// while they stay current; a snapshot of any other shape, such as one
+	// left by an earlier configuration, is collected once no VM uses it and
+	// none was restored from it for fcSnapshotIdle. Zero serves no shape in
+	// particular, so every snapshot is kept only that long.
+	CPUs, MemoryMiB int
 	// MemoryFloorMiB, when nonzero, refuses a new VM (ErrMemoryPressure)
 	// while the host's available memory (MemAvailable) is below it:
 	// capacity then follows what VMs really use, not their configured RAM.
@@ -193,6 +201,9 @@ type fcHost interface {
 	TrustedFile(path string, executable bool) error
 	FreeBytes(path string) (uint64, error)
 	Chown(path string, uid, gid int) error
+	// ChownAt changes the owner of name in the open directory dir, without
+	// following a symlink or resolving anything above dir.
+	ChownAt(dir int, name string, uid, gid int) error
 	// FormatVolume runs the trusted mkfs binary on the volume image file
 	// path; nothing is mounted on the host.
 	FormatVolume(ctx context.Context, mkfs, path string) error
@@ -329,8 +340,13 @@ func newFirecrackerDriver(cfg FirecrackerConfig, host fcHost) (*FirecrackerDrive
 	if cfg.HomeDiskMiB < 64 || cfg.HomeDiskMiB > 1<<20 || cfg.DiskFloorMiB < 0 {
 		return nil, errors.New("invalid Firecracker home disk size or disk floor")
 	}
-	if cfg.MemoryFloorMiB < 0 || cfg.MemoryFloorMiB > fcMaxMemoryMiB {
+	// The host floor is not a guest size: any amount of host memory that
+	// counts in bytes is valid.
+	if cfg.MemoryFloorMiB < 0 || int64(cfg.MemoryFloorMiB) > math.MaxInt64>>20 {
 		return nil, errors.New("invalid Firecracker memory floor")
+	}
+	if cfg.Snapshots && (cfg.CPUs != 0 || cfg.MemoryMiB != 0) && !fcValidShape(cfg.CPUs, cfg.MemoryMiB) {
+		return nil, errors.New("Firecracker VM shape out of range")
 	}
 	if cfg.BootTimeout <= 0 {
 		return nil, errors.New("Firecracker boot timeout must be positive")
@@ -927,15 +943,16 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 // from its configuration file.
 var fcBootArgs = []string{"--no-api", "--config-file", fcConfigPath}
 
-// jailerArgs runs the VMM with vmm as its own arguments. A VMM with an API
-// socket can write a snapshot of its guest memory, so its file size limit
-// covers that too.
-func (d *FirecrackerDriver) jailerArgs(meta fcMeta, vmm ...string) []string {
-	// The VMM's file size limit must cover every disk it writes.
-	fsizeMiB := max(d.cfg.HomeDiskMiB, meta.VolumeMiB)
-	if slices.Contains(vmm, "--api-sock") {
-		fsizeMiB = max(fsizeMiB, meta.MemoryMiB)
-	}
+// diskLimitMiB is the file size limit of a VMM that writes only its disks:
+// the home disk and any attached volume.
+func (d *FirecrackerDriver) diskLimitMiB(meta fcMeta) int {
+	return max(d.cfg.HomeDiskMiB, meta.VolumeMiB)
+}
+
+// jailerArgs runs the VMM with vmm as its own arguments and fsizeMiB as its
+// file size limit, which must cover every file it writes: diskLimitMiB, and
+// for a template build the snapshot of its guest memory as well.
+func (d *FirecrackerDriver) jailerArgs(meta fcMeta, fsizeMiB int, vmm ...string) []string {
 	args := []string{
 		"--id", meta.ID,
 		"--exec-file", d.cfg.Firecracker,
@@ -1061,7 +1078,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	if slot < 0 {
 		return Instance{}, fmt.Errorf("Firecracker slot %q is not configured", spec.Network)
 	}
-	if spec.CPUs < 1 || spec.CPUs > fcMaxCPUs || spec.MemoryMiB < fcMinMemoryMiB || spec.MemoryMiB > fcMaxMemoryMiB {
+	if !fcValidShape(spec.CPUs, spec.MemoryMiB) {
 		return Instance{}, errors.New("Firecracker VM shape out of range")
 	}
 	// The hardened guest init exists only in the e2b path, and its root is
@@ -1133,11 +1150,16 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 	return Instance{ID: spec.ID, Running: true, Network: spec.Network}, nil
 }
 
+// fcValidShape reports whether a VM can have cpus vCPUs and memoryMiB of RAM.
+func fcValidShape(cpus, memoryMiB int) bool {
+	return cpus >= 1 && cpus <= fcMaxCPUs && memoryMiB >= fcMinMemoryMiB && memoryMiB <= fcMaxMemoryMiB
+}
+
 func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup) error {
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, d.diskLimitMiB(meta), fcBootArgs...); err != nil {
 		return err
 	}
 	if _, err := d.waitAgent(ctx, spec, meta.VMMUID); err != nil {
@@ -1147,8 +1169,9 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 }
 
 // launch creates the VM's network and runs its VMM, with vmm as the VMM's
-// own arguments, in the prepared jail. An envd guest's console is kept.
-func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, vmm ...string) error {
+// own arguments and fsizeMiB as its file size limit (jailerArgs), in the
+// prepared jail. An envd guest's console is kept.
+func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, fsizeMiB int, vmm ...string) error {
 	ruleset, marker := d.netnsRuleset(meta.Egress)
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: d.names.netnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
@@ -1161,7 +1184,7 @@ func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, 
 	if err != nil {
 		return err
 	}
-	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, vmm...), console)
+	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, fsizeMiB, vmm...), console)
 	_ = console.Close() // the VMM holds its own descriptor
 	if err != nil {
 		return err

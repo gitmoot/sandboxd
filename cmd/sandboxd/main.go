@@ -236,7 +236,7 @@ func run(ctx context.Context, args []string) (runErr error) {
 	case "firecracker":
 		// Guests that survived a daemon kill keep running; the control
 		// plane's reconciliation keeps those its ledger still owns.
-		firecracker, shutdown, err := startFirecracker(ctx, fc, images, slotNames)
+		firecracker, shutdown, err := startFirecracker(ctx, fc, images, slotNames, *cpus, *memory)
 		if err != nil {
 			return err
 		}
