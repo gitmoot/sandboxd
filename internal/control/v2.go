@@ -113,11 +113,15 @@ func absent(raw json.RawMessage) bool {
 
 // unsupported names the first requested option sandboxd cannot honour yet.
 // volumeMounts are honoured only with volumes configured; internet access
-// and network egress only with egress policies (egress.go validates them).
-func (request createV2Request) unsupported(volumes, egress bool) string {
+// and network egress only with egress policies (egress.go validates them);
+// autoPause only with a pausing local driver, and only keeping memory.
+func (request createV2Request) unsupported(volumes, egress, pauser bool) string {
+	autoPause := request.AutoPause != nil && *request.AutoPause
 	switch {
-	case request.AutoPause != nil && *request.AutoPause:
+	case autoPause && !pauser:
 		return "autoPause (pause and resume) is not supported"
+	case autoPause && string(request.AutoPauseMemory) == "false":
+		return refusePauseFilesystem
 	case !absent(request.AutoResume) && string(request.AutoResume) != `{"enabled":false}`:
 		return "autoResume is not supported"
 	case request.Secure != nil && !*request.Secure:
@@ -153,7 +157,7 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, ProfileE2B, http.StatusBadRequest, "invalid sandbox request body")
 		return
 	}
-	if reason := request.unsupported(s.volumes != nil, s.egress != nil); reason != "" {
+	if reason := request.unsupported(s.volumes != nil, s.egress != nil, s.pauser != nil); reason != "" {
 		s.refuse(w, reason)
 		return
 	}
@@ -213,10 +217,11 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 	id := "sandboxd-" + idBytes
 	hash := sha256.Sum256([]byte(s.envdToken(id)))
 	started := time.Now().UTC()
+	autoPause := request.AutoPause != nil && *request.AutoPause
 	row := store.Row{ID: id, TokenHash: hash[:], Metadata: string(encoded), JobID: fence.job,
 		TemplateID: template.ID, Profile: string(ProfileE2B), Attempt: fence.attempt, Generation: fence.generation,
-		Fence: metadata["daemon_fencing_token"], Started: started, Ends: started.Add(ttl)}
-	if err := s.launch(r.Context(), &row, placement{volume: mount, egress: egress, hardened: template.Hardened}); err != nil {
+		Fence: metadata["daemon_fencing_token"], AutoPause: autoPause, Started: started, Ends: started.Add(ttl)}
+	if err := s.launch(r.Context(), &row, placement{volume: mount, egress: egress, hardened: template.Hardened, autoPause: autoPause}); err != nil {
 		var refusal *refusal
 		if errors.As(err, &refusal) {
 			s.fail(w, ProfileE2B, refusal.status, refusal.message)
@@ -252,12 +257,13 @@ func (s *Service) createV2(w http.ResponseWriter, r *http.Request) {
 
 type connectRequest struct {
 	Timeout *int64 `json:"timeout"`
-	// Memory chooses how a paused sandbox resumes; nothing is ever paused.
+	// Memory chooses how a paused sandbox resumes: only with its memory.
 	Memory json.RawMessage `json:"memory"`
 }
 
 // connect returns a running e2b sandbox's envd token again and extends its
-// lifetime to at least timeout seconds from now; it never shortens it.
+// lifetime to at least timeout seconds from now; it never shortens it. A
+// paused sandbox is resumed for timeout seconds (201).
 func (s *Service) connect(w http.ResponseWriter, r *http.Request, id string) {
 	var request connectRequest
 	if err := decode(w, r, &request); !errors.Is(err, io.EOF) {
@@ -272,13 +278,36 @@ func (s *Service) connect(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 	}
-	row, m, err := s.live(r.Context(), id)
+	row, m, err := s.present(r.Context(), id)
 	if err != nil {
 		s.fail(w, ProfileE2B, statusFor(err), fmt.Sprintf("sandbox %q unavailable", id))
 		return
 	}
 	if profile := rowProfile(row.Profile); profile != ProfileE2B {
 		s.fail(w, ProfileE2B, http.StatusConflict, fmt.Sprintf("sandbox %q uses the %s profile, which has no connect", id, profile))
+		return
+	}
+	switch row.State {
+	case "paused":
+		if s.pauser == nil {
+			s.refuse(w, refusePause)
+			return
+		}
+		if string(request.Memory) == "false" {
+			s.refuse(w, refusePauseFilesystem)
+			return
+		}
+		if !m.local {
+			s.refuse(w, refusePauseRemote)
+			return
+		}
+		if request.Timeout == nil {
+			ttl, _ = s.ttl(min(int64(defaultTimeout), int64(s.cfg.MaxTTL/time.Second)))
+		}
+		s.resumeSandbox(w, r, id, ttl, nil)
+		return
+	case "pausing", "resuming":
+		s.fail(w, ProfileE2B, statusFor(errPaused), fmt.Sprintf("sandbox %q is being paused or resumed", id))
 		return
 	}
 	if request.Timeout != nil {
@@ -360,6 +389,7 @@ func (s *Service) metricsE2B(w http.ResponseWriter, r *http.Request, row store.R
 type listFilter struct {
 	metadata     []metadataPair
 	running      bool // the state filter admits running sandboxes
+	paused       bool // the state filter admits paused sandboxes
 	template     string
 	startedAfter time.Time
 	order        string
@@ -393,7 +423,8 @@ func encodingForms(value string) []string {
 }
 
 func parseListFilter(query url.Values, templates *registry) (listFilter, error) {
-	filter := listFilter{running: true}
+	// No state filter lists running and paused sandboxes alike.
+	filter := listFilter{running: true, paused: true}
 	if raw, ok, err := single(query, "metadata"); err != nil {
 		return filter, err
 	} else if ok {
@@ -409,13 +440,14 @@ func parseListFilter(query url.Values, templates *registry) (listFilter, error) 
 		}
 	}
 	if values, ok := query["state"]; ok {
-		filter.running = false
+		filter.running, filter.paused = false, false
 		for _, value := range values {
 			for _, state := range strings.Split(value, ",") {
 				switch strings.TrimSpace(state) {
 				case "running":
 					filter.running = true
 				case "paused":
+					filter.paused = true
 				default:
 					return filter, fmt.Errorf("invalid state filter %q", state)
 				}
@@ -449,10 +481,14 @@ func parseListFilter(query url.Values, templates *registry) (listFilter, error) 
 }
 
 // matches reports whether a row belongs to the filtered response, judging
-// only its ledger fields: every listed sandbox is running, so a strict row
-// that cannot be described is one the response may be missing.
+// only its ledger fields: every listed sandbox is running or paused, so a
+// strict row that cannot be described is one the response may be missing.
 func (f listFilter) matches(row store.Row) bool {
-	if !f.running || f.template != "" && row.TemplateID != f.template ||
+	admitted := f.running
+	if describedState(row.State) == "paused" {
+		admitted = f.paused
+	}
+	if !admitted || f.template != "" && row.TemplateID != f.template ||
 		!f.startedAfter.IsZero() && row.Started.Before(f.startedAfter) {
 		return false
 	}

@@ -51,8 +51,11 @@ type Row struct {
 	// Profile is the template profile the row was admitted under; "" marks a
 	// row created before profiles were recorded, all of them gitmoot-strict.
 	Profile string
-	Started time.Time
-	Ends    time.Time
+	// AutoPause pauses the sandbox at its end time instead of destroying it
+	// (E2B autoPause). While paused, Ends is when its retention lapses.
+	AutoPause bool
+	Started   time.Time
+	Ends      time.Time
 }
 
 type Store struct {
@@ -172,6 +175,7 @@ func migrateIdentity(ctx context.Context, db *sql.DB) error {
 		{"worker_id", "TEXT NOT NULL DEFAULT ''"}, {"slot", "TEXT NOT NULL DEFAULT ''"},
 		{"cpus", "INTEGER NOT NULL DEFAULT 0"}, {"memory_mib", "INTEGER NOT NULL DEFAULT 0"},
 		{"lease", "INTEGER NOT NULL DEFAULT 0"}, {"profile", "TEXT NOT NULL DEFAULT ''"},
+		{"auto_pause", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		if existing[column.name] {
 			continue
@@ -268,9 +272,9 @@ func (s *Store) Reserve(ctx context.Context, row Row, maxVMs int, slots []string
 	if slot == "" {
 		return "", ErrCapacity
 	}
-	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,started_ns,ends_ns)
-		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?,?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
-		row.TemplateID, row.Image, row.WorkerID, slot, row.CPUs, row.MemoryMiB, row.Lease, row.Profile, row.Started.UnixNano(), row.Ends.UnixNano())
+	_, err = conn.ExecContext(ctx, `INSERT INTO sandboxes(id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,auto_pause,started_ns,ends_ns)
+		VALUES(?,?,?,?,?,?,?,'reserved',?,?,?,?,?,?,?,?,?,?,?)`, row.ID, row.TokenHash, row.Metadata, row.JobID, row.Attempt, row.Generation, row.Fence,
+		row.TemplateID, row.Image, row.WorkerID, slot, row.CPUs, row.MemoryMiB, row.Lease, row.Profile, row.AutoPause, row.Started.UnixNano(), row.Ends.UnixNano())
 	if err != nil {
 		return "", err
 	}
@@ -284,7 +288,7 @@ func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	var row Row
 	var start, end int64
 	err := scanner.Scan(&row.ID, &row.TokenHash, &row.Metadata, &row.JobID, &row.Attempt, &row.Generation, &row.Fence, &row.State,
-		&row.TemplateID, &row.Image, &row.WorkerID, &row.Slot, &row.CPUs, &row.MemoryMiB, &row.Lease, &row.Profile, &start, &end)
+		&row.TemplateID, &row.Image, &row.WorkerID, &row.Slot, &row.CPUs, &row.MemoryMiB, &row.Lease, &row.Profile, &row.AutoPause, &start, &end)
 	if err == nil {
 		row.Started = time.Unix(0, start).UTC()
 		row.Ends = time.Unix(0, end).UTC()
@@ -292,7 +296,7 @@ func scanRow(scanner interface{ Scan(...any) error }) (Row, error) {
 	return row, err
 }
 
-const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,started_ns,ends_ns"
+const columns = "id,token_hash,metadata,job_id,attempt,generation,fence,state,template_id,image,worker_id,slot,cpus,memory_mib,lease,profile,auto_pause,started_ns,ends_ns"
 
 func (s *Store) Get(ctx context.Context, id string) (Row, error) {
 	return scanRow(s.db.QueryRowContext(ctx, "SELECT "+columns+" FROM sandboxes WHERE id=?", id))
@@ -419,10 +423,22 @@ func (s *Store) NextLease(ctx context.Context, workerID string, local bool, abov
 	return lease, err
 }
 
-// Adopt records that a running row was proven present under lease.
+// Adopt records that a running or paused row was proven present under lease.
 func (s *Store) Adopt(ctx context.Context, id string, lease int64) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE sandboxes SET lease=? WHERE id=? AND state='running'", lease, id)
+	_, err := s.db.ExecContext(ctx, "UPDATE sandboxes SET lease=? WHERE id=? AND state IN ('running','paused')", lease, id)
 	return err
+}
+
+// Transition moves row id from state from to state to with a new end time
+// and auto-pause choice, and reports whether the row was in state from.
+func (s *Store) Transition(ctx context.Context, id, from, to string, ends time.Time, autoPause bool) (bool, error) {
+	result, err := s.db.ExecContext(ctx, "UPDATE sandboxes SET state=?, ends_ns=?, auto_pause=? WHERE id=? AND state=?",
+		to, ends.UnixNano(), autoPause, id, from)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed == 1, err
 }
 
 // Extend sets a running row's end time, earlier or later (E2B set_timeout).

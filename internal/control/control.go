@@ -70,6 +70,10 @@ type Config struct {
 	// the local driver's per-sandbox egress policies; nil refuses both (501)
 	// as unsupported. A sandbox with a policy runs only on the local worker.
 	Egress vm.EgressPolicies
+	// PauseRetention is how long a paused sandbox is kept before it is
+	// destroyed; 0 means DefaultPauseRetention. Pause and resume are served
+	// only when the local driver can pause (vm.Pauser).
+	PauseRetention time.Duration
 }
 
 // Remote is one enrolled worker reached through its own transport.
@@ -111,6 +115,13 @@ type Service struct {
 	egress              vm.EgressPolicies
 	tunnels             tunnelLeases
 	volumeTransferSlots chan struct{}
+	// pauser is the local driver's pause and resume, nil when it has none:
+	// pause and resume are then refused (501).
+	pauser vm.Pauser
+	// autoPauses tracks the pauses reconciliation started at sandboxes' end
+	// times; Close waits for them. closing (guarded by mu) stops new ones.
+	autoPauses sync.WaitGroup
+	closing    bool
 }
 
 // Open creates the durable ledger before accepting any VM allocations. The
@@ -118,7 +129,7 @@ type Service struct {
 // HTTP requests. driver may be nil for a gateway that runs no local VMs.
 func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Service, error) {
 	if cfg.APIKey == "" || cfg.Domain == "" || strings.ContainsAny(cfg.Domain, "/:*? #@\t\r\n") ||
-		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 || cfg.ReadyTimeout < 0 {
+		cfg.MaxTTL < time.Second || cfg.MaxTTL/time.Second > math.MaxInt32 || cfg.ReadyTimeout < 0 || cfg.PauseRetention < 0 {
 		return nil, errors.New("invalid sandbox control configuration")
 	}
 	if driver == nil && len(cfg.Workers) == 0 {
@@ -229,6 +240,12 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 	if reporter, ok := driver.(vm.HostMemoryReporter); ok {
 		s.localMemory = reporter
 	}
+	if pauser, ok := driver.(vm.Pauser); ok {
+		s.pauser = pauser
+	}
+	if s.cfg.PauseRetention == 0 {
+		s.cfg.PauseRetention = DefaultPauseRetention
+	}
 	s.cfg.APIKey = "" // never retain a second plaintext copy of the control key
 	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret, s.cfg.Volumes = nil, nil, nil, nil
 	go s.sweep()
@@ -282,6 +299,10 @@ func (s *Service) Close() error {
 	s.closeTunnels()
 	close(s.stop)
 	<-s.done
+	s.mu.Lock()
+	s.closing = true
+	s.mu.Unlock()
+	s.autoPauses.Wait()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ledger.Close()
@@ -474,6 +495,21 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request) {
 				s.updateNetwork(w, r, id)
 				return
 			}
+			// With a pausing local driver, pause and resume are served
+			// (pause.go); without, they stay refused below.
+			if s.pauser != nil && (action == "pause" || action == "resume") {
+				if r.Method != http.MethodPost {
+					w.Header().Set("Allow", http.MethodPost)
+					s.fail(w, ProfileE2B, http.StatusMethodNotAllowed, "method not allowed")
+					return
+				}
+				if action == "pause" {
+					s.pause(w, r, id)
+				} else {
+					s.resume(w, r, id)
+				}
+				return
+			}
 			if reason := sandboxRefusal(action); reason != "" {
 				if !s.refusable(w, r, id) {
 					return
@@ -620,7 +656,7 @@ func (s *Service) describe(row store.Row) sandbox {
 	}
 	described := sandbox{ID: row.ID, TemplateID: row.TemplateID, StartedAt: row.Started, EndAt: row.Ends,
 		CPUCount: cpus, MemoryMB: memory, DiskSizeMB: 10 * 1024,
-		State: "running", EnvdVersion: strictEnvdVersion, Metadata: metadata, Domain: s.cfg.Domain}
+		State: describedState(row.State), EnvdVersion: strictEnvdVersion, Metadata: metadata, Domain: s.cfg.Domain}
 	if template, ok := s.registered(row); ok && template.Profile == ProfileE2B {
 		described.EnvdVersion, described.ClientID = template.EnvdVersion, clientID
 	}
@@ -878,21 +914,24 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	offline = append(offline, s.unenrolled(rows)...)
 	result := make([]sandbox, 0, len(rows))
 	for _, row := range rows {
-		if s.busy[row.ID] != nil || !filter.matches(row) {
+		// A pause or resume in flight keeps its row busy; the sandbox stays.
+		transient := row.State == "pausing" || row.State == "resuming"
+		if s.busy[row.ID] != nil && !transient || !filter.matches(row) {
 			continue // Create or Destroy in flight: not yet, or no longer, a sandbox.
 		}
+		listable := row.State == "running" || row.State == "paused" || transient
 		strict := rowProfile(row.Profile) == ProfileStrict
 		m := s.byID[row.WorkerID]
 		if m == nil || !m.online {
-			// The worker's last known running sandboxes stay listed: an offline
-			// or removed worker neither strands nor silently drops them. The
+			// The worker's last known sandboxes stay listed: an offline or
+			// removed worker neither strands nor silently drops them. The
 			// header below says this part of the inventory is unconfirmed.
-			if _, registered := s.registered(row); row.State == "running" && (strict || registered) {
+			if _, registered := s.registered(row); listable && (strict || registered) {
 				result = append(result, s.describe(row))
 			}
 			continue
 		}
-		if row.State != "running" || !s.servable(row, m) {
+		if !listable || !s.servable(row, m) {
 			if strict {
 				s.fail(w, shared, http.StatusServiceUnavailable, "sandbox state unavailable")
 				return
@@ -912,7 +951,13 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 	if len(offline) > 0 {
 		w.Header().Set("X-Sandboxd-Offline-Workers", strings.Join(offline, ","))
 	}
-	w.Header().Set("X-Total-Running", strconv.Itoa(len(result)))
+	running := 0
+	for _, item := range result {
+		if item.State == "running" {
+			running++
+		}
+	}
+	w.Header().Set("X-Total-Running", strconv.Itoa(running))
 	start := 0
 	if token != "" {
 		cursor, err := s.cursor(r.Context(), token, byID, result)
@@ -931,8 +976,22 @@ func (s *Service) list(w http.ResponseWriter, r *http.Request) {
 }
 
 // live reconciles the sandbox's own worker and returns its row only while it
-// is running, current and owned under the worker's current lease.
+// is running, current and owned under the worker's current lease. A paused
+// sandbox, or one being paused or resumed, is errPaused.
 func (s *Service) live(ctx context.Context, id string) (store.Row, *member, error) {
+	row, m, err := s.present(ctx, id)
+	if err == nil && row.State != "running" {
+		return store.Row{}, nil, errPaused
+	}
+	return row, m, err
+}
+
+// errPaused refuses an action that needs a running sandbox (409).
+var errPaused = errors.New("sandbox is paused")
+
+// present is live that also returns a paused sandbox and one being paused or
+// resumed (states "paused", "pausing" and "resuming").
+func (s *Service) present(ctx context.Context, id string) (store.Row, *member, error) {
 	s.mu.Lock()
 	row, err := s.ledger.Get(ctx, id)
 	m := s.byID[row.WorkerID]
@@ -957,7 +1016,11 @@ func (s *Service) live(ctx context.Context, id string) (store.Row, *member, erro
 	if released(row) {
 		return store.Row{}, nil, sql.ErrNoRows
 	}
-	if row.State != "running" || s.busy[id] != nil || !s.servable(row, m) {
+	// A pause or resume in flight keeps its row busy; only Create and
+	// Destroy make a sandbox absent while they run.
+	transient := row.State == "pausing" || row.State == "resuming"
+	settled := (row.State == "running" || row.State == "paused") && s.busy[id] == nil
+	if !transient && !settled || !s.servable(row, m) {
 		return store.Row{}, nil, errors.New("sandbox not running")
 	}
 	if row, m, err = s.owned(ctx, id); err != nil {
@@ -966,19 +1029,31 @@ func (s *Service) live(ctx context.Context, id string) (store.Row, *member, erro
 	return row, m, nil
 }
 
+// describedState is the E2B state of a row: "paused" from the moment a
+// pause settles until a resume settles, "running" otherwise.
+func describedState(state string) string {
+	if state == "paused" || state == "resuming" {
+		return "paused"
+	}
+	return "running"
+}
+
 // released reports a row that no longer holds a reservation: proven gone, or
 // released by forget-worker without proof (its VM is then no longer managed).
 func released(row store.Row) bool { return row.State == "gone" || row.State == "unverified" }
 
 func statusFor(err error) int {
-	if errors.Is(err, sql.ErrNoRows) {
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
 		return http.StatusNotFound
+	case errors.Is(err, errPaused):
+		return http.StatusConflict
 	}
 	return http.StatusServiceUnavailable
 }
 
 func (s *Service) get(w http.ResponseWriter, r *http.Request, id string) {
-	row, m, err := s.live(r.Context(), id)
+	row, m, err := s.present(r.Context(), id)
 	if err != nil {
 		s.fail(w, s.profileOf(r.Context(), id), statusFor(err), "sandbox unavailable")
 		return
