@@ -312,8 +312,8 @@ func TestFirecrackerSnapshotRestore(t *testing.T) {
 	if args := lastStart(host, fcTestID2); !restored(args, fcTestID2) || argAfter(args, "--uid") != strconv.Itoa(cfg.UIDBase+1) {
 		t.Fatalf("clone VMM args = %v", args)
 	}
-	// A clone writes only its disks.
-	if got := argAfter(lastStart(host, fcTestID2), "--resource-limit"); got != fmt.Sprint("fsize=", 256<<20) {
+	// A clone can be paused: its limit covers a snapshot of its memory.
+	if got := argAfter(lastStart(host, fcTestID2), "--resource-limit"); got != fmt.Sprint("fsize=", 512<<20) {
 		t.Fatalf("clone VMM %s", got)
 	}
 	if meta, err := d.readMeta(fcTestID2); err != nil || meta.Snapshot != name {

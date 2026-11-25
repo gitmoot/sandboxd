@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/gitmoot/sandboxd/internal/guestagent"
+	"golang.org/x/sys/unix"
 )
 
 // A paused Firecracker VM is a full snapshot of its guest (VM state and
@@ -73,14 +74,22 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB guest memory needed",
 			ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB, meta.MemoryMiB)
 	}
-	dir := filepath.Join(d.chroot(id), fcPausedJail)
-	if err := os.RemoveAll(dir); err != nil {
+	// The running VMM owns its chroot and can replace anything in it: the
+	// paused directory is created and handed to it only through the open
+	// chroot, never through a path it could turn into a symlink.
+	chroot, err := unix.Open(d.chroot(id), unix.O_PATH|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open the jail of %q: %w", id, err)
+	}
+	defer unix.Close(chroot)
+	if err := os.RemoveAll(filepath.Join(d.chroot(id), fcPausedJail)); err != nil {
 		return err
 	}
-	if err := mkdirExact(dir, 0o700); err != nil {
-		return err
+	name := filepath.Base(fcPausedJail)
+	if err := unix.Mkdirat(chroot, name, 0o700); err != nil {
+		return fmt.Errorf("create the paused directory of %q: %w", id, err)
 	}
-	if err := d.host.Chown(dir, meta.VMMUID, meta.VMMUID); err != nil {
+	if err := d.host.ChownAt(chroot, name, meta.VMMUID, meta.VMMUID); err != nil {
 		return err
 	}
 	conn, err := d.dialAgentAs(ctx, id, meta.VMMUID)
