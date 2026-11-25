@@ -107,7 +107,7 @@ func (s *Service) pause(w http.ResponseWriter, r *http.Request, id string) {
 	s.lifecycle.Add(1)
 	s.mu.Unlock()
 	defer s.lifecycle.Done()
-	if err := s.pauseRow(context.WithoutCancel(r.Context()), row, true); err != nil {
+	if err := errors.Join(s.pauseRow(context.WithoutCancel(r.Context()), row, true)); err != nil {
 		log.Printf("sandbox %s: pause failed: %v", id, err)
 		switch {
 		case errors.Is(err, vm.ErrImageTooOld):
@@ -127,9 +127,10 @@ func (s *Service) pause(w http.ResponseWriter, r *http.Request, id string) {
 // an explicit pause (revert) returns the row to running, and reconciliation
 // destroys the VM if the driver left it stopped; a failed auto-pause marks
 // the row unknown, so reconciliation destroys it as at any end time.
-func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) error {
+// pauseErr is the driver's error, settleErr the ledger's.
+func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) (pauseErr, settleErr error) {
 	pauseCtx, cancel := context.WithTimeout(ctx, workerSlowTimeout)
-	pauseErr := s.pauser.Pause(pauseCtx, row.ID)
+	pauseErr = s.pauser.Pause(pauseCtx, row.ID)
 	cancel()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -139,24 +140,30 @@ func (s *Service) pauseRow(ctx context.Context, row store.Row, revert bool) erro
 		if err == nil && !paused {
 			err = errors.New("sandbox row left pausing during the pause")
 		}
-		return err
+		return nil, err
 	}
 	if !revert {
-		return errors.Join(pauseErr, s.setState(ctx, row.ID, "unknown"))
+		return pauseErr, s.setState(ctx, row.ID, "unknown")
 	}
 	running, err := s.ledger.Transition(ctx, row.ID, "pausing", "running", row.Ends, row.AutoPause)
 	if err == nil && running {
 		s.indexSigner(row.ID)
 	}
-	return errors.Join(pauseErr, err)
+	return pauseErr, err
 }
 
 // autoPause pauses an e2b sandbox with autoPause at its end time;
 // reconciliation set its row pausing and busy, and counted it in lifecycle.
 func (s *Service) autoPause(row store.Row) {
 	defer s.lifecycle.Done()
-	if err := s.pauseRow(context.Background(), row, false); err != nil {
-		log.Printf("sandbox %s: auto-pause failed, destroying it: %v", row.ID, err)
+	pauseErr, settleErr := s.pauseRow(context.Background(), row, false)
+	switch {
+	case pauseErr == nil && settleErr != nil:
+		log.Printf("sandbox %s: auto-paused, but the ledger did not record it: %v", row.ID, settleErr)
+	case settleErr != nil:
+		log.Printf("sandbox %s: auto-pause failed (%v), and the ledger did not mark it unknown: %v", row.ID, pauseErr, settleErr)
+	case pauseErr != nil:
+		log.Printf("sandbox %s: auto-pause failed; marked unknown for reconciliation to remove: %v", row.ID, pauseErr)
 	}
 }
 

@@ -422,20 +422,28 @@ func TestCloseAdmitsNoAutoPauseFromARequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	held := createE2B(t, s, map[string]any{"templateID": "base"}).ID
-	due := createE2B(t, s, map[string]any{"templateID": "base", "autoPause": true, "timeout": 2}).ID
-	ends := time.Now().Add(2 * time.Second)
+	due := createE2B(t, s, map[string]any{"templateID": "base", "autoPause": true, "timeout": 300}).ID
 	paused := make(chan int, 1)
 	go func() { paused <- request(t, s, http.MethodPost, "/sandboxes/"+held+"/pause", nil).Code }()
 	receive(t, driver.entered)
 	closed := make(chan error, 1)
 	go func() { closed <- s.Close() }()
 	receive(t, s.done)
-	time.Sleep(time.Until(ends) + 200*time.Millisecond)
-	request(t, s, http.MethodGet, "/sandboxes/"+due, nil)
-	select {
-	case <-driver.entered:
-		t.Error("a request started an auto-pause after Close began")
-	case <-time.After(300 * time.Millisecond):
+	// The sweep is gone; due's end time comes now.
+	s.mu.Lock()
+	err = s.ledger.Extend(context.Background(), due, time.Now().Add(-time.Second))
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := request(t, s, http.MethodGet, "/sandboxes/"+due, nil).Code; code != http.StatusOK {
+		t.Fatalf("GET of the due sandbox while closing: %d", code)
+	}
+	s.mu.Lock()
+	row, err := s.ledger.Get(context.Background(), due)
+	s.mu.Unlock()
+	if err != nil || row.State != "running" {
+		t.Fatalf("due sandbox row after a request's reconciliation while closing: %+v, %v", row, err)
 	}
 	release()
 	if code := receive(t, paused); code != http.StatusNoContent {
