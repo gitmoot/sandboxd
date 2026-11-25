@@ -820,15 +820,29 @@ func (d *FirecrackerDriver) removeBuilds(ctx context.Context) error {
 
 // destroyBuild removes every trace of build VM id, from any partial state.
 func (d *FirecrackerDriver) destroyBuild(ctx context.Context, id string) error {
+	defer d.dropConsole(id)
+	if err := d.stopBuild(ctx, id); err != nil {
+		return err
+	}
+	return d.removeBuild(ctx, id)
+}
+
+// stopBuild stops build VM id's VMM and network stack: once it returns nil,
+// nothing of the build can write.
+func (d *FirecrackerDriver) stopBuild(ctx context.Context, id string) error {
 	if !fcBuildID.MatchString(id) {
 		return fmt.Errorf("invalid template build ID %q", id)
 	}
-	defer d.dropConsole(id)
 	for _, cgroup := range []string{id, fcNetCgroup + id} {
 		if err := d.host.KillCgroup(ctx, cgroup); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// removeBuild removes the network namespace and jail of stopped build VM id.
+func (d *FirecrackerDriver) removeBuild(ctx context.Context, id string) error {
 	if err := d.host.DeleteNetns(ctx, d.names.netnsPrefix+id); err != nil {
 		return err
 	}
@@ -859,18 +873,23 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}
 	// held is what the build holds while its VMM may still write: the
 	// directories its admission reads and the admission itself. They go
-	// once the build VM is destroyed; if that fails, the VMM may still be
-	// writing and the admission stays held until the daemon exits.
+	// once the build VM is stopped, whatever its removal then does; if it
+	// cannot be stopped, the VMM may still be writing and the admission
+	// stays held until the daemon exits.
 	var held []func()
 	admitted := false
 	defer func() {
+		defer d.dropConsole(id)
 		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		destroyErr := d.destroyBuild(cleanup, id)
-		err = errors.Join(err, destroyErr)
-		if destroyErr != nil && admitted {
-			log.Printf("firecracker: template build %s could not be removed; its snapshot space stays held", id)
-			return
+		if stopErr := d.stopBuild(cleanup, id); stopErr != nil {
+			err = errors.Join(err, stopErr)
+			if admitted {
+				log.Printf("firecracker: template build %s could not be stopped; its snapshot space stays held", id)
+				return
+			}
+		} else if removeErr := d.removeBuild(cleanup, id); removeErr != nil {
+			err = errors.Join(err, fmt.Errorf("remove the stopped template build: %w", removeErr))
 		}
 		for _, free := range slices.Backward(held) {
 			free()

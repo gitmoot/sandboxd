@@ -121,7 +121,7 @@ type Service struct {
 	// lifecycle tracks every pause and resume in flight, explicit or
 	// started by reconciliation at a sandbox's end time; Close waits for
 	// them before it closes the ledger. closing (guarded by mu) refuses new
-	// explicit ones; the sweep Close drains may still start auto-pauses.
+	// ones.
 	lifecycle sync.WaitGroup
 	closing   bool
 }

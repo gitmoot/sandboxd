@@ -299,10 +299,10 @@ func (s *Service) reconcile(ctx context.Context, m *member) error {
 				}
 			}
 			switch {
+			case autoPause && s.closing:
+				// Close refuses new pauses: the row stays running for the
+				// next start to pause, never destroyed for a pause not run.
 			case autoPause:
-				// Also while Close drains this sweep: Close waits for the
-				// pause (lifecycle) once the sweep is done, so the sandbox
-				// is kept paused rather than removed at shutdown.
 				if err := s.setState(ctx, row.ID, "pausing"); err != nil {
 					s.mu.Unlock()
 					return s.offline(m, err)
