@@ -767,6 +767,17 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if need := uint64(d.cfg.DiskFloorMiB+d.cfg.HomeDiskMiB+spec.MemoryMiB) << 20; free < need {
 		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus the snapshot's memory and home disk needed", ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB)
 	}
+	// The build VM runs beside the VM whose create started it: it must not
+	// take the host below the memory floor either.
+	if d.cfg.MemoryFloorMiB > 0 {
+		memory, err := d.host.HostMemory()
+		if err != nil {
+			return err
+		}
+		if need := uint64(d.cfg.MemoryFloorMiB+spec.MemoryMiB+fcVMMOverhead) << 20; memory.AvailableBytes < need {
+			return fmt.Errorf("%w: %d MiB available, the floor plus the build VM need %d MiB", ErrMemoryPressure, memory.AvailableBytes>>20, need>>20)
+		}
+	}
 	if err := d.destroyBuild(ctx, id); err != nil {
 		return err
 	}

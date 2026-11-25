@@ -44,6 +44,7 @@ provider on a Firecracker host.
 | Internet egress; private ranges and the host blocked | ✅ | ✅ |
 | Per-sandbox egress policy (`allow_internet_access`, `allowOut`/`denyOut`, network update) | ✅ | ❌ |
 | Hardened e2b templates (`hardened=true`: read-only `nosuid` system disk, no sudo; [details](docs/compatibility.md#hardened-templates)) | ✅ | ❌ |
+| Fast starts from a booted template snapshot (`-fc-snapshots`: ~0.16 s instead of ~0.55 s per create; [details](docs/firecracker.md#template-snapshots)) | ✅ | ❌ |
 | One gateway scheduling onto several enrolled workers | ✅ | ✅ |
 
 The Linux column comes from two sources:
@@ -86,8 +87,10 @@ route by route.
 - **`get_host` and per-sandbox hostnames.** `<port>-<id>.<domain>` needs
   wildcard DNS and TLS, so it is off by default (`-port-hosts` turns it on).
   Guest ports work through the gateway host with the SDKs' routing headers.
-- **Pause, resume, snapshots and fork** (M5). Refused with a `501` and a
-  clear message.
+- **Pause, resume, snapshots and fork through the API** (M5). Refused with
+  a `501` and a clear message. The Firecracker worker restores new VMs from
+  a template snapshot internally (`-fc-snapshots`), which the API does not
+  expose.
 - **Template builds through the API.** Templates are built with the scripts
   in [`images/`](images) and registered by the operator with
   `-register-template`.

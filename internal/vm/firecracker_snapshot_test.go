@@ -499,6 +499,21 @@ func TestFirecrackerSnapshotFallsBackToColdBoot(t *testing.T) {
 			t.Fatal("failed build retried at once")
 		}
 	})
+	t.Run("build below memory floor", func(t *testing.T) {
+		// Room for the VM, not for the build VM beside it.
+		d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) { c.MemoryFloorMiB = 2048 })
+		host.memory.AvailableBytes = (2048 + 512) << 20
+		if _, err := d.Create(ctx, spec(cfg, fcTestID, "sbx0")); err != nil {
+			t.Fatal(err)
+		}
+		waitBuild(t, d)
+		if names, err := readDirNames(d.snapshotsDir()); err != nil || len(names) != 0 {
+			t.Fatalf("snapshot built below the memory floor: %v %v", names, err)
+		}
+		if starts := vmmStarts(host, fcBuildPrefix+snapshotName(t, d, spec(cfg, fcTestID, "sbx0"))); len(starts) != 0 {
+			t.Fatalf("build VM started below the memory floor: %v", starts)
+		}
+	})
 	t.Run("volume", func(t *testing.T) {
 		d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) {
 			c.VolumeBudgetMiB, c.VolumeMiB, c.VolumeDir = 256, 128, filepath.Join(c.Root, "volumes")
