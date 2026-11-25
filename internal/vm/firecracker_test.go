@@ -77,14 +77,38 @@ type fakeFCHost struct {
 	// envdPort is the loopback port tests dial through a booted e2b
 	// guest's agent (OpDial).
 	envdPort int
-	// oldAgent boots guests whose agent predates OpDisk.
-	oldAgent bool
+	// oldAgent boots guests whose agent predates OpDisk; noRestore, guests
+	// whose agent predates OpRestore.
+	oldAgent, noRestore bool
+	// features are each running guest's agent features; apis, the API
+	// sockets of VMMs started with one, and paused, the VMs paused through
+	// it. loadFault, when set, is the fault every snapshot load answers;
+	// restoreErr is what a restored guest's agent answers OpRestore with,
+	// and restores records each OpRestore it accepted.
+	features   map[string][]string
+	apis       map[string]*net.UnixListener
+	paused     map[string]bool
+	loadFault  string
+	restoreErr error
+	restores   []fakeRestore
+	// facts is what SnapshotFacts reports; memory, what HostMemory does.
+	facts  fcHostFacts
+	memory HostMemory
 	// stateCalls counts firewall checks; stateFailures makes the next ones
 	// fail to complete, as a timed-out nft run does.
 	stateCalls, stateFailures int
 	// onKill runs before a cgroup kill, outside h.mu, to observe the driver
 	// mid-teardown.
 	onKill func(name string)
+	// onSnapshot runs, outside h.mu, once a VMM has written a snapshot, with
+	// its chroot: what a compromised VMM does there before it exits.
+	onSnapshot func(chroot string)
+	// onExecCopy runs, outside h.mu, as the jailer copies the Firecracker
+	// binary into VM id's chroot to run it: just before the copy (copied
+	// false) and just after it (true).
+	onExecCopy func(id string, copied bool)
+	// onNetns runs, outside h.mu, as Netns starts: to hold its caller.
+	onNetns func()
 	// dropAccept installs the host table without its accept rules, as an
 	// nft that silently loses one would.
 	dropAccept bool
@@ -111,11 +135,17 @@ func newFakeFCHost(t *testing.T) *fakeFCHost {
 		t: t, free: 100 << 30, untrusted: map[string]bool{}, netns: map[string]bool{},
 		cgroups: map[string]bool{}, guests: map[string]string{}, listeners: map[string]*net.UnixListener{},
 		owners: map[string]int{}, events: make(chan struct{}),
+		apis: map[string]*net.UnixListener{}, paused: map[string]bool{}, features: map[string][]string{},
+		facts:  fcHostFacts{Firecracker: "Firecracker v1.17.0", HostKernel: "6.8.0-test", CPU: "AuthenticAMD 23/113/0 microcode 0x8701035"},
+		memory: HostMemory{TotalBytes: 64 << 30, AvailableBytes: 32 << 30},
 	}
 	t.Cleanup(func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		for _, l := range h.listeners {
+			_ = l.Close()
+		}
+		for _, l := range h.apis {
 			_ = l.Close()
 		}
 	})
@@ -140,6 +170,15 @@ func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	defer h.mu.Unlock()
 	h.owners[path] = uid
 	return nil
+}
+
+// ChownAt records the change under the path of dir's open directory.
+func (h *fakeFCHost) ChownAt(dir int, name string, uid, gid int) error {
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", dir))
+	if err != nil {
+		return err
+	}
+	return h.Chown(filepath.Join(path, name), uid, gid)
 }
 func (h *fakeFCHost) owner(path string) (int, bool) {
 	h.mu.Lock()
@@ -275,13 +314,23 @@ func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.cgroups, name)
-	if l, ok := h.listeners[name]; ok {
-		_ = l.Close()
-		delete(h.listeners, name)
+	for _, listeners := range []map[string]*net.UnixListener{h.listeners, h.apis} {
+		if l, ok := listeners[name]; ok {
+			_ = l.Close()
+			delete(listeners, name)
+		}
 	}
+	delete(h.paused, name)
+	delete(h.features, name)
 	return nil
 }
 func (h *fakeFCHost) Netns() ([]string, error) {
+	h.mu.Lock()
+	hold := h.onNetns
+	h.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	var names []string
@@ -342,6 +391,16 @@ func argAfter(args []string, flag string) string {
 	return args[i+1]
 }
 
+// copyExec copies the binary at from to to, as the jailer does before it
+// runs the copy.
+func copyExec(from, to string) error {
+	data, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(to, data, 0o555)
+}
+
 func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, console *os.File) error {
 	h.record("vmm")
 	h.mu.Lock()
@@ -357,17 +416,39 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 		}
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.vmmArgs = append(h.vmmArgs, args)
-	if h.failVMM != nil {
-		return h.failVMM
+	failed, onExecCopy := h.failVMM, h.onExecCopy
+	h.mu.Unlock()
+	if failed != nil {
+		return failed
 	}
-	id := argAfter(args, "--id")
-	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), "firecracker", id, "root")
+	// The jailer copies the Firecracker binary into the chroot and runs the
+	// copy.
+	id, exec := argAfter(args, "--id"), argAfter(args, "--exec-file")
+	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), filepath.Base(exec), id, "root")
+	if onExecCopy != nil {
+		onExecCopy(id, false)
+	}
+	if err := copyExec(exec, filepath.Join(chroot, filepath.Base(exec))); err != nil {
+		return fmt.Errorf("jailer: %w", err)
+	}
+	if onExecCopy != nil {
+		onExecCopy(id, true)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A VMM given an API socket and no configuration waits to load a
+	// snapshot: it reads neither a kernel nor a configuration.
+	api := argAfter(args, "--api-sock")
+	restoring := api != "" && !slices.Contains(args, "--config-file")
+	required := []string{"vm.json", "vmlinux", "rootfs.ext4"}
+	if restoring {
+		required = []string{"rootfs.ext4"}
+	}
 	// The real VMM runs as its own unprivileged UID and owns only what the
 	// driver chowns to it; the root-owned files it reads must be readable by
 	// others, or Firecracker panics at startup and exits.
-	for _, name := range []string{"vm.json", "vmlinux", "rootfs.ext4"} {
+	for _, name := range required {
 		info, err := os.Stat(filepath.Join(chroot, name))
 		if err != nil || info.Mode().Perm()&0o004 == 0 {
 			h.cgroups[id] = false
@@ -378,13 +459,17 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 	if h.bootDies {
 		return nil
 	}
-	guest := h.t.TempDir()
-	h.guests[chroot] = guest
-	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
-	if err != nil {
-		return err
+	if api != "" {
+		listener, err := listenUnixIn(filepath.Join(chroot, filepath.Dir(api)), filepath.Base(api))
+		if err != nil {
+			return err
+		}
+		h.apis[id] = listener
+		go h.serveAPI(listener, id, chroot)
 	}
-	h.listeners[id] = listener
+	if restoring {
+		return nil // the guest runs once its snapshot is loaded
+	}
 	// Like the real init, the fake guest applies what its boot arguments
 	// ask for; an old agent predates features and reports none.
 	var features []string
@@ -404,8 +489,34 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 		if path, _ := guestagent.VolumePath(config.Boot.Args); path != "" {
 			features = append(features, guestagent.FeatureVolume)
 		}
+		if !h.noRestore {
+			features = append(features, guestagent.FeatureRestore)
+		}
 	}
-	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent, features)
+	return h.bootGuest(id, chroot, features)
+}
+
+// bootGuest runs VM id's guest: an agent with features on the VM's vsock
+// socket, serving a fresh guest directory. h.mu must be held.
+func (h *fakeFCHost) bootGuest(id, chroot string, features []string) error {
+	guest := h.t.TempDir()
+	h.guests[chroot] = guest
+	listener, err := listenUnixIn(filepath.Join(chroot, fcVsockDir), fcVsockName)
+	if err != nil {
+		return err
+	}
+	h.listeners[id] = listener
+	h.features[id] = features
+	restore := func(entropy []byte, unixNano int64) error {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.restoreErr != nil {
+			return h.restoreErr
+		}
+		h.restores = append(h.restores, fakeRestore{ID: id, Entropy: slices.Clone(entropy), Time: time.Unix(0, unixNano)})
+		return nil
+	}
+	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent, features, restore)
 	return nil
 }
 
@@ -413,7 +524,26 @@ func (h *fakeFCHost) Dial(ctx context.Context, chroot string, _ int) (net.Conn, 
 	h.mu.Lock()
 	owner := os.Getuid() + h.ownerShift
 	h.mu.Unlock()
-	return dialJailSocket(ctx, chroot, owner)
+	return dialJailSocket(ctx, chroot, owner, fcVsockName)
+}
+
+func (h *fakeFCHost) DialAPI(ctx context.Context, chroot string, _ int) (net.Conn, error) {
+	h.mu.Lock()
+	owner := os.Getuid() + h.ownerShift
+	h.mu.Unlock()
+	return dialJailSocket(ctx, chroot, owner, fcAPIName)
+}
+
+func (h *fakeFCHost) SnapshotFacts(context.Context, string) (fcHostFacts, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.facts, nil
+}
+
+func (h *fakeFCHost) HostMemory() (HostMemory, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.memory, nil
 }
 
 // listenUnixIn binds a Unix socket named name in dir through a directory
@@ -433,8 +563,9 @@ func listenUnixIn(dir, name string) (*net.UnixListener, error) {
 }
 
 // serveFakeAgent answers Firecracker's vsock handshake on every connection
-// and serves a real guest agent whose filesystem is the guest directory.
-func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent bool, features []string) {
+// and serves a real guest agent whose filesystem is the guest directory;
+// restore stands in for guestagent.ApplyRestore.
+func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent bool, features []string, restore func([]byte, int64) error) {
 	dialHost := ""
 	if dial {
 		dialHost = "127.0.0.1"
@@ -442,7 +573,7 @@ func serveFakeAgent(listener *net.UnixListener, guest string, dial, oldAgent boo
 	server := &guestagent.Server{
 		Env: []string{"PATH=/usr/bin:/bin", "HOME=" + guest}, Dir: guest,
 		WriteHelper: []string{os.Args[0], fcWriteHelperArg}, WaitDelay: time.Second,
-		DialHost: dialHost, DiskPath: guest, Features: features,
+		DialHost: dialHost, DiskPath: guest, Features: features, Restore: restore,
 	}
 	for {
 		conn, err := listener.Accept()
@@ -551,6 +682,8 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		"unmasked deny":     func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{netip.MustParsePrefix("203.0.113.7/24")} },
 		"invalid deny":      func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{{}} },
 		"negative floor":    func(c *FirecrackerConfig) { c.DiskFloorMiB = -1 },
+		"negative memfloor": func(c *FirecrackerConfig) { c.MemoryFloorMiB = -1 },
+		"served shape":      func(c *FirecrackerConfig) { c.Snapshots, c.CPUs, c.MemoryMiB = true, 0, 512 },
 		"relative image":    func(c *FirecrackerConfig) { c.Images = []string{"images/x.ext4"} },
 		"unclean jailer":    func(c *FirecrackerConfig) { c.Jailer = "/usr/bin/../bin/jailer" },
 		"duplicate slot":    func(c *FirecrackerConfig) { c.Slots = []string{"sbx0", "sbx0"} },

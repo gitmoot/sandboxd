@@ -25,7 +25,7 @@ import (
 // the install; imageEnv (a rootfs path) overrides the one image in
 // <root>/images matching imageGlob. Beside a running sandboxd, set
 // SANDBOXD_FC_INSTANCE, SANDBOXD_FC_UID_BASE and a separate root (#50).
-func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int) (*FirecrackerDriver, string, context.Context) {
+func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int, mutate ...func(*FirecrackerConfig)) (*FirecrackerDriver, string, context.Context) {
 	t.Helper()
 	if os.Getenv("SANDBOXD_FC_KVM") != "1" {
 		t.Skip("set SANDBOXD_FC_KVM=1 to boot real Firecracker VMs")
@@ -53,7 +53,7 @@ func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int) (
 			t.Fatal(err)
 		}
 	}
-	d, err := NewFirecrackerDriver(FirecrackerConfig{
+	cfg := FirecrackerConfig{
 		Instance: os.Getenv("SANDBOXD_FC_INSTANCE"),
 		Root:     root, Firecracker: filepath.Join(root, "bin", "firecracker"), Jailer: filepath.Join(root, "bin", "jailer"),
 		Kernel: kernels[0], Images: []string{image}, Slots: FirecrackerSlotNames(2),
@@ -63,7 +63,11 @@ func newKVMFirecracker(t *testing.T, imageEnv, imageGlob string, hostPort int) (
 		// 1.0.0.1 is public: a configured deny must hold even for the internet.
 		DenyCIDRs: []netip.Prefix{netip.MustParsePrefix("10.1.0.0/16"), netip.MustParsePrefix("1.0.0.1/32")},
 		HostPort:  hostPort,
-	})
+	}
+	for _, m := range mutate {
+		m(&cfg)
+	}
+	d, err := NewFirecrackerDriver(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

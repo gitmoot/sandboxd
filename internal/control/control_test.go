@@ -206,6 +206,37 @@ func TestAmbiguousCreateRetainsCapacityUntilInventoryResolves(t *testing.T) {
 	}
 }
 
+// memoryDriver is a fakeDriver that measures its host's memory, as the
+// Firecracker driver does.
+type memoryDriver struct {
+	fakeDriver
+	memory vm.HostMemory
+}
+
+func (d *memoryDriver) HostMemory(context.Context) (vm.HostMemory, error) { return d.memory, nil }
+
+func TestMemoryFloorRefusalAndCapacityReport(t *testing.T) {
+	d := &memoryDriver{
+		fakeDriver: fakeDriver{instances: make(map[string]vm.Instance), createError: errors.Join(errors.New("create"), vm.ErrMemoryPressure)},
+		memory:     vm.HostMemory{TotalBytes: 64 << 30, AvailableBytes: 3 << 30, FloorBytes: 4 << 30, PressureSome10: 1.5},
+	}
+	s, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), d,
+		Config{APIKey: "control-secret", TemplateID: "review-arm64", Image: "linux-arm64", Domain: "sandbox.example", WorkerID: "mac-local", CPUs: 2, MemoryMiB: 512, MaxVMs: 1, MaxTTL: time.Hour, Slots: []string{"slot-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	// Below its memory floor the worker refuses with the retryable 503.
+	got := request(t, s, http.MethodPost, "/sandboxes", createBody("job-A", 1))
+	if got.Code != http.StatusServiceUnavailable || !strings.Contains(got.Body.String(), "memory is below its floor") {
+		t.Fatalf("create below the memory floor: %d %s", got.Code, got.Body.String())
+	}
+	local := workerReport(t, readCapacity(t, s), "mac-local")
+	if local.HostMemory == nil || *local.HostMemory != (hostMemory{TotalMiB: 64 << 10, AvailableMiB: 3 << 10, FloorMiB: 4 << 10, PressureSome10: 1.5}) {
+		t.Fatalf("local host memory = %+v", local.HostMemory)
+	}
+}
+
 func TestInventoryPagesPreserveCompleteRunningSet(t *testing.T) {
 	driver := &fakeDriver{instances: make(map[string]vm.Instance)}
 	service, err := Open(context.Background(), filepath.Join(t.TempDir(), "ledger.sqlite"), driver,

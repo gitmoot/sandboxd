@@ -11,10 +11,10 @@ Gitmoot review profile (`gitmoot-strict`) and, unlike the Apple worker, the
 | --- | --- |
 | VM | One Firecracker microVM per sandbox, started by the jailer with `--new-pid-ns` |
 | Host identity | Slot *i* runs its VMM as UID/GID `fc-uid-base + i` and its NAT as `fc-uid-base + 1000 + i`. Each VM gets its own chroot under `<fc-root>/jail/firecracker/<id>/root` |
-| Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (home disk size) and `nofile=256` |
+| Limits | cgroup v2 `sbx-fc/<id>`: `memory.max` = guest RAM + 128 MiB, `memory.swap.max=0`, `cpu.max` = vCPUs × 100 ms per 100 ms, `pids.max=64`. Plus rlimits `fsize` (the larger of the home disk and an attached volume; for a [template snapshot](#template-snapshots--fc-snapshots) build, at least the guest RAM it writes) and `nofile=256` |
 | Disk | The root image is a hard link of a 0444 ext4 file, attached read-only. A fresh sparse `home.ext4` (`-fc-home-disk-mib`, default 10 GiB) is the only writable disk besides an attached [volume](#volumes). The guest formats it at boot and mounts it on `/home/user`, owned by 1000:1000. `/tmp` and `/var/tmp` are bounded tmpfs |
 | Exec and files | Over vsock only, through Firecracker's host-side Unix socket in the jail. The VMM owns that directory, so the daemon opens each path component beneath the root-owned jail directory with `O_NOFOLLOW`, requires the directory and socket to be owned by the VMM UID, and connects through the opened socket (`/proc/self/fd/N`), never through a re-resolved path. The guest agent (`cmd/sandboxd-guest-agent`, PID 1) runs every command and file write as uid/gid 1000 with no supplementary groups |
-| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk |
+| Admission | `-fc-disk-floor-mib` (default 8 GiB): `Create` refuses when free disk on `fc-root` is below the floor plus one home disk. `-fc-memory-floor-mib` (default 0, off): `Create` refuses with `ErrMemoryPressure` (the gateway answers a retryable `503`) while the host's `MemAvailable` is below the floor; `/sandboxd/capacity` reports the local host's memory |
 
 CPU and memory come from `-cpus` and `-memory-mib`, the same flags the Apple
 worker uses.
@@ -378,6 +378,89 @@ The balloon is one more paravirtualized device driven by the untrusted
 guest. A compromised guest driver can only make the host return or keep
 its own guest's pages; Firecracker checks every reported page is inside
 that guest's memory. The VM's cgroup limit (`memory.max`) is unchanged.
+
+## Template snapshots (`-fc-snapshots`)
+
+A cold boot runs the kernel and the guest's init for every VM: about
+0.55 s per create on the fleet host. With `-fc-snapshots` (off by default)
+a VM starts instead by restoring a snapshot of an already booted guest of
+the same image and shape (`#46`):
+
+- **Build.** The first create of an image, vCPU count, memory size, envd
+  and hardening combination cold boots as before and starts one background
+  build: a VM named `template-<key>` (never a sandbox ID) in the last UID
+  pair of the instance's range, which no slot uses, boots, waits until its
+  agent (and envd) answer, flushes its disks, is paused and written as a
+  full Firecracker snapshot. The files go to `<fc-root>/snapshots/<key>/`
+  (`vmstate`, `mem`, `home.ext4`, `meta.json`), root-owned and read-only.
+  The image and kernel linked into the build jail must be the files the key
+  was computed from (a file replaced in between fails the build), and so
+  must the Firecracker binary the jailer copied. The build VMM owns its
+  chroot, so its files are taken only through the chroot and output
+  directories the daemon opened before it started, never through a path
+  resolved again or a symlink; each must be a regular single-link file
+  owned by the build UID.
+  One build runs at a time, beside the create that started it; it is
+  skipped while it would take the host below `-fc-memory-floor-mib`. A
+  failed build is retried after 15 minutes at the earliest.
+- **Restore.** Each later create of that shape gets its own jail, network
+  namespace and UIDs exactly as a cold boot does. The jail holds hard links
+  of `vmstate` and `mem` (so clones share one page cache for the snapshot's
+  memory, mapped private: a clone's writes stay its own) and a sparse copy
+  of the template's home disk. The image linked into the jail must be the
+  one the snapshot was built from. Firecracker loads the snapshot through
+  its API socket and resumes the guest.
+- **Home disk.** A clone's home disk is a copy of the template's, not a
+  blank disk: the guest agent formats and mounts it during boot, so the
+  snapshot's memory depends on it. It holds nothing per sandbox: envd
+  `/init` (environment, access token) runs per sandbox after the restore,
+  as for a cold boot.
+- **Clone uniqueness.** Before a restored VM is handed out the daemon
+  redials its agent (the vsock device resets on restore) and sends
+  `OpRestore`: 64 bytes of host randomness, which the agent adds to the
+  guest kernel's entropy pool before forcing a reseed of its random number
+  generator (`RNDADDENTROPY`, `RNDRESEEDCRNG`), and the host's wall clock,
+  which it sets. Firecracker's VM generation ID device makes the guest
+  kernel reseed on its own as well. A guest that does not accept
+  `OpRestore` within 10 s is destroyed; it never runs as a sandbox.
+- **Compatibility.** A snapshot is named by a hash of everything it
+  depends on: the Firecracker version and binary hash, the guest kernel's
+  hash, the host kernel release, the CPU model and microcode, the image
+  (inode, size, modification time), the home disk size and the exact VM
+  configuration. Any change names another snapshot, which is built anew;
+  a VM never restores a snapshot of another host, binary or image.
+- **Fallback.** A VM with a volume, an image whose agent lacks `OpRestore`,
+  a missing snapshot or any failed restore cold boots, and the log says
+  why. Three loads in a row that Firecracker rejects retire the snapshot.
+- **Lifetime.** A snapshot is kept while a VM record names it. One that no
+  VM uses and that this daemon would no longer restore (changed
+  Firecracker, kernel, image or configuration, or `-fc-snapshots` off) is
+  deleted when a VM ends, after a build and at startup, together with
+  anything an interrupted build left. Any other snapshot is deleted once no
+  VM uses it and none was built or restored from it for a day, or for an
+  hour when it is of another shape than `-cpus`/`-memory-mib` (say, from
+  before they changed). Whether a template still asks for a snapshot's
+  image, envd and hardening is the gateway's to know, so none is kept for
+  good.
+
+An image needs the guest agent of this release (`OpRestore`); rebuild it
+with the scripts below. Older images keep cold booting.
+
+Measured on the fleet host (Ryzen 5 3600, Firecracker 1.17.0, guest
+kernel 6.1.186, review image, 1 vCPU, 512 MiB) with
+`TestFirecrackerKVMSnapshotBench`, 20 creates per mode, timing `Create`
+until the VM's agent answered:
+
+| | p50 | p95 | VM cgroup `memory.current` | VMM RSS | VMM PSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold boot | 529–562 ms | 553–694 ms | 91–107 MiB | 58 MiB | 58 MiB |
+| Restore | 157–211 ms | 176–556 ms | 4–20 MiB | 27 MiB | 16 MiB |
+
+Ranges are over three runs; the restore p95 of 556 ms was the run right
+after the snapshot was built, the others were 176 and 211 ms. A restored
+VM's memory is mostly shared snapshot pages, charged to the cgroup that
+first read them, so `memory.current` understates it and PSS is the fairer
+per-VM figure. A template build took 1.2 s.
 
 ## Install
 
@@ -795,4 +878,9 @@ that. Upgrade every instance on a host to a binary with claims.
   exit codes, CopyIn, cross-guest isolation, host and private probes against
   a host listener on every interface, internet access and cleanup;
   `TestFirecrackerKVMHostPort` the `-fc-host-port` exception;
-  `TestFirecrackerKVMGoImage` the Go review image.
+  `TestFirecrackerKVMGoImage` the Go review image;
+  `TestFirecrackerKVMSnapshot` two clones restored from one template
+  snapshot (different `/dev/urandom` output, the host's clock, internet
+  egress and the deny list). `SANDBOXD_FC_BENCH=20` with
+  `-run TestFirecrackerKVMSnapshotBench` measures cold boots against
+  restores (the [table above](#template-snapshots--fc-snapshots)).

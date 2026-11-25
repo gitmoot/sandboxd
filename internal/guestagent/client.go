@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Handshake performs Firecracker's host-initiated vsock handshake on a fresh
@@ -137,6 +138,30 @@ func Sync(ctx context.Context, conn io.ReadWriteCloser) error {
 	}
 	if result.Error != "" {
 		return errors.New(result.Error)
+	}
+	return nil
+}
+
+// ErrRefused marks an error the agent itself answered with, as opposed to
+// a connection that failed: retrying the same request cannot help.
+var ErrRefused = errors.New("guest agent refused the request")
+
+// Restore sends OpRestore to a guest just restored from a snapshot: fresh
+// entropy (RestoreEntropyBytes) for its kernel and the host's wall clock.
+func Restore(ctx context.Context, conn io.ReadWriteCloser, entropy []byte, now time.Time) error {
+	if len(entropy) != RestoreEntropyBytes {
+		return fmt.Errorf("restore entropy must be %d bytes", RestoreEntropyBytes)
+	}
+	defer closeOnCancel(ctx, conn)()
+	if err := WriteRequest(conn, Request{Op: OpRestore, Entropy: entropy, Time: now.UnixNano()}); err != nil {
+		return contextErr(ctx, err)
+	}
+	result, err := readResult(conn)
+	if err != nil {
+		return contextErr(ctx, err)
+	}
+	if result.Error != "" {
+		return fmt.Errorf("%w: %s", ErrRefused, result.Error)
 	}
 	return nil
 }

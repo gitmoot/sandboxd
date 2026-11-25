@@ -19,8 +19,9 @@ const fcClaimDir = "/run/sandboxd-fc"
 // startFirecracker claims the instance, then arms the host firewall before
 // any guest work. Guests that survived a daemon kill keep running behind the
 // table, which outlives the daemon. The returned shutdown destroys every
-// guest, then removes the table and the claim.
-func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []string) (isolatedDriver, func(context.Context) error, error) {
+// guest, then removes the table and the claim. cpus and memoryMiB are the
+// VM shape this host serves (-cpus, -memory-mib).
+func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []string, cpus, memoryMiB int) (isolatedDriver, func(context.Context) error, error) {
 	binary := *f.firecracker
 	if binary == "" {
 		binary = filepath.Join(*f.root, "bin", "firecracker")
@@ -39,9 +40,10 @@ func startFirecracker(ctx context.Context, f firecrackerFlags, images, slots []s
 	driver, err := vm.NewFirecrackerDriver(vm.FirecrackerConfig{
 		Instance: *f.instance, ClaimDir: fcClaimDir,
 		Root: *f.root, Firecracker: binary, Jailer: jailer, Kernel: *f.kernel, Images: images, Slots: slots,
-		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB,
+		UIDBase: *f.uidBase, HomeDiskMiB: *f.homeDiskMiB, DiskFloorMiB: *f.diskFloorMiB, MemoryFloorMiB: *f.memoryFloorMiB,
 		BootTimeout: *f.bootTimeout, ConsoleLog: *f.consoleLog, DenyCIDRs: *f.deny, HostPort: *f.hostPort,
 		VolumeBudgetMiB: *f.volumeBudgetMiB, VolumeMiB: *f.volumeMiB, VolumeDir: volumeDir, Balloon: *f.balloon,
+		Snapshots: *f.snapshots, CPUs: cpus, MemoryMiB: memoryMiB,
 	})
 	if err != nil {
 		return nil, nil, err

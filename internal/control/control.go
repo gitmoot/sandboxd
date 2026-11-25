@@ -90,6 +90,9 @@ type Service struct {
 	byID      map[string]*member
 	// localMember is the gateway's own driver, nil for a gateway without one.
 	localMember *member
+	// localMemory is the local driver's host memory report, nil when the
+	// driver has none (vm.HostMemoryReporter).
+	localMemory vm.HostMemoryReporter
 	// busy marks rows whose worker call (Create or Destroy) is in flight. They
 	// are not judged by reconciliation or listed until the call settles; the
 	// channel is closed when it does.
@@ -222,6 +225,9 @@ func Open(ctx context.Context, path string, driver vm.Driver, cfg Config) (*Serv
 		if m.local {
 			s.localMember = m
 		}
+	}
+	if reporter, ok := driver.(vm.HostMemoryReporter); ok {
+		s.localMemory = reporter
 	}
 	s.cfg.APIKey = "" // never retain a second plaintext copy of the control key
 	s.cfg.Workers, s.cfg.Templates, s.cfg.TokenSecret, s.cfg.Volumes = nil, nil, nil, nil
@@ -800,6 +806,9 @@ func (s *Service) launch(ctx context.Context, row *store.Row, place placement) e
 			// The operator's image, not the request, is wrong; retrying
 			// cannot help, so never the retryable 503.
 			return &refusal{http.StatusInternalServerError, "template image does not support this sandbox's hardening or volume; the operator must rebuild it"}
+		case errors.Is(err, vm.ErrMemoryPressure):
+			// The worker's memory floor: retryable once guests go away.
+			return &refusal{http.StatusServiceUnavailable, "worker host memory is below its floor; retry later"}
 		}
 		return errLaunch
 	}
