@@ -460,7 +460,7 @@ func (d *FirecrackerDriver) restore(ctx context.Context, spec Spec, meta fcMeta,
 	if err := d.prepareRestoreJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, d.snapshotLimitMiB(meta), "--api-sock", fcAPIPath); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, "--api-sock", fcAPIPath); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, fcRestoreTime)
@@ -843,7 +843,7 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	if err := d.Ready(ctx); err != nil {
 		return fmt.Errorf("firewall is not armed before the build: %w", err)
 	}
-	free, err := d.host.FreeBytes(d.cfg.Root)
+	free, err := d.rootFree()
 	if err != nil {
 		return err
 	}
@@ -900,7 +900,7 @@ func (d *FirecrackerDriver) runBuild(ctx context.Context, spec Spec, key fcSnaps
 	}
 	defer unix.Close(outDir)
 	startup := &fcStartup{}
-	if err := d.launch(ctx, spec, meta, startup, d.snapshotLimitMiB(meta), fcBootArgs...); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err
 	}
 	// The jailer copied the Firecracker binary into the jail and runs the

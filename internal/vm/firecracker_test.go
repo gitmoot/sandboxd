@@ -83,16 +83,22 @@ type fakeFCHost struct {
 	// features are each running guest's agent features; apis, the API
 	// sockets of VMMs started with one, and paused, the VMs paused through
 	// it. loadFault and snapshotFault, when set, are the fault every
-	// snapshot load and create answers; restoreErr is what a restored
-	// guest's agent answers OpRestore with, and restores records each
-	// OpRestore it accepted.
-	features      map[string][]string
-	apis          map[string]*net.UnixListener
-	paused        map[string]bool
-	loadFault     string
-	snapshotFault string
-	restoreErr    error
-	restores      []fakeRestore
+	// snapshot load and create answers; a failing create first writes
+	// snapshotPartialMiB of its memory file. restoreErr is what a restored
+	// guest's agent answers OpRestore with, restores records each OpRestore
+	// it accepted, and onRestore, when set, runs (outside h.mu) after each.
+	features           map[string][]string
+	apis               map[string]*net.UnixListener
+	paused             map[string]bool
+	loadFault          string
+	snapshotFault      string
+	snapshotPartialMiB int
+	restoreErr         error
+	restores           []fakeRestore
+	onRestore          func(id string)
+	// written is every snapshot file a VMM wrote: while it exists, its size
+	// is taken from free.
+	written []string
 	// facts is what SnapshotFacts reports; memory, what HostMemory does.
 	facts  fcHostFacts
 	memory HostMemory
@@ -166,7 +172,17 @@ func (h *fakeFCHost) TrustedFile(path string, _ bool) error {
 	}
 	return nil
 }
-func (h *fakeFCHost) FreeBytes(string) (uint64, error) { return h.free, nil }
+func (h *fakeFCHost) FreeBytes(string) (uint64, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	free := h.free
+	for _, path := range h.written {
+		if info, err := os.Stat(path); err == nil {
+			free -= min(free, uint64(info.Size()))
+		}
+	}
+	return free, nil
+}
 func (h *fakeFCHost) Chown(path string, uid, _ int) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -525,12 +541,15 @@ func (h *fakeFCHost) bootGuest(id, chroot string, features []string, guest strin
 	h.features[id] = features
 	restore := func(entropy []byte, unixNano int64) error {
 		h.mu.Lock()
-		defer h.mu.Unlock()
-		if h.restoreErr != nil {
-			return h.restoreErr
+		err, hook := h.restoreErr, h.onRestore
+		if err == nil {
+			h.restores = append(h.restores, fakeRestore{ID: id, Entropy: slices.Clone(entropy), Time: time.Unix(0, unixNano)})
 		}
-		h.restores = append(h.restores, fakeRestore{ID: id, Entropy: slices.Clone(entropy), Time: time.Unix(0, unixNano)})
-		return nil
+		h.mu.Unlock()
+		if err == nil && hook != nil {
+			hook(id)
+		}
+		return err
 	}
 	go serveFakeAgent(listener, guest, h.envdPort != 0, h.oldAgent, features, restore)
 	return nil

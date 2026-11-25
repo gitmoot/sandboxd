@@ -89,8 +89,9 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		h.mu.Lock()
-		paused, features, guest, failure := h.paused[id], h.features[id], h.guests[chroot], h.snapshotFault
+		paused, features, guest, failure, partial := h.paused[id], h.features[id], h.guests[chroot], h.snapshotFault, h.snapshotPartialMiB
 		_, writable := h.owners[filepath.Dir(jailed(body.State))]
+		h.written = append(h.written, jailed(body.State), jailed(body.Memory))
 		h.mu.Unlock()
 		if !paused {
 			fault(w, "the VM must be paused")
@@ -102,6 +103,11 @@ func (h *fakeFCHost) serveAPI(listener *net.UnixListener, id, chroot string) {
 			return
 		}
 		if failure != "" {
+			if partial > 0 {
+				if err := os.WriteFile(jailed(body.Memory), nil, 0o600); err == nil {
+					_ = os.Truncate(jailed(body.Memory), int64(partial)<<20)
+				}
+			}
 			fault(w, "%s", failure)
 			return
 		}

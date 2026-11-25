@@ -188,9 +188,12 @@ func TestFirecrackerFailedPauseKeepsTheVMRunning(t *testing.T) {
 	if err := d.Pause(ctx, fcTestID); !errors.Is(err, ErrDiskFloor) {
 		t.Fatalf("pause below the disk floor: %v", err)
 	}
+	// A snapshot that fails part way: what it wrote is discarded, so the
+	// next pause finds the space it measured before.
 	host.mu.Lock()
-	host.free = 100 << 30
+	host.free = uint64(cfg.DiskFloorMiB+600) << 20
 	host.snapshotFault = "no space left on device"
+	host.snapshotPartialMiB = 200
 	host.mu.Unlock()
 	from := callCount(host)
 	if err := d.Pause(ctx, fcTestID); err == nil {
@@ -204,6 +207,9 @@ func TestFirecrackerFailedPauseKeepsTheVMRunning(t *testing.T) {
 	}
 	if meta, err := d.readMeta(fcTestID); err != nil || meta == nil || meta.Paused {
 		t.Fatalf("record after a failed pause = %+v, %v", meta, err)
+	}
+	if _, err := os.Stat(filepath.Join(d.chroot(fcTestID), fcPausedMemory)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed pause kept its partial memory file: %v", err)
 	}
 	host.mu.Lock()
 	host.snapshotFault = ""
@@ -257,11 +263,79 @@ func TestFirecrackerFailedResumeKeepsTheVMPaused(t *testing.T) {
 	if list, err := d.List(ctx); err != nil || !slices.Equal(list, paused) {
 		t.Fatalf("list after a refused personalisation = %+v, %v", list, err)
 	}
+	// The resumed guest fails its final firewall check: it is stopped and
+	// still paused, its snapshot and record kept.
 	host.mu.Lock()
 	host.restoreErr = nil
+	host.onRestore = func(string) {
+		host.mu.Lock()
+		host.stateFailures, host.onRestore = 1, nil
+		host.mu.Unlock()
+	}
 	host.mu.Unlock()
+	if err := d.Resume(ctx, fcTestID); err == nil {
+		t.Fatal("resume with a failing firewall confirmation succeeded")
+	}
+	if list, err := d.List(ctx); err != nil || !slices.Equal(list, paused) {
+		t.Fatalf("list after a failed confirmation = %+v, %v", list, err)
+	}
+	if meta, err := d.readMeta(fcTestID); err != nil || meta == nil || !meta.Paused {
+		t.Fatalf("record after a failed confirmation = %+v, %v", meta, err)
+	}
+	for _, name := range []string{fcPausedState, fcPausedMemory} {
+		if _, err := os.Stat(filepath.Join(d.chroot(fcTestID), name)); err != nil {
+			t.Fatalf("failed confirmation lost %s: %v", name, err)
+		}
+	}
 	if err := d.Resume(ctx, fcTestID); err != nil {
 		t.Fatalf("resume after the faults cleared: %v", err)
+	}
+}
+
+// Concurrent pauses each reserve their guest's memory above the disk floor:
+// with room for one snapshot, a second pause is refused while the first is
+// still writing, and admitted once it is done.
+func TestFirecrackerConcurrentPausesShareTheDiskHeadroom(t *testing.T) {
+	d, host, cfg := newTestFirecracker(t)
+	ctx := context.Background()
+	for i, id := range []string{fcTestID, fcTestID2} {
+		if _, err := d.Create(ctx, Spec{ID: id, Image: cfg.Images[0], Network: FirecrackerSlotNames(2)[i], CPUs: 1, MemoryMiB: 512}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writing, release := make(chan string, 2), make(chan struct{})
+	host.mu.Lock()
+	host.free = uint64(cfg.DiskFloorMiB+513) << 20
+	host.onSnapshot = func(chroot string) {
+		writing <- chroot
+		<-release
+	}
+	host.mu.Unlock()
+	first := make(chan error, 1)
+	go func() { first <- d.Pause(ctx, fcTestID) }()
+	<-writing
+	second := make(chan error, 1)
+	go func() { second <- d.Pause(ctx, fcTestID2) }()
+	admitted := false
+	select {
+	case err := <-second:
+		if !errors.Is(err, ErrDiskFloor) {
+			t.Errorf("second pause beside a pause in progress: %v", err)
+		}
+	case <-writing:
+		admitted = true
+		t.Error("second pause admitted on space the first one holds")
+	}
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first pause: %v", err)
+	}
+	if admitted {
+		<-second
+		return
+	}
+	if err := d.Pause(ctx, fcTestID2); err != nil {
+		t.Fatalf("pause once the first one wrote its snapshot: %v", err)
 	}
 }
 

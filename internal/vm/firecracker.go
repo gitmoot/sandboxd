@@ -181,6 +181,12 @@ type FirecrackerDriver struct {
 
 	// snap is the template snapshot state (firecracker_snapshot.go).
 	snap fcSnapshots
+
+	// pausing is the guest memory, in bytes, of every pause admitted but
+	// whose snapshot is not yet complete or discarded: disk under Root that
+	// is promised but not yet taken (rootFree). pausingMu guards it.
+	pausingMu sync.Mutex
+	pausing   uint64
 }
 
 var (
@@ -715,7 +721,14 @@ type fcVM struct {
 }
 
 func (vm fcVM) running() bool {
-	return vm.meta != nil && !vm.meta.Paused && vm.netns && vm.vmmUp && vm.netUp
+	return vm.up() && !vm.meta.Paused
+}
+
+// up reports VM vm's VMM and network stack running in its namespace,
+// whatever its record says: a resume confirms this before it records the VM
+// as running.
+func (vm fcVM) up() bool {
+	return vm.meta != nil && vm.netns && vm.vmmUp && vm.netUp
 }
 
 func (d *FirecrackerDriver) readMeta(id string) (*fcMeta, error) {
@@ -960,23 +973,12 @@ func (d *FirecrackerDriver) vmConfig(spec Spec) ([]byte, error) {
 // configuration file, and the API socket Pause snapshots it through.
 var fcBootArgs = []string{"--api-sock", fcAPIPath, "--config-file", fcConfigPath}
 
-// diskLimitMiB is the file size limit of a VMM that writes only its disks:
-// the home disk and any attached volume.
-func (d *FirecrackerDriver) diskLimitMiB(meta fcMeta) int {
-	return max(d.cfg.HomeDiskMiB, meta.VolumeMiB)
-}
-
-// snapshotLimitMiB is the file size limit of a VMM that can also write a
-// snapshot of its guest memory: a template build, and every sandbox VMM,
-// since each has an API socket and can be paused.
-func (d *FirecrackerDriver) snapshotLimitMiB(meta fcMeta) int {
-	return max(d.diskLimitMiB(meta), meta.MemoryMiB)
-}
-
-// jailerArgs runs the VMM with vmm as its own arguments and fsizeMiB as its
-// file size limit, which must cover every file it writes: diskLimitMiB, and
-// snapshotLimitMiB for a VMM that writes a snapshot.
-func (d *FirecrackerDriver) jailerArgs(meta fcMeta, fsizeMiB int, vmm ...string) []string {
+// jailerArgs runs the VMM with vmm as its own arguments. Its file size limit
+// covers every file a VMM writes: the home disk, an attached volume, and
+// the memory file of a snapshot, since every VMM has an API socket (a
+// template build, and every sandbox, which can be paused).
+func (d *FirecrackerDriver) jailerArgs(meta fcMeta, vmm ...string) []string {
+	fsizeMiB := max(d.cfg.HomeDiskMiB, meta.VolumeMiB, meta.MemoryMiB)
 	args := []string{
 		"--id", meta.ID,
 		"--exec-file", d.cfg.Firecracker,
@@ -1137,7 +1139,7 @@ func (d *FirecrackerDriver) Create(ctx context.Context, spec Spec) (Instance, er
 			return Instance{}, fmt.Errorf("Firecracker slot %q is in use by %q", spec.Network, vm.id)
 		}
 	}
-	free, err := d.host.FreeBytes(d.cfg.Root)
+	free, err := d.rootFree()
 	if err != nil {
 		return Instance{}, err
 	}
@@ -1183,7 +1185,7 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 	if err := d.prepareJail(spec, meta); err != nil {
 		return err
 	}
-	if err := d.launch(ctx, spec, meta, startup, d.snapshotLimitMiB(meta), fcBootArgs...); err != nil {
+	if err := d.launch(ctx, spec, meta, startup, fcBootArgs...); err != nil {
 		return err
 	}
 	if _, err := d.waitAgent(ctx, spec, meta.VMMUID); err != nil {
@@ -1193,9 +1195,9 @@ func (d *FirecrackerDriver) start(ctx context.Context, spec Spec, meta fcMeta, s
 }
 
 // launch creates the VM's network and runs its VMM, with vmm as the VMM's
-// own arguments and fsizeMiB as its file size limit (jailerArgs), in the
-// prepared jail. An envd guest's console is kept.
-func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, fsizeMiB int, vmm ...string) error {
+// own arguments (jailerArgs), in the prepared jail. An envd guest's console
+// is kept.
+func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, startup *fcStartup, vmm ...string) error {
 	ruleset, marker := d.netnsRuleset(meta.Egress)
 	if err := d.host.CreateNetwork(ctx, fcNetwork{
 		Netns: d.names.netnsPrefix + spec.ID, Cgroup: fcNetCgroup + spec.ID,
@@ -1208,7 +1210,7 @@ func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, 
 	if err != nil {
 		return err
 	}
-	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, fsizeMiB, vmm...), console)
+	err = d.host.StartVMM(ctx, d.cfg.Jailer, d.jailerArgs(meta, vmm...), console)
 	_ = console.Close() // the VMM holds its own descriptor
 	if err != nil {
 		return err
@@ -1219,14 +1221,14 @@ func (d *FirecrackerDriver) launch(ctx context.Context, spec Spec, meta fcMeta, 
 	return nil
 }
 
-// confirmStarted requires a started VM to be running behind the armed
-// firewall before it is handed out.
+// confirmStarted requires a started VM's VMM and network stack to be
+// running behind the armed firewall before it is handed out.
 func (d *FirecrackerDriver) confirmStarted(ctx context.Context, id string) error {
 	vm, found, err := d.lookup(id)
 	if err != nil {
 		return err
 	}
-	if !found || !vm.running() {
+	if !found || !vm.up() {
 		return fmt.Errorf("Firecracker VM %q did not stay running", id)
 	}
 	if err := d.Ready(ctx); err != nil {

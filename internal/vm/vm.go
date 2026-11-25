@@ -115,7 +115,8 @@ type Instance struct {
 
 // Pauser is implemented by drivers that can pause a running VM and resume it
 // later where it stopped: its memory, processes, disks and network slot are
-// kept, while a paused VM runs no guest code and takes no CPU or guest RAM.
+// kept, while a paused VM runs no guest code. Whether a paused VM still
+// holds host RAM or processes is each driver's own (and documented there).
 // Callers serialize Pause, Resume and Destroy of one VM.
 type Pauser interface {
 	// Pause stops running VM id, keeping everything Resume needs; List then

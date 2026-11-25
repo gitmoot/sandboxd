@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/gitmoot/sandboxd/internal/guestagent"
@@ -50,7 +51,10 @@ func (vm fcVM) paused() bool {
 // and stops its VMM and network stack. Only a VM started with an API socket
 // (every VM started since pause support) whose guest agent can be restored
 // can be paused. On error before the snapshot is complete the guest is
-// resumed; after that it is left for Destroy.
+// resumed and what the snapshot wrote is discarded; after that it is left
+// for Destroy. The guest's memory is reserved under Root above the disk
+// floor from admission until the snapshot is written or discarded, so
+// concurrent pauses never promise the same space.
 func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err := validAppleID(id); err != nil {
 		return err
@@ -66,14 +70,6 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 	if err := d.checkPausable(ctx, meta); err != nil {
 		return err
 	}
-	free, err := d.host.FreeBytes(d.cfg.Root)
-	if err != nil {
-		return err
-	}
-	if need := uint64(d.cfg.DiskFloorMiB+meta.MemoryMiB) << 20; free < need {
-		return fmt.Errorf("%w: %d MiB free, %d MiB floor plus %d MiB guest memory needed",
-			ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB, meta.MemoryMiB)
-	}
 	// The running VMM owns its chroot and can replace anything in it: the
 	// paused directory is created and handed to it only through the open
 	// chroot, never through a path it could turn into a symlink.
@@ -82,9 +78,16 @@ func (d *FirecrackerDriver) Pause(ctx context.Context, id string) error {
 		return fmt.Errorf("open the jail of %q: %w", id, err)
 	}
 	defer unix.Close(chroot)
+	// What an earlier pause left (the emptied directory of a resumed VM, or
+	// output a failed discard kept) goes before the free space is measured.
 	if err := os.RemoveAll(filepath.Join(d.chroot(id), fcPausedJail)); err != nil {
 		return err
 	}
+	release, err := d.reservePause(meta.MemoryMiB)
+	if err != nil {
+		return err
+	}
+	defer release()
 	name := filepath.Base(fcPausedJail)
 	if err := unix.Mkdirat(chroot, name, 0o700); err != nil {
 		return fmt.Errorf("create the paused directory of %q: %w", id, err)
@@ -150,9 +153,46 @@ func (d *FirecrackerDriver) checkPausable(ctx context.Context, meta fcMeta) erro
 	return nil
 }
 
+// reservePause reserves memoryMiB, the memory file of a pause snapshot,
+// under Root above the disk floor and the space earlier pauses reserved.
+// release returns it once the snapshot is written (and so counted in the
+// free space) or discarded.
+func (d *FirecrackerDriver) reservePause(memoryMiB int) (release func(), err error) {
+	d.pausingMu.Lock()
+	defer d.pausingMu.Unlock()
+	free, err := d.host.FreeBytes(d.cfg.Root)
+	if err != nil {
+		return nil, err
+	}
+	need := uint64(memoryMiB) << 20
+	if floor := uint64(d.cfg.DiskFloorMiB)<<20 + d.pausing; free < floor+need {
+		return nil, fmt.Errorf("%w: %d MiB free, %d MiB floor and %d MiB of pauses in progress plus %d MiB guest memory needed",
+			ErrDiskFloor, free>>20, d.cfg.DiskFloorMiB, d.pausing>>20, memoryMiB)
+	}
+	d.pausing += need
+	return sync.OnceFunc(func() {
+		d.pausingMu.Lock()
+		d.pausing -= need
+		d.pausingMu.Unlock()
+	}), nil
+}
+
+// rootFree is the free space under Root less what pauses in progress have
+// reserved (reservePause) but not yet written.
+func (d *FirecrackerDriver) rootFree() (uint64, error) {
+	d.pausingMu.Lock()
+	defer d.pausingMu.Unlock()
+	free, err := d.host.FreeBytes(d.cfg.Root)
+	if err != nil {
+		return 0, err
+	}
+	return free - min(free, d.pausing), nil
+}
+
 // snapshotPaused pauses VM meta's guest and writes its full snapshot to the
 // jail's paused directory. If the snapshot fails the guest is resumed, or,
-// if that fails too, its VMM is stopped.
+// if that fails too, its VMM is stopped; once the VMM can no longer write
+// there, what it wrote is discarded.
 func (d *FirecrackerDriver) snapshotPaused(ctx context.Context, meta fcMeta) error {
 	call := func(ctx context.Context, method, path string, body any) error {
 		ctx, cancel := context.WithTimeout(ctx, fcPauseAPITime)
@@ -170,9 +210,18 @@ func (d *FirecrackerDriver) snapshotPaused(ctx context.Context, meta fcMeta) err
 	if err == nil {
 		return nil
 	}
+	// The VMM answers one API request at a time: once it has answered the
+	// resume, the snapshot request is over.
 	undo := context.WithoutCancel(ctx)
 	if resumeErr := call(undo, http.MethodPatch, "/vm", map[string]string{"state": "Resumed"}); resumeErr != nil {
-		err = errors.Join(err, resumeErr, d.host.KillCgroup(undo, meta.ID))
+		stopErr := d.host.KillCgroup(undo, meta.ID)
+		err = errors.Join(err, resumeErr, stopErr)
+		if stopErr != nil {
+			return fmt.Errorf("snapshot Firecracker VM %q: %w", meta.ID, err)
+		}
+	}
+	if discardErr := os.RemoveAll(filepath.Join(d.chroot(meta.ID), fcPausedJail)); discardErr != nil {
+		err = errors.Join(err, fmt.Errorf("discard the failed snapshot: %w", discardErr))
 	}
 	return fmt.Errorf("snapshot Firecracker VM %q: %w", meta.ID, err)
 }
@@ -209,9 +258,10 @@ func (d *FirecrackerDriver) stopNetwork(ctx context.Context, id string) error {
 }
 
 // Resume starts paused VM id from its snapshot, in its jail on a rebuilt
-// network, and personalises it. On error it is stopped again and stays
-// paused, unless its record could not be put back (then it is left for
-// Destroy).
+// network, personalises it and confirms it runs behind the armed firewall;
+// only then is its record marked running and its snapshot unlinked. On any
+// error its VMM and network stack are stopped again and it stays paused,
+// snapshot and record intact.
 func (d *FirecrackerDriver) Resume(ctx context.Context, id string) error {
 	if err := validAppleID(id); err != nil {
 		return err
@@ -234,17 +284,21 @@ func (d *FirecrackerDriver) Resume(ctx context.Context, id string) error {
 		return err
 	}
 	startup := &fcStartup{}
-	err = d.launch(ctx, Spec{ID: id, Envd: meta.Envd}, meta, startup, d.snapshotLimitMiB(meta), "--api-sock", fcAPIPath)
+	recording := false
+	err = d.launch(ctx, Spec{ID: id, Envd: meta.Envd}, meta, startup, "--api-sock", fcAPIPath)
 	if err == nil {
 		err = d.loadPaused(ctx, meta)
 	}
 	if err == nil {
+		err = d.confirmStarted(ctx, id)
+	}
+	if err == nil {
+		recording = true
 		if _, err = d.markPaused(id, false); err != nil {
-			return fmt.Errorf("record the resume of %q: %w", id, err)
+			err = fmt.Errorf("record the resume: %w", err)
 		}
-		if err := d.confirmStarted(ctx, id); err != nil {
-			return err
-		}
+	}
+	if err == nil {
 		// Mapped by the VMM: unlinking returns the disk when it exits.
 		for _, name := range []string{fcPausedState, fcPausedMemory} {
 			if err := fcRemoveMissing(filepath.Join(d.chroot(id), name)); err != nil {
@@ -261,6 +315,12 @@ func (d *FirecrackerDriver) Resume(ctx context.Context, id string) error {
 	stopErr := d.host.KillCgroup(undo, id)
 	if stopErr == nil {
 		stopErr = d.stopNetwork(undo, id)
+	}
+	if recording {
+		// A record write that failed after its rename left it running.
+		if _, markErr := d.markPaused(id, true); markErr != nil {
+			stopErr = errors.Join(stopErr, fmt.Errorf("record %q paused again: %w", id, markErr))
+		}
 	}
 	return startup.annotate(errors.Join(fmt.Errorf("resume Firecracker VM %q: %w", id, err), stopErr))
 }
