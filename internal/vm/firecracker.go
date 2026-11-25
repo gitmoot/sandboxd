@@ -123,11 +123,12 @@ type FirecrackerConfig struct {
 	// reason is logged. Off by default: every VM then boots as before.
 	Snapshots bool
 	// CPUs and MemoryMiB are the VM shape this host serves (sandboxd's
-	// -cpus and -memory-mib). Template snapshots of that shape are kept
-	// while they stay current; a snapshot of any other shape, such as one
-	// left by an earlier configuration, is collected once no VM uses it and
-	// none was restored from it for fcSnapshotIdle. Zero serves no shape in
-	// particular, so every snapshot is kept only that long.
+	// -cpus and -memory-mib). A current template snapshot no VM uses is
+	// collected once none was built or restored from for
+	// fcSnapshotServedIdle when it is of that shape, for fcSnapshotIdle
+	// when it is of any other, such as one left by an earlier
+	// configuration. Zero serves no shape in particular, so every snapshot
+	// is kept only fcSnapshotIdle.
 	CPUs, MemoryMiB int
 	// MemoryFloorMiB, when nonzero, refuses a new VM (ErrMemoryPressure)
 	// while the host's available memory (MemAvailable) is below it:
@@ -502,9 +503,10 @@ func fcNetnsRuleset(deny4 []string, hostPort int) string {
 // Arm creates the cgroup parent and atomically (re)installs the host table,
 // then records its exact state for Ready. Call it before admitting guests,
 // including after a daemon restart with surviving guests. It then removes
-// what an interrupted template snapshot build left and collects snapshots
-// no VM uses that this host will not restore (all of them with snapshots
-// off).
+// what an interrupted template snapshot build left, lets snapshot builds
+// and due collections start again (stopBuilds stopped them) and collects
+// snapshots no VM uses that this host will not restore (all of them with
+// snapshots off).
 func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 	if err := d.arm(ctx); err != nil {
 		return err
@@ -512,6 +514,9 @@ func (d *FirecrackerDriver) Arm(ctx context.Context) error {
 	if err := d.removeBuilds(ctx); err != nil {
 		return err
 	}
+	d.snap.mu.Lock()
+	d.snap.stopped = false
+	d.snap.mu.Unlock()
 	d.collectSnapshots()
 	return nil
 }
@@ -650,7 +655,8 @@ func (d *FirecrackerDriver) firewallReady(ctx context.Context) error {
 func (d *FirecrackerDriver) HostTable() string { return d.names.table }
 
 // Disarm removes the host table and cgroup parent once no VM remains, then
-// the instance's claim. A snapshot build still running is stopped first.
+// the instance's claim. Snapshot builds and collections are stopped first
+// (stopBuilds), and one still running awaited.
 func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	if err := d.stopBuilds(ctx); err != nil {
 		return err
@@ -671,8 +677,9 @@ func (d *FirecrackerDriver) Disarm(ctx context.Context) error {
 	return d.releaseClaim()
 }
 
-// CleanupGuests destroys every VM this driver owns, after stopping a
-// snapshot build still running (which removes its VM).
+// CleanupGuests destroys every VM this driver owns, after stopping snapshot
+// builds and collections (stopBuilds): a build still running removes its
+// VM.
 func (d *FirecrackerDriver) CleanupGuests(ctx context.Context) error {
 	if err := d.stopBuilds(ctx); err != nil {
 		return err

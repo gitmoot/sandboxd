@@ -436,9 +436,12 @@ the same image and shape (`#46`):
   VM uses and that this daemon would no longer restore (changed
   Firecracker, kernel, image or configuration, or `-fc-snapshots` off) is
   deleted when a VM ends, after a build and at startup, together with
-  anything an interrupted build left. A snapshot of another shape than
-  `-cpus`/`-memory-mib` (say, from before they changed) is deleted too once
-  no VM uses it and none was restored from it for an hour.
+  anything an interrupted build left. Any other snapshot is deleted once no
+  VM uses it and none was built or restored from it for a day, or for an
+  hour when it is of another shape than `-cpus`/`-memory-mib` (say, from
+  before they changed). Whether a template still asks for a snapshot's
+  image, envd and hardening is the gateway's to know, so none is kept for
+  good.
 
 An image needs the guest agent of this release (`OpRestore`); rebuild it
 with the scripts below. Older images keep cold booting.

@@ -103,6 +103,12 @@ type fakeFCHost struct {
 	// onSnapshot runs, outside h.mu, once a VMM has written a snapshot, with
 	// its chroot: what a compromised VMM does there before it exits.
 	onSnapshot func(chroot string)
+	// onExecCopy runs, outside h.mu, as the jailer copies the Firecracker
+	// binary into VM id's chroot to run it: just before the copy (copied
+	// false) and just after it (true).
+	onExecCopy func(id string, copied bool)
+	// onNetns runs, outside h.mu, as Netns starts: to hold its caller.
+	onNetns func()
 	// dropAccept installs the host table without its accept rules, as an
 	// nft that silently loses one would.
 	dropAccept bool
@@ -320,6 +326,12 @@ func (h *fakeFCHost) KillCgroup(_ context.Context, name string) error {
 }
 func (h *fakeFCHost) Netns() ([]string, error) {
 	h.mu.Lock()
+	hold := h.onNetns
+	h.mu.Unlock()
+	if hold != nil {
+		hold()
+	}
+	h.mu.Lock()
 	defer h.mu.Unlock()
 	var names []string
 	for name := range h.netns {
@@ -379,6 +391,16 @@ func argAfter(args []string, flag string) string {
 	return args[i+1]
 }
 
+// copyExec copies the binary at from to to, as the jailer does before it
+// runs the copy.
+func copyExec(from, to string) error {
+	data, err := os.ReadFile(from)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(to, data, 0o555)
+}
+
 func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, console *os.File) error {
 	h.record("vmm")
 	h.mu.Lock()
@@ -394,13 +416,27 @@ func (h *fakeFCHost) StartVMM(_ context.Context, _ string, args []string, consol
 		}
 	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	h.vmmArgs = append(h.vmmArgs, args)
-	if h.failVMM != nil {
-		return h.failVMM
+	failed, onExecCopy := h.failVMM, h.onExecCopy
+	h.mu.Unlock()
+	if failed != nil {
+		return failed
 	}
-	id := argAfter(args, "--id")
-	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), "firecracker", id, "root")
+	// The jailer copies the Firecracker binary into the chroot and runs the
+	// copy.
+	id, exec := argAfter(args, "--id"), argAfter(args, "--exec-file")
+	chroot := filepath.Join(argAfter(args, "--chroot-base-dir"), filepath.Base(exec), id, "root")
+	if onExecCopy != nil {
+		onExecCopy(id, false)
+	}
+	if err := copyExec(exec, filepath.Join(chroot, filepath.Base(exec))); err != nil {
+		return fmt.Errorf("jailer: %w", err)
+	}
+	if onExecCopy != nil {
+		onExecCopy(id, true)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	// A VMM given an API socket and no configuration waits to load a
 	// snapshot: it reads neither a kernel nor a configuration.
 	api := argAfter(args, "--api-sock")

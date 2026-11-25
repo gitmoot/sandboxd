@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -800,9 +802,10 @@ func TestFirecrackerSnapshotOfAnotherShapeCollected(t *testing.T) {
 	}
 }
 
-// The snapshot of the shape a host serves is kept however long it goes
-// unused. Once the host serves another shape, after a restart, it is
-// collected as any other shape's is.
+// The snapshot of the shape a host serves is kept longer than another
+// shape's: unused for more than fcSnapshotIdle, it stays. Once the host
+// serves another shape, after a restart, it is collected as any other
+// shape's is.
 func TestFirecrackerSnapshotOfServedShapeKept(t *testing.T) {
 	d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) { c.CPUs, c.MemoryMiB = 1, 512 })
 	ctx := context.Background()
@@ -815,7 +818,7 @@ func TestFirecrackerSnapshotOfServedShapeKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := d.snapshotDir(snapshotName(t, d, first))
-	unused := time.Now().Add(-24 * time.Hour)
+	unused := time.Now().Add(-2 * time.Hour)
 	if err := os.Chtimes(dir, unused, unused); err != nil {
 		t.Fatal(err)
 	}
@@ -835,6 +838,41 @@ func TestFirecrackerSnapshotOfServedShapeKept(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("snapshot of the shape served before the restart kept: %v", err)
+	}
+}
+
+// A template's profile can change at a restart while its image and shape
+// do not; here it became hardened. Its plain snapshot is still current and
+// of the shape the host serves, but no create asks for it again: once no
+// VM used it for fcSnapshotServedIdle it is collected, not kept for good.
+func TestFirecrackerSnapshotOfUnusedProfileCollected(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) { c.CPUs, c.MemoryMiB = 1, 512 })
+	ctx := context.Background()
+	plain := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
+	if _, err := d.Create(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(t, d)
+	if err := d.Destroy(ctx, fcTestID); err != nil {
+		t.Fatal(err)
+	}
+	dir := d.snapshotDir(snapshotName(t, d, plain))
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("snapshot of the old profile: %v", err)
+	}
+	unused := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(dir, unused, unused); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := newFirecrackerDriver(cfg, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot of a profile no VM used for two days kept: %v", err)
 	}
 }
 
@@ -883,5 +921,118 @@ func TestFirecrackerSnapshotBuildOutputStaysInJail(t *testing.T) {
 	name := snapshotName(t, d, first)
 	if data, err := os.ReadFile(filepath.Join(d.snapshotDir(name), fcSnapshotMemory)); err != nil || string(data) != "memory of "+fcBuildPrefix+name {
 		t.Fatalf("stored memory = %q, %v", data, err)
+	}
+}
+
+// The jailer copies the Firecracker binary into the build jail and runs the
+// copy. A binary installed just before that copy and rolled back right
+// after it ran the build: its snapshot is not stored under the key of the
+// binary the install path holds again.
+func TestFirecrackerSnapshotBuildRunsKeyedBinary(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	first := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
+	name := snapshotName(t, d, first)
+	original, err := os.ReadFile(cfg.Firecracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapped := make(chan error, 2)
+	host.mu.Lock()
+	host.onExecCopy = func(id string, copied bool) {
+		if id != fcBuildPrefix+name {
+			return
+		}
+		content := "firecracker, another version"
+		if copied {
+			content = string(original)
+		}
+		swapped <- replaceFile(cfg.Firecracker, content)
+	}
+	host.mu.Unlock()
+	if _, err := d.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(t, d)
+	for range 2 {
+		select {
+		case err := <-swapped:
+			if err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatal("the build VMM did not start")
+		}
+	}
+	if _, err := os.Stat(d.snapshotDir(name)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot another binary built stored under this one's key: %v", err)
+	}
+}
+
+// A collection that came due is the driver's own work: stopBuilds, which
+// Disarm runs before it releases the instance's claim, returns only once
+// one already running has ended, and no collection is due after it.
+func TestFirecrackerSnapshotSweepStopsWithDriver(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t)
+	ctx := context.Background()
+	var dirs []string
+	for _, memory := range []int{512, 1024} {
+		spec := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: memory}
+		if _, err := d.Create(ctx, spec); err != nil {
+			t.Fatal(err)
+		}
+		waitBuild(t, d)
+		if err := d.Destroy(ctx, fcTestID); err != nil {
+			t.Fatal(err)
+		}
+		dirs = append(dirs, d.snapshotDir(snapshotName(t, d, spec)))
+	}
+	// This driver serves neither shape: the first snapshot's idle time ends
+	// in a moment, the second's a second later.
+	now := time.Now()
+	used := []time.Time{now.Add(500*time.Millisecond - fcSnapshotIdle), now.Add(1500*time.Millisecond - fcSnapshotIdle)}
+	for i, dir := range dirs {
+		if err := os.Chtimes(dir, used[i], used[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The collection that comes due is held midway.
+	var held atomic.Bool
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	defer releaseOnce()
+	host.mu.Lock()
+	host.onNetns = func() {
+		if held.CompareAndSwap(false, true) {
+			close(entered)
+			<-release
+		}
+	}
+	host.mu.Unlock()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no collection came due")
+	}
+	stopped := make(chan error, 1)
+	go func() { stopped <- d.stopBuilds(ctx) }()
+	select {
+	case err := <-stopped:
+		t.Fatalf("stopBuilds returned while a due collection ran: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce()
+	if err := <-stopped; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dirs[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the due collection had not ended when stopBuilds returned: %v", err)
+	}
+	time.Sleep(time.Until(used[1].Add(fcSnapshotIdle + 300*time.Millisecond)))
+	if _, err := os.Stat(dirs[1]); err != nil {
+		t.Fatalf("collected after stopBuilds returned: %v", err)
 	}
 }
