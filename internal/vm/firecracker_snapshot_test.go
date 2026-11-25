@@ -800,6 +800,44 @@ func TestFirecrackerSnapshotOfAnotherShapeCollected(t *testing.T) {
 	}
 }
 
+// The snapshot of the shape a host serves is kept however long it goes
+// unused. Once the host serves another shape, after a restart, it is
+// collected as any other shape's is.
+func TestFirecrackerSnapshotOfServedShapeKept(t *testing.T) {
+	d, host, cfg := newSnapshotFirecracker(t, func(c *FirecrackerConfig) { c.CPUs, c.MemoryMiB = 1, 512 })
+	ctx := context.Background()
+	first := Spec{ID: fcTestID, Image: cfg.Images[0], Network: "sbx0", CPUs: 1, MemoryMiB: 512}
+	if _, err := d.Create(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	waitBuild(t, d)
+	if err := d.Destroy(ctx, fcTestID); err != nil {
+		t.Fatal(err)
+	}
+	dir := d.snapshotDir(snapshotName(t, d, first))
+	unused := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(dir, unused, unused); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("snapshot of the served shape: %v", err)
+	}
+	cfg.MemoryMiB = 1024
+	restarted, err := newFirecrackerDriver(cfg, host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Arm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot of the shape served before the restart kept: %v", err)
+	}
+}
+
 // A build VMM owns its chroot, so before it exits it can leave a symlink to
 // a host directory where its output directory was. Its output is taken only
 // through the directories the driver opened before it started: no host file

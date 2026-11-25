@@ -647,6 +647,7 @@ func TestFirecrackerConfigValidation(t *testing.T) {
 		"invalid deny":      func(c *FirecrackerConfig) { c.DenyCIDRs = []netip.Prefix{{}} },
 		"negative floor":    func(c *FirecrackerConfig) { c.DiskFloorMiB = -1 },
 		"negative memfloor": func(c *FirecrackerConfig) { c.MemoryFloorMiB = -1 },
+		"served shape":      func(c *FirecrackerConfig) { c.Snapshots, c.CPUs, c.MemoryMiB = true, 0, 512 },
 		"relative image":    func(c *FirecrackerConfig) { c.Images = []string{"images/x.ext4"} },
 		"unclean jailer":    func(c *FirecrackerConfig) { c.Jailer = "/usr/bin/../bin/jailer" },
 		"duplicate slot":    func(c *FirecrackerConfig) { c.Slots = []string{"sbx0", "sbx0"} },
